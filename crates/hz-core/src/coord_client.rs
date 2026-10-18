@@ -14,13 +14,14 @@ use hyper_util::rt::TokioIo;
 use hz_proto::coord_client::CoordClient;
 use hz_proto::{
     BeginLoginRequest, HelloRequest, LoginStatusRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest,
-    StreamMapRequest,
+    ReportEndpointsRequest, StreamMapRequest,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Uri};
 use tower_service::Service;
 
+use crate::endpoint::{DiscoveredEndpoint, EndpointKind};
 use crate::keys::KeyStore;
 use crate::status::RegisteredInfo;
 
@@ -112,6 +113,53 @@ pub async fn open_network_map_stream(
         .map_err(|status| anyhow!("Network Map 订阅失败：{status}"))?
         .into_inner();
     Ok(stream)
+}
+
+/// 上报收集到的 Endpoint（FR-8）：Hello → 签挑战 → ReportEndpoints。
+/// 服务端落库后随 Network Map 差量推给其他 Node。
+pub async fn report_endpoints(
+    state_dir: &Path,
+    endpoints: &[DiscoveredEndpoint],
+    coord_addr: &str,
+) -> anyhow::Result<()> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+
+    let hello = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+        })
+        .await
+        .map_err(|status| anyhow!("Endpoint 上报失败：Hello 被拒绝（{status}）"))?
+        .into_inner();
+    let nonce = hello.challenge_nonce;
+    let signature = keys.machine().sign(&nonce).to_bytes();
+    client
+        .report_endpoints(ReportEndpointsRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature.to_vec(),
+            endpoints: endpoints
+                .iter()
+                .map(|endpoint| hz_proto::Endpoint {
+                    addr: endpoint.addr.ip().to_string(),
+                    port: endpoint.addr.port() as u32,
+                    kind: match endpoint.kind {
+                        EndpointKind::Lan => hz_proto::EndpointKind::Lan as i32,
+                        EndpointKind::Stun => hz_proto::EndpointKind::Stun as i32,
+                        EndpointKind::V6 => hz_proto::EndpointKind::V6 as i32,
+                    },
+                })
+                .collect(),
+        })
+        .await
+        .map_err(|status| anyhow!("Endpoint 上报失败：{status}"))?;
+    Ok(())
 }
 
 /// 交互式登录的第一步：申请一次性登录链接（FR-2）。Node 侧只拿到 URL 与

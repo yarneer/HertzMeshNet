@@ -344,3 +344,51 @@ async fn wrong_relay_token_makes_coord_reject_every_check() {
     world.relay.shutdown();
     world.relay.terminated().await;
 }
+
+#[tokio::test]
+async fn relayed_ping_survives_periodic_punches_into_dead_endpoints() {
+    init_logging();
+    let world = spin_world(None).await;
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let record_a = register_node(&world.store, dir_a.path(), "punch-a").await;
+    let record_b = register_node(&world.store, dir_b.path(), "punch-b").await;
+
+    let node_a = spawn_node(dir_a.path(), &record_a, &world).await;
+    let mut node_b = spawn_node(dir_b.path(), &record_b, &world).await;
+    // 模拟对称 NAT：候选 Endpoint 全部不可达，打洞握手有去无回。
+    let mut spec_a = spec_for_peer(&record_b);
+    spec_a.endpoints = vec!["203.0.113.99:9999".parse().unwrap()];
+    let mut spec_b = spec_for_peer(&record_a);
+    spec_b.endpoints = vec!["203.0.113.98:9999".parse().unwrap()];
+    node_a.engine.reconcile(vec![spec_a]);
+    node_b.engine.reconcile(vec![spec_b]);
+
+    // 路径任务的节奏：每 3 秒一轮打洞（握手发往死端点）。
+    let puncher = {
+        let a = node_a.engine.clone();
+        let b = node_b.engine.clone();
+        let id_a = record_a.id.clone();
+        let id_b = record_b.id.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                ticker.tick().await;
+                a.send_punch(&id_b).await;
+                b.send_punch(&id_a).await;
+            }
+        })
+    };
+
+    for round in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let packet_ab = udp_v4_packet(record_a.ipv4, record_b.ipv4, b"punch-churn");
+        node_a.engine.send_ip_packet(&packet_ab).await;
+        let got = tokio::time::timeout(RELAY_TIMEOUT, node_b.to_tunnel.recv()).await;
+        match got {
+            Ok(Some(packet)) if packet == packet_ab => continue,
+            other => panic!("第 {round} 轮打洞后经 Relay 的包未到达：{other:?}"),
+        }
+    }
+    puncher.abort();
+}

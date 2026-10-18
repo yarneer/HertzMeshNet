@@ -2,12 +2,16 @@
 
 pub mod coord_client;
 pub mod dns;
+pub mod endpoint;
 pub mod ipc;
 pub mod keys;
 pub mod map;
 pub mod netif;
+pub mod path;
 pub mod paths;
+pub mod punch;
 pub mod relay_client;
 pub mod status;
+pub mod stun;
 pub mod tun;
 pub mod wire;

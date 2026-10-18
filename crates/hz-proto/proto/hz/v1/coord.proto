@@ -19,6 +19,10 @@ service Coord {
   // Relay 代理的 Node 身份校验（FR-9）：Relay 呈上 bootstrap 签发的 relay token
   // 与 Node 的 Machine-Key 挑战签名，Coordination Server 代为验证。
   rpc RelayCheckNode(RelayCheckRequest) returns (RelayCheckResponse);
+  // Endpoint 上报（FR-8）：Node 周期性把 Lan/STUN/IPv6 Endpoint 报上来，
+  // 服务端落库并随 Network Map 差量推给其他 Node。与打洞信令无关——
+  // 实时协商走 Relay 通道，不经 Coordination Server。
+  rpc ReportEndpoints(ReportEndpointsRequest) returns (ReportEndpointsResponse);
 }
 
 message HelloRequest {
@@ -54,9 +58,41 @@ message NodeInfo {
   optional int64 expires_at_unix = 7;
   // Node Key 公钥（x25519，32 字节），数据面建立 WireGuard 会话用。
   bytes node_key_pub = 8;
-  // 该 Node 的 UDP Endpoint（"ip:port"）。打洞 Endpoint 种类在 #8 扩展。
+  // 该 Node 的 UDP Endpoint（"ip:port"）兼容视图：全部来源拍平成字符串。
   repeated string endpoints = 9;
+  // 按 Endpoint 来源区分的视图（FR-8）：对端排打洞候选序用（IPv6 优先）。
+  repeated Endpoint detailed_endpoints = 10;
 }
+
+// Endpoint 的发现途径。
+enum EndpointKind {
+  ENDPOINT_KIND_UNSPECIFIED = 0;
+  // 非虚拟网卡的 IPv4 + WireGuard 端口（同网段可达）。
+  ENDPOINT_KIND_LAN = 1;
+  // STUN 发现的公网映射（NAT 外侧）。
+  ENDPOINT_KIND_STUN = 2;
+  // 网卡上的全球单播 IPv6（无 NAT 预期）。
+  ENDPOINT_KIND_V6 = 3;
+}
+
+message Endpoint {
+  // IP 字面量（v4 或 v6），不带端口。
+  string addr = 1;
+  uint32 port = 2;
+  EndpointKind kind = 3;
+}
+
+message ReportEndpointsRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  // 本 Node 当前的全部 Endpoint（整体覆盖旧值）。
+  repeated Endpoint endpoints = 6;
+}
+
+message ReportEndpointsResponse {}
 
 message BeginLoginRequest {
   uint32 protocol_version = 1;

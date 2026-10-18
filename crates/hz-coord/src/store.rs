@@ -37,7 +37,63 @@ pub struct NodeRecord {
     pub owner_user: Option<String>,
     pub expires_at_unix: Option<i64>,
     pub node_key_pub: Vec<u8>,
-    pub udp_endpoints: Vec<String>,
+    /// 该 Node 上报的 UDP Endpoint 及来源（lan/stun/v6）。
+    pub udp_endpoints: Vec<StoredEndpoint>,
+}
+
+/// 落库形态的 Endpoint：udp_endpoints 列的 JSON 元素。
+/// 旧库里的纯字符串元素按 lan 来源装载（#8 之前的唯一来源）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredEndpoint {
+    pub addr: String,
+    pub kind: String,
+}
+
+impl StoredEndpoint {
+    pub fn lan(addr: impl Into<String>) -> Self {
+        Self {
+            addr: addr.into(),
+            kind: "lan".to_string(),
+        }
+    }
+
+    /// 未知来源的兜底种类：按 lan 对待。
+    pub fn of_kind(addr: impl Into<String>, kind: &str) -> Self {
+        let known = matches!(kind, "lan" | "stun" | "v6");
+        Self {
+            addr: addr.into(),
+            kind: if known {
+                kind.to_string()
+            } else {
+                "lan".to_string()
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub fn addr_only(&self) -> String {
+        self.addr.clone()
+    }
+}
+
+fn parse_stored_endpoints(json: &str) -> anyhow::Result<Vec<StoredEndpoint>> {
+    let values: Vec<serde_json::Value> = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("invalid udp_endpoints in db: {e}"))?;
+    values
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::String(addr) => Ok(StoredEndpoint::lan(addr)),
+            serde_json::Value::Object(fields) => {
+                let addr = fields
+                    .get("addr")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("udp_endpoints 元素缺少 addr 字段"))?;
+                let kind = fields.get("kind").and_then(|v| v.as_str()).unwrap_or("lan");
+                Ok(StoredEndpoint::of_kind(addr, kind))
+            }
+            _ => Err(anyhow::anyhow!("udp_endpoints 元素既非字符串也非对象")),
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -248,11 +304,11 @@ impl Store {
         })
     }
 
-    /// StreamNetworkMap 打开时整体覆盖该 Node 的 UDP Endpoint 列表。
+    /// 上报路径整体覆盖该 Node 的 UDP Endpoint 列表（带来源）。
     pub async fn update_udp_endpoints(
         &self,
         node_id: &str,
-        endpoints: &[String],
+        endpoints: &[StoredEndpoint],
     ) -> anyhow::Result<()> {
         sqlx::query("UPDATE nodes SET udp_endpoints = ?1 WHERE id = ?2")
             .bind(serde_json::to_string(endpoints)?)
@@ -434,8 +490,7 @@ fn node_record_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<NodeRec
         owner_user: row.try_get("owner_user").ok().flatten(),
         expires_at_unix: row.get("expires_at_unix"),
         node_key_pub: row.get("node_key_pub"),
-        udp_endpoints: serde_json::from_str(&row.get::<String, _>("udp_endpoints"))
-            .map_err(|e| anyhow::anyhow!("invalid udp_endpoints in db: {e}"))?,
+        udp_endpoints: parse_stored_endpoints(&row.get::<String, _>("udp_endpoints"))?,
     })
 }
 

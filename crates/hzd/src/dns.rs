@@ -520,6 +520,7 @@ mod tests {
             expires_at_unix: None,
             node_key_pub: vec![],
             endpoints: vec![],
+            detailed_endpoints: vec![],
         }
     }
 

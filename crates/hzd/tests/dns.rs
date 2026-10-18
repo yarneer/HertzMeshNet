@@ -25,6 +25,7 @@ fn node(name: &str, ipv4: &str, ipv6: &str) -> MapNode {
         expires_at_unix: None,
         node_key_pub: vec![],
         endpoints: vec![],
+        detailed_endpoints: vec![],
     }
 }
 

@@ -12,7 +12,10 @@ use hz_coord::service::{ServeConfig, ServeHandle, serve};
 use hz_coord::store::Store;
 use hz_proto::coord_client::CoordClient;
 use hz_proto::network_map_message::Kind;
-use hz_proto::{HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest, StreamMapRequest};
+use hz_proto::{
+    HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest, ReportEndpointsRequest,
+    StreamMapRequest,
+};
 use rand_core::OsRng;
 use tonic::transport::Channel;
 use tonic::{Response, Status};
@@ -218,7 +221,7 @@ async fn map_stream_authenticates_upserts_endpoints_and_delivers_full_snapshot()
         .unwrap();
     assert_eq!(
         persisted.udp_endpoints,
-        vec!["192.168.1.5:51820".to_string()]
+        vec![hz_coord::store::StoredEndpoint::lan("192.168.1.5:51820")]
     );
 
     handle.shutdown();
@@ -431,7 +434,10 @@ async fn endpoint_change_is_pushed_as_delta() {
     let _ = next_message(&mut stream, Duration::from_secs(5)).await;
 
     store
-        .update_udp_endpoints(&info_b.node_id, &["10.9.8.7:42421".to_string()])
+        .update_udp_endpoints(
+            &info_b.node_id,
+            &[hz_coord::store::StoredEndpoint::lan("10.9.8.7:42421")],
+        )
         .await
         .unwrap();
 
@@ -484,6 +490,115 @@ async fn coord_outage_closes_streams_and_restart_delivers_fresh_full_map() {
         HashSet::from([info_a.name.clone()]),
         "重启后的全量必须来自同一份持久化存储：{names:?}"
     );
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+#[tokio::test]
+async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let auth_key = auth_key(&store).await;
+    let node_a = node_keys();
+    let node_b = node_keys();
+    let mut client = connect(addr).await;
+    let _info_a = register(&mut client, &node_a, "node-a", &auth_key).await;
+    let info_b = register(&mut client, &node_b, "node-b", &auth_key).await;
+
+    // node-a 打开 Map 流；node-b 随后经 ReportEndpoints 上报三类 Endpoint。
+    let mut stream = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let _ = next_message(&mut stream, Duration::from_secs(5)).await;
+
+    let hello = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: node_b.machine.verifying_key().to_bytes().to_vec(),
+            hostname: "node-b".to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .report_endpoints(ReportEndpointsRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: node_b.machine.verifying_key().to_bytes().to_vec(),
+            hostname: "node-b".to_owned(),
+            challenge_nonce: hello.challenge_nonce.clone(),
+            challenge_signature: node_b
+                .machine
+                .sign(&hello.challenge_nonce)
+                .to_bytes()
+                .to_vec(),
+            endpoints: vec![
+                hz_proto::Endpoint {
+                    addr: "203.0.113.9".to_string(),
+                    port: 41001,
+                    kind: hz_proto::EndpointKind::Stun as i32,
+                },
+                hz_proto::Endpoint {
+                    addr: "192.168.9.2".to_string(),
+                    port: 51820,
+                    kind: hz_proto::EndpointKind::Lan as i32,
+                },
+                hz_proto::Endpoint {
+                    addr: "2001:db8::2".to_string(),
+                    port: 51820,
+                    kind: hz_proto::EndpointKind::V6 as i32,
+                },
+            ],
+        })
+        .await
+        .expect("挑战认证通过的上报必须被接受");
+
+    let delta = next_delta(&mut stream, Duration::from_secs(5)).await;
+    let updated = delta
+        .added_or_updated
+        .iter()
+        .find(|n| n.node_id == info_b.node_id)
+        .expect("Endpoint 上报必须作为差量推给订阅方");
+    assert_eq!(
+        updated.endpoints,
+        vec![
+            "203.0.113.9:41001".to_string(),
+            "192.168.9.2:51820".to_string(),
+            "[2001:db8::2]:51820".to_string(),
+        ],
+        "兼容视图必须保持 ip:port 字符串"
+    );
+    assert_eq!(updated.detailed_endpoints.len(), 3);
+    assert_eq!(
+        updated.detailed_endpoints[0].kind,
+        hz_proto::EndpointKind::Stun as i32
+    );
+    assert_eq!(updated.detailed_endpoints[0].addr, "203.0.113.9");
+    assert_eq!(
+        updated.detailed_endpoints[2].kind,
+        hz_proto::EndpointKind::V6 as i32
+    );
+
+    // 无效签名必须被拒绝，且不落库。
+    let hello = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: node_b.machine.verifying_key().to_bytes().to_vec(),
+            hostname: "node-b".to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bad_signature = node_b.machine.sign(&hello.challenge_nonce).to_bytes();
+    bad_signature[0] ^= 0x01;
+    let rejected = client
+        .report_endpoints(ReportEndpointsRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: node_b.machine.verifying_key().to_bytes().to_vec(),
+            hostname: "node-b".to_owned(),
+            challenge_nonce: hello.challenge_nonce.clone(),
+            challenge_signature: bad_signature.to_vec(),
+            endpoints: vec![],
+        })
+        .await;
+    assert!(rejected.is_err(), "伪造签名的上报必须被拒绝");
 
     handle.shutdown();
     handle.terminated().await;

@@ -81,6 +81,60 @@ ping_assert() { # ping_assert <node> <target> <label> [flags...]
   fail "${label}: $(tail -3 "$ART_DIR/ping.out" | tr '\n' ' ')"
 }
 
+wait_for_log() { # wait_for_log <file> <pattern> <label> [timeout-secs]
+  local file="$1" pattern="$2" label="$3" timeout="${4:-60}" i
+  for i in $(seq 1 $((timeout * 2))); do
+    if [[ -f $file ]] && grep -q "$pattern" "$file"; then
+      pass "$label（$(grep "$pattern" "$file" | tail -1 | cut -c1-160)）"
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "$label：${timeout}s 内未在 $(basename "$file") 见到 /$pattern/"
+  return 1
+}
+
+relay_env_extra() { # 打洞/STUN 场景共用的 hzd 注入：Relay 地址 + 自签 CA（STUN 地址自动推导同主机 3478）
+  echo "HZD_RELAY_ADDR=https://203.0.113.1:$RELAY_PORT HZD_RELAY_CA_PATH=$ART_DIR/relay-ca.pem"
+}
+
+start_pair_with_relay() { # start_pair_with_relay <a> <b>：带 Relay/STUN 启动并注册两个 Node
+  local a="$1" b="$2"
+  HZD_NODE_EXTRA="$(relay_env_extra)"
+  note "[$a/$b] 启动 hzd（Relay + STUN，路径管理自选路径）并注册"
+  start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
+}
+
+wait_pair_mutual_view() { # wait_pair_mutual_view <a> <b>
+  if wait_for_peer "$1" "$2" && wait_for_peer "$2" "$1"; then
+    pass "双方 Network Map 互见（name/ipv4/ipv6/endpoints 齐全）"
+  else
+    fail "Network Map 未在 90s 内互通"
+    return 1
+  fi
+}
+
+peer_addresses() { # peer_addresses <a> <b>：打印对端视角的 v4/v6 Node Address
+  local b4 b6 a4 a6
+  b4=$(peer_field "$1" ipv4); b6=$(peer_field "$1" ipv6)
+  a4=$(peer_field "$2" ipv4); a6=$(peer_field "$2" ipv6)
+  note "$2=${b4} / ${b6}；$1=${a4} / ${a6}"
+}
+
+assert_single_udp_socket() { # assert_single_udp_socket <node...>
+  local node ns count
+  for node in "$@"; do
+    ns=$(node_ns "$node")
+    count=$(ip netns exec "$ns" sh -c "ss -u -a -p 2>/dev/null | grep -c 'hzd' || true")
+    if [[ $count == 1 ]]; then
+      pass "$node：hzd 恰好 1 个 UDP socket（WireGuard/打洞/STUN 共用，ADR-0002）"
+    else
+      fail "$node：hzd UDP socket 数量为 ${count}（应为 1）"
+    fi
+  done
+}
+
 # ---------------------------------------------------------------------------
 # 套件 lan：ticket #4 局域网互通断言的拓扑化移植（HZ_PROXY_SIM=1 时加第三方 TUN 共存步骤）
 # ---------------------------------------------------------------------------
@@ -286,8 +340,8 @@ assert_suite_relay() {
   b=$(reg_list | awk -F'|' '$2 == "symmetric" && $1 != "'"$a"'" { print $1; exit }')
   [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 symmetric 节点"; return 1; }
 
-  HZD_NODE_EXTRA="HZD_RELAY_ADDR=https://203.0.113.1:$RELAY_PORT HZD_RELAY_CA_PATH=$ART_DIR/relay-ca.pem HZD_FORCE_RELAY=1"
-  note "[$a/$b] 启动 hzd（HZD_FORCE_RELAY=1，对称 NAT 无直连路径）并注册"
+  HZD_NODE_EXTRA="$(relay_env_extra)"
+  note "[$a/$b] 启动 hzd（路径管理对对称 NAT 自选 Relay，无强制开关）并注册"
   start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
   start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
 
@@ -348,6 +402,295 @@ assert_suite_relay() {
   else
     pass "Relay 日志无明文载荷（pattern ${pattern} 未出现）"
   fi
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 direct（FR-8 / issue #8 AC1）：两端锥形 NAT，打洞成功升级 Direct Path
+# ---------------------------------------------------------------------------
+pick_two() { # pick_two <attachment>：按 attachment 取两个节点名
+  local a b
+  a=$(reg_list | awk -F'|' -v t="$1" '$2 == t { print $1; exit }')
+  b=$(reg_list | awk -F'|' -v t="$1" '$2 == t && $1 != "'"$a"'" { print $1; exit }')
+  echo "$a $b"
+}
+
+assert_suite_direct() {
+  local a b b4 b6 a4 a6
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  peer_addresses "$a" "$b"
+  local b4 b6 a4 a6
+  b4=$(peer_field "$a" ipv4); b6=$(peer_field "$a" ipv6)
+  a4=$(peer_field "$b" ipv4); a6=$(peer_field "$b" ipv6)
+
+  note "断言 1：双向 IPv4 / ULA IPv6 Node Address ping"
+  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
+  ping_assert "$a" "$b6" "$a → $b IPv6（$b6）" -6
+  ping_assert "$b" "$a6" "$b → $a IPv6（$a6）" -6
+
+  note "断言 2：双方 hzd 日志出现 path=direct（打洞升级成功）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
+
+  note "断言 3：STUN 公网 Endpoint 已发现并上报（锥形静态映射端口）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 60 || return 1
+  local wan_a ext_a wan_b ext_b
+  wan_a="203.0.113.1$(nat_num_of fullcone)"
+  wan_b="203.0.113.1$(nat_num_of portrestricted)"
+  ext_a=$(reg_field "$a" 5); ext_b=$(reg_field "$b" 5)
+  # 日志行带 ANSI 颜色码，直接匹配 "值+空格"（字段值后即消息文本）。
+  grep -q "$wan_a:$ext_a$" "$ART_DIR/hz-node-$a.log" \
+    && pass "$a：STUN Endpoint = $wan_a:$ext_a（静态映射端口）" \
+    || fail "$a：STUN Endpoint 与静态映射不符（期望 $wan_a:$ext_a）：$(grep 'stun mapped' "$ART_DIR/hz-node-$a.log" | tail -1)"
+  grep -q "$wan_b:$ext_b$" "$ART_DIR/hz-node-$b.log" \
+    && pass "$b：STUN Endpoint = $wan_b:$ext_b（静态映射端口）" \
+    || fail "$b：STUN Endpoint 与静态映射不符（期望 $wan_b:$ext_b）：$(grep 'stun mapped' "$ART_DIR/hz-node-$b.log" | tail -1)"
+
+  note "断言 4：Coordination Server 不参与打洞信令（coord 日志无 punch 痕迹）"
+  local punch_hits
+  punch_hits=$(grep -ci punch "$ART_DIR/coord.log" || true)
+  if (( punch_hits == 0 )); then
+    pass "coord.log 无 punch 字样（打洞信令只走 Relay 通道）"
+  else
+    fail "coord.log 出现 punch 相关内容 x${punch_hits}"
+  fi
+
+  note "断言 5：hzd 仍只持一个 UDP socket（打洞复用）"
+  assert_single_udp_socket "$a" "$b"
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 symcone（FR-8）：对称 + 端口受限锥形，直连必失败 → 稳定 Relayed Path
+# ---------------------------------------------------------------------------
+assert_suite_symcone() {
+  local a b b4 a4 i flaps
+  a=$(reg_list | awk -F'|' '$2 == "symmetric" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 symmetric + portrestricted 各一个"; return 1; }
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+
+  note "断言 1：双向 ping（经 Relay）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+
+  note "断言 2：60s 观察窗内不出现 path=direct（直连失败后稳定走 Relay，不抖动）"
+  flaps=0
+  for i in $(seq 1 20); do
+    sleep 3
+    flaps=$(( flaps + $(grep -c "path=direct" "$ART_DIR/hz-node-$a.log" 2>/dev/null || true) \
+                    + $(grep -c "path=direct" "$ART_DIR/hz-node-$b.log" 2>/dev/null || true) ))
+  done
+  if (( flaps == 0 )); then
+    pass "60s 内双方均未升级 Direct（对称×端口受限无直连路径）"
+  else
+    fail "观察窗内出现 path=direct x${flaps}，不应发生"
+  fi
+
+  note "断言 3：窗口结束时连通仍在"
+  ping_assert "$a" "$b4" "$a → $b 窗口后仍通（$b4）"
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 symsym（FR-8）：双对称 NAT，路径管理自选 Relay（无 HZD_FORCE_RELAY）
+# ---------------------------------------------------------------------------
+assert_suite_symsym() {
+  local a b b4 a4 i flaps
+  read -r a b <<<"$(pick_two symmetric)"
+  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 symmetric 节点"; return 1; }
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+
+  note "断言 1：双向 ping（经 Relay）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+
+  note "断言 2：60s 观察窗内不出现 path=direct"
+  flaps=0
+  for i in $(seq 1 20); do
+    sleep 3
+    flaps=$(( flaps + $(grep -c "path=direct" "$ART_DIR/hz-node-$a.log" 2>/dev/null || true) \
+                    + $(grep -c "path=direct" "$ART_DIR/hz-node-$b.log" 2>/dev/null || true) ))
+  done
+  (( flaps == 0 )) && pass "双对称 NAT 稳定走 Relay" || fail "出现 path=direct x${flaps}，双对称不应直连"
+
+  note "断言 3：窗口结束时连通仍在"
+  ping_assert "$a" "$b4" "$a → $b 窗口后仍通（$b4）"
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 v6pair（FR-8）：双方都有全球单播 IPv6，优先 IPv6 Direct Path
+# ---------------------------------------------------------------------------
+assert_suite_v6pair() {
+  local a b b4 b6 a4 a6 a_ns b_ns
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
+  a_ns=$(node_ns "$a"); b_ns=$(node_ns "$b")
+
+  note "前置：双方 eth0 各有 2001:db8::/32 全球单播地址且互通"
+  local a_v6 b_v6
+  a_v6=$(ip netns exec "$a_ns" ip -6 addr show dev eth0 scope global | awk '/2001:db8/{print $2; exit}' | cut -d/ -f1)
+  b_v6=$(ip netns exec "$b_ns" ip -6 addr show dev eth0 scope global | awk '/2001:db8/{print $2; exit}' | cut -d/ -f1)
+  [[ -n $a_v6 && -n $b_v6 ]] || { fail "Node 缺少 v6 地址（a=$a_v6 b=$b_v6），HZ_WAN_V6 未生效？"; return 1; }
+  local probe_rc=1 probe
+  for probe in 1 2 3 4 5 6 7 8 9 10; do
+    if ip netns exec "$a_ns" ping -6 -c 2 -W 2 "$b_v6" >/dev/null 2>&1; then probe_rc=0; break; fi
+    sleep 1
+  done
+  if (( probe_rc == 0 )); then
+    pass "底层 v6 直达（$a_v6 → $b_v6，DAD 稳定后第 ${probe} 次探测通过）"
+  else
+    fail "底层 v6 不通，v6 直连无从谈起"
+  fi
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  peer_addresses "$a" "$b"
+  b4=$(peer_field "$a" ipv4); b6=$(peer_field "$a" ipv6)
+  a4=$(peer_field "$b" ipv4); a6=$(peer_field "$b" ipv6)
+
+  note "断言 1：Node Address 双向 ping（v4 与 ULA v6）"
+  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
+  ping_assert "$a" "$b6" "$a → $b IPv6（$b6）" -6
+  ping_assert "$b" "$a6" "$b → $a IPv6（$a6）" -6
+
+  note "断言 2：双方选择 IPv6 Direct Path（日志 path=direct 的 endpoint 落在 2001:db8::/32）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct.*2001:db8" "$a 以 IPv6 直连" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct.*2001:db8" "$b 以 IPv6 直连" 90 || return 1
+
+  note "断言 3：v4 STUN Endpoint 仍被发现（IPv6 优先不排斥 v4 候选）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 60 || return 1
+
+  note "断言 4：hzd 单 UDP socket（v4/v6 双栈共用）"
+  assert_single_udp_socket "$a" "$b"
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 blockfallback（FR-8）：直连建立后阻断 WG 端口，退回 Relay 且连通不中断
+# ---------------------------------------------------------------------------
+assert_suite_blockfallback() {
+  local a b b4 a4 natnum before_a before_b after_a after_b
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
+
+  note "人为阻断：在 $b 的 NAT 上丢弃双向 WG 端口流量（Relay 的 TCP 不受影响）"
+  natnum=$(nat_num_of "$(reg_field "$b" 2)")
+  ip netns exec "hz-nat$natnum" nft insert rule ip "hz-nat$natnum" filterin udp dport "$HZ_WG_PORT" drop
+  ip netns exec "hz-nat$natnum" nft insert rule ip "hz-nat$natnum" filterin udp sport "$HZ_WG_PORT" drop
+  pass "已在 hz-nat$natnum 的 forward 链首插入 udp port $HZ_WG_PORT 双向 drop"
+  before_a=$(grep -c "path=direct" "$ART_DIR/hz-node-$a.log" || true)
+  before_b=$(grep -c "path=direct" "$ART_DIR/hz-node-$b.log" || true)
+
+  note "断言 1：15s 内双方退回 Relay（path=relay）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=relay" "$a 退回 Relayed Path" 15 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=relay" "$b 退回 Relayed Path" 15 || return 1
+
+  note "断言 2：连通不中断（退回后 ping 恢复应答）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay 恢复（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay 恢复（$a4）"
+
+  note "断言 3：退回后 20s 内不再反复升级（阻断期间无 path=direct 增量）"
+  sleep 20
+  after_a=$(grep -c "path=direct" "$ART_DIR/hz-node-$a.log" || true)
+  after_b=$(grep -c "path=direct" "$ART_DIR/hz-node-$b.log" || true)
+  if (( after_a == before_a && after_b == before_b )); then
+    pass "阻断期间无再次直连（${before_a}/${before_b} 次保持不变）"
+  else
+    fail "阻断期间出现新的 path=direct（${before_a}→${after_a}，${before_b}→${after_b}）"
+  fi
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 proxysim（FR-8）：cone-cone + 一端黑洞 TUN，STUN 仍是真实出口、直连结果不变
+# ---------------------------------------------------------------------------
+assert_suite_proxysim() {
+  local a b b4 a4 ns stun_line expected
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
+  ns=$(node_ns "$a")
+
+  # 黑洞先于 hzd 安装：此后的一切观测（STUN、直连）都在接管默认路由的
+  # 第三方 TUN 类网络工具在场时发生。物理默认路由以更高 metric 保留在
+  # eth0 上（真实工具不删除物理默认，只是以更优 metric 抢占），
+  # SO_BINDTODEVICE 绑定 eth0 的 hzd 外层流量仍可经物理口出去（FR-7）。
+  note "PROXY_SIM：$a 先安装接管默认路由的黑洞 TUN，再启动 hzd"
+  local gw ipaddr
+  ipaddr=$(reg_field "$a" 4); gw="${ipaddr%.*}.1"
+  if ip netns exec "$ns" sh -c "
+      ip tuntap add dev proxytun mode tun &&
+      ip addr add 198.18.0.1/30 dev proxytun &&
+      ip link set proxytun up &&
+      ip route replace default via ${gw} dev eth0 metric 100 &&
+      ip route add default dev proxytun metric 1
+    "; then
+    local defaults
+    defaults=$(ip netns exec "$ns" ip route show default)
+    if [[ $defaults == *proxytun* && $defaults == *eth0* ]]; then
+      pass "黑洞生效：默认路由由第三方 TUN 以更优 metric 接管，物理默认保留在 eth0（$defaults）"
+    else
+      fail "默认路由形态异常：$defaults"
+    fi
+  else
+    fail "第三方 TUN 模拟（proxytun）配置失败"
+  fi
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+
+  note "断言 1：黑洞之下 STUN 仍发现真实出口公网 Endpoint（≠ 198.18.0.1 黑洞地址）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 90 || return 1
+  expected="203.0.113.1$(nat_num_of fullcone):$(reg_field "$a" 5)"
+  if grep -q -- "$expected" "$ART_DIR/hz-node-a.log"; then
+    pass "$a：STUN Endpoint = $expected（真实出口，非黑洞地址 198.18.0.1）"
+  else
+    stun_line=$(grep "stun mapped endpoint discovered" "$ART_DIR/hz-node-a.log" | tail -1)
+    fail "$a：STUN Endpoint 异常（期望 $expected）：$stun_line"
+  fi
+
+  note "断言 2：黑洞之下仍建立 Direct Path、双向 ping"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path（黑洞共存）" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path（黑洞共存）" 90 || return 1
+  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
 
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))

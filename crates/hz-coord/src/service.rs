@@ -1,6 +1,6 @@
 //! gRPC 服务：挑战签发与校验、Auth Key 注册、交互式登录、协议版本闸门、
 //! Network Map 下发流。下发流的登记在 [`crate::map_stream`]。
-use std::net::{Shutdown, SocketAddr};
+use std::net::{IpAddr, Shutdown, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
@@ -11,7 +11,8 @@ use hz_proto::coord_server::{Coord, CoordServer};
 use hz_proto::{
     BeginLoginRequest, BeginLoginResponse, HelloRequest, HelloResponse, LoginStatusRequest,
     LoginStatusResponse, NetworkMapMessage, RegisterAuthKeyRequest, RegisterResponse,
-    RelayCheckRequest, RelayCheckResponse, StreamMapRequest,
+    RelayCheckRequest, RelayCheckResponse, ReportEndpointsRequest, ReportEndpointsResponse,
+    StreamMapRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
@@ -527,8 +528,12 @@ impl Coord for CoordServiceImpl {
         // Endpoint 是边界输入：逐条解析成 SocketAddr，坏一条就拒绝整份上报。
         let endpoints = parse_endpoints(&req.endpoints)?;
         if !endpoints.is_empty() {
+            let stored = endpoints
+                .iter()
+                .map(|addr| crate::store::StoredEndpoint::lan(addr.clone()))
+                .collect::<Vec<_>>();
             self.store
-                .update_udp_endpoints(&record.id, &endpoints)
+                .update_udp_endpoints(&record.id, &stored)
                 .await
                 .map_err(|e| {
                     tracing::error!(%e, "update udp endpoints failed");
@@ -617,6 +622,94 @@ impl Coord for CoordServiceImpl {
             valid: true,
             reason: String::new(),
         }))
+    }
+
+    /// Endpoint 上报（FR-8）：挑战认证通过后整体覆盖该 Node 的 Endpoint 列表，
+    /// 存储变更唤醒 fan-out，其他 Node 收到差量。打洞信令不经这里。
+    async fn report_endpoints(
+        &self,
+        request: Request<ReportEndpointsRequest>,
+    ) -> Result<Response<ReportEndpointsResponse>, Status> {
+        let req = request.into_inner();
+        if let Some(status) = Self::hello_reject_old_version(req.protocol_version) {
+            return Err(status);
+        }
+        let machine_key_pub: [u8; 32] = req
+            .machine_key_pub
+            .try_into()
+            .map_err(|_| Status::invalid_argument("machine_key_pub 必须是 32 字节"))?;
+        let nonce: [u8; 32] = req
+            .challenge_nonce
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_nonce 必须是 32 字节"))?;
+        let signature: [u8; 64] = req
+            .challenge_signature
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_signature 必须是 64 字节"))?;
+        Self::take_verified_challenge(
+            &self.challenges,
+            &machine_key_pub,
+            &req.hostname,
+            nonce,
+            signature,
+        )?;
+
+        let record = self
+            .store
+            .node_by_machine_key(&machine_key_pub)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "lookup node for endpoint report failed");
+                Status::internal("查询 Node 失败")
+            })?
+            .ok_or_else(|| Status::permission_denied("Node 未注册或已吊销，无法上报 Endpoint"))?;
+        if record
+            .expires_at_unix
+            .is_some_and(|expires| expires <= crate::store::unix_now())
+        {
+            return Err(Status::permission_denied("Node 已过期，请重新登录"));
+        }
+
+        // 边界输入：addr 必须是 IP 字面量、port 在范围内、kind 未知按 lan 兜底。
+        let stored = req
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                let addr: IpAddr = endpoint.addr.parse().map_err(|_| {
+                    Status::invalid_argument(format!(
+                        "无效的 Endpoint 地址：{}，期望 IP 字面量",
+                        endpoint.addr
+                    ))
+                })?;
+                if endpoint.port == 0 || endpoint.port > u16::MAX as u32 {
+                    return Err(Status::invalid_argument(format!(
+                        "无效的 Endpoint 端口：{}",
+                        endpoint.port
+                    )));
+                }
+                let kind = hz_proto::EndpointKind::try_from(endpoint.kind)
+                    .map(|kind| match kind {
+                        hz_proto::EndpointKind::Stun => "stun",
+                        hz_proto::EndpointKind::V6 => "v6",
+                        _ => "lan",
+                    })
+                    .unwrap_or("lan");
+                Ok(crate::store::StoredEndpoint::of_kind(
+                    SocketAddr::new(addr, endpoint.port as u16).to_string(),
+                    kind,
+                ))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        tracing::info!(node_id = %record.id, ?stored, "node endpoints reported");
+        self.store
+            .update_udp_endpoints(&record.id, &stored)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "update reported endpoints failed");
+                Status::internal("更新 Endpoint 失败")
+            })?;
+        Ok(Response::new(ReportEndpointsResponse {}))
     }
 }
 

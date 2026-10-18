@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use boringtun::noise::{Tunn, TunnResult};
@@ -16,12 +16,14 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::relay_client::RelayClient;
+use crate::stun::StunRouter;
 
 /// WireGuard 数据报与 IP 包的统一缓冲上限（UDP 数据报上限 64 KiB）。
 const MAX_DATAGRAM: usize = 65536;
 
-/// boringtun 定期保活间隔（秒）。
-const KEEPALIVE_SECS: u16 = 25;
+/// boringtun 定期保活间隔（秒）。必须小于直连失效判据
+/// （[`crate::path::DIRECT_RX_FRESH`]），空闲直连靠保活维持新鲜度。
+const KEEPALIVE_SECS: u16 = 8;
 
 /// WireGuard 消息类型字节。
 const MSG_HANDSHAKE_INIT: u8 = 1;
@@ -73,6 +75,8 @@ struct Peer {
     tunn: Tunn,
     dst_addrs: Vec<IpAddr>,
     use_relay: bool,
+    /// 最近一次从直连 UDP 收到该对端已认证报文的时刻；路径管理据此判直连存活。
+    direct_rx: Option<Instant>,
 }
 
 enum Step {
@@ -159,6 +163,7 @@ impl Engine {
                     tunn,
                     dst_addrs: spec.dst_addrs,
                     use_relay: spec.use_relay,
+                    direct_rx: None,
                 },
             );
             if old.is_some() {
@@ -242,6 +247,7 @@ impl Engine {
                 return out;
             };
             self.prefer_endpoint(&node_id, from);
+            self.note_direct_rx(&node_id);
             self.register_own_index(&node_id, &response);
             out.to_network.push(NetworkSend {
                 node_id,
@@ -266,6 +272,9 @@ impl Engine {
             .expect("by_index 与 peers 一致")
             .tunn
             .decapsulate(Some(from.ip()), datagram, &mut scratch);
+        if !matches!(result, TunnResult::Err(_)) {
+            self.note_direct_rx(&node_id);
+        }
         // 解密方一侧可能排队了多个待发数据报，按 boringtun 契约用空数据报排空。
         let mut pending = Some(step_result(result));
         while let Some(step) = pending.take() {
@@ -402,6 +411,56 @@ impl Engine {
             .collect()
     }
 
+    /// 各对端最近一次直连接收距今的时间；None 表示从未直连收到。
+    /// 路径管理（#8）据此判断 Direct Path 存活。
+    pub fn direct_rx_ages(&self) -> HashMap<String, Option<Duration>> {
+        self.peers
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.direct_rx.map(|at| at.elapsed())))
+            .collect()
+    }
+
+    /// 生成一个握手发起包（打洞包）：从共享 socket 发往对端候选，
+    /// 同时打开双方 NAT 映射。不强制重发——进行中的握手（例如 Relay 侧正在
+    /// 完成的那个）不能被反复重置，否则对称 NAT 场景下 Relay 会话永远建立
+    /// 不起来。对端不在册、或握手进行中返回 None。
+    pub fn punch_handshake(&mut self, node_id: &str) -> Option<Vec<u8>> {
+        let mut scratch = vec![0u8; MAX_DATAGRAM];
+        let datagram = {
+            let peer = self.peers.get_mut(node_id)?;
+            match peer.tunn.format_handshake_initiation(&mut scratch, false) {
+                TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
+                _ => return None,
+            }
+        };
+        self.register_own_index(node_id, &datagram);
+        Some(datagram)
+    }
+
+    /// 调整该对端的传输开关（true = Relay）。对端不在册时忽略。
+    pub fn set_use_relay(&mut self, node_id: &str, use_relay: bool) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.use_relay = use_relay;
+        }
+    }
+
+    /// 追加候选 Endpoint（打洞信令带来的对端实时地址），去重、不扰动偏好序。
+    pub fn add_peer_endpoints(&mut self, node_id: &str, candidates: Vec<SocketAddr>) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            for addr in candidates {
+                if !peer.endpoints.contains(&addr) {
+                    peer.endpoints.push(addr);
+                }
+            }
+        }
+    }
+
+    fn note_direct_rx(&mut self, node_id: &str) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.direct_rx = Some(Instant::now());
+        }
+    }
+
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
@@ -469,21 +528,26 @@ fn merge_endpoints(mut preferred: Vec<SocketAddr>, fresh: Vec<SocketAddr>) -> Ve
 /// 持有唯一 UDP socket 的引擎外壳：socket 归它所有（#8 打洞复用同一 socket），
 /// 入方向循环 + 定时器循环在这里跑，解密出的明文包经 channel 交给 TUN 写任务。
 /// 设置了 Relay 客户端（[`SocketEngine::set_relay`]）时，开关指向 Relay 的对端
-/// 走 TLS 中继收发，直连 UDP 路径不变。
+/// 走 TLS 中继收发，直连 UDP 路径不变。Relay 客户端可随时替换（断线重连），
+/// 新的入站流会被自动接管。
 pub struct SocketEngine {
     engine: Arc<StdMutex<Engine>>,
     socket: Arc<UdpSocket>,
     relay: Arc<StdMutex<Option<Arc<RelayClient>>>>,
+    stun_router: Arc<StunRouter>,
+    punch_in: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl SocketEngine {
     /// port 为 0 时由内核分配。实例携带实际绑定地址。
+    /// socket 优先按 IPv6 双栈绑定（v4-mapped 兼容 v4，IPv6 Direct Path 需要
+    /// 同一 socket 收发两个族），内核不支持时退回纯 v4。
     /// socket 绑定到物理出口网卡（FR-7 共存），默认路由被第三方 TUN 类
     /// 网络工具接管时外层收发仍走物理网卡。
     pub async fn bind(own_secret: StaticSecret, port: u16) -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", port))
+        let socket = bind_dual_stack(port)
             .await
-            .with_context(|| format!("bind udp 0.0.0.0:{port} failed"))?;
+            .with_context(|| format!("bind udp :{port} failed"))?;
         crate::netif::bind_to_physical_egress(&socket);
         let local_addr = socket
             .local_addr()
@@ -493,17 +557,54 @@ impl SocketEngine {
             engine: Arc::new(StdMutex::new(Engine::new(own_secret))),
             socket: Arc::new(socket),
             relay: Arc::new(StdMutex::new(None)),
+            stun_router: Arc::new(StunRouter::default()),
+            punch_in: Arc::new(StdMutex::new(None)),
         })
     }
 
-    /// 接入 Relay 传输。须在 [`SocketEngine::run`] 之前调用一次；
-    /// 重复调用以后设置者为准。
+    /// 接入 Relay 传输。断线重连由装配层的监督任务再次调用本方法完成；
+    /// 替换后引擎自动接管新客户端的入站流。
     pub fn set_relay(&self, client: Arc<RelayClient>) {
         *self.relay.lock().expect("relay poisoned") = Some(client);
     }
 
-    fn relay_client(&self) -> Option<Arc<RelayClient>> {
+    /// 当前 Relay 客户端（可能未接入）。打洞信令经它发给对端。
+    pub fn relay_client(&self) -> Option<Arc<RelayClient>> {
         self.relay.lock().expect("relay poisoned").clone()
+    }
+
+    /// 登记打洞信令的入站队列：Relay 数据报带打洞前缀时原样投递到这里，
+    /// 由装配层（hzd 的路径任务）解密处理。只能设置一次。
+    pub fn set_punch_handler(&self, inbound: mpsc::Sender<Vec<u8>>) {
+        *self.punch_in.lock().expect("punch handler poisoned") = Some(inbound);
+    }
+
+    /// 从共享 socket 发起 STUN 查询（FR-8）：响应经收包循环按事务 id 路由
+    /// 回调用方，不与引擎抢收。返回的即本 socket 的公网映射 Endpoint。
+    pub async fn stun_query(&self, server: SocketAddr) -> anyhow::Result<SocketAddr> {
+        self.stun_router.query(&self.socket, server).await
+    }
+
+    /// 朝对端全部候选 Endpoint 发一个握手发起包（打洞）。v6 候选在最前，
+    /// 逐个尝试；单个候选发送失败只记录。
+    pub async fn send_punch(&self, node_id: &str) {
+        let punch = {
+            let mut engine = self.engine.lock().expect("engine poisoned");
+            engine
+                .punch_handshake(node_id)
+                .map(|datagram| (datagram, engine.endpoint_candidates(node_id)))
+        };
+        let Some((datagram, candidates)) = punch else {
+            return;
+        };
+        if candidates.is_empty() {
+            tracing::debug!(node_id, "punch without any candidate endpoint");
+        }
+        for candidate in candidates {
+            if let Err(error) = self.socket.send_to(&datagram, candidate).await {
+                tracing::debug!(node_id, endpoint = %candidate, %error, "punch send failed");
+            }
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -524,6 +625,46 @@ impl SocketEngine {
             .lock()
             .expect("engine poisoned")
             .handshake_ages()
+    }
+
+    pub fn direct_rx_ages(&self) -> HashMap<String, Option<Duration>> {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .direct_rx_ages()
+    }
+
+    /// 偏好序的 Endpoint 候选（路径日志与打洞发送用）。
+    pub fn endpoint_candidates(&self, node_id: &str) -> Vec<SocketAddr> {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .endpoint_candidates(node_id)
+    }
+
+    /// 调整对端传输开关（true = Relay）。
+    pub fn set_use_relay(&self, node_id: &str, use_relay: bool) {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .set_use_relay(node_id, use_relay);
+    }
+
+    /// 把某个地址提升为该对端的最佳 Endpoint（IPv6 直连优先的落点：
+    /// 升级 Direct 时把发送偏好切到 v6 候选）。
+    pub fn prefer_endpoint(&self, node_id: &str, addr: SocketAddr) {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .prefer_endpoint(node_id, addr);
+    }
+
+    /// 追加对端候选 Endpoint（打洞信令带来的实时地址）。
+    pub fn add_peer_endpoints(&self, node_id: &str, candidates: Vec<SocketAddr>) {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .add_peer_endpoints(node_id, candidates);
     }
 
     pub fn peer_count(&self) -> usize {
@@ -560,33 +701,48 @@ impl SocketEngine {
             }
         });
 
-        if let Some(relay) = self.relay_client() {
-            if let Some(incoming) = relay.take_incoming() {
-                let engine = self.engine.clone();
-                let relay_slot = self.relay.clone();
-                let to_tunnel = to_tunnel.clone();
-                tokio::spawn(async move {
-                    let mut incoming = incoming;
-                    while let Some(datagram) = incoming.recv().await {
-                        let out = {
-                            let mut engine = engine.lock().expect("engine poisoned");
-                            engine.handle_relay_datagram(&datagram)
-                        };
-                        forward_to_tunnel(&to_tunnel, out.to_tunnel);
-                        send_to_relay(&relay_slot, out.to_relay).await;
+        // Relay 入站泵：监听 relay 槽位，断线重连换上新客户端后自动接管新流。
+        // WireGuard 密文进引擎；带打洞前缀的帧原样交给装配层的信令队列。
+        tokio::spawn({
+            let engine = self.engine.clone();
+            let relay_slot = self.relay.clone();
+            let punch_in = self.punch_in.clone();
+            let to_tunnel = to_tunnel.clone();
+            async move {
+                loop {
+                    let current = relay_slot.lock().expect("relay poisoned").clone();
+                    if let Some(relay) = current {
+                        if let Some(mut incoming) = relay.take_incoming() {
+                            while let Some(datagram) = incoming.recv().await {
+                                if route_punch_signal(&punch_in, &datagram) {
+                                    continue;
+                                }
+                                let out = {
+                                    let mut engine = engine.lock().expect("engine poisoned");
+                                    engine.handle_relay_datagram(&datagram)
+                                };
+                                forward_to_tunnel(&to_tunnel, out.to_tunnel);
+                                send_to_relay(&relay_slot, out.to_relay).await;
+                            }
+                        }
                     }
-                    tracing::warn!("relay inbound stream ended, relay receive path stopped");
-                });
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
-        }
+        });
 
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let result = loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((len, from)) => {
+                    let datagram = &buf[..len];
+                    // STUN 响应按事务 id 路由回等待中的查询，不进 WireGuard。
+                    if self.stun_router.dispatch(datagram) {
+                        continue;
+                    }
                     let out = {
                         let mut engine = self.engine.lock().expect("engine poisoned");
-                        engine.handle_udp(from, &buf[..len])
+                        engine.handle_udp(from, datagram)
                     };
                     forward_to_tunnel(&to_tunnel, out.to_tunnel);
                     send_to_network(&self.socket, out.to_network).await;
@@ -600,10 +756,62 @@ impl SocketEngine {
     }
 }
 
+/// 单 socket 双栈绑定：先试 [::] 关闭 v6only（v4-mapped 收 v4），失败再退
+/// 纯 v4。打洞与 WireGuard 共用这一个 socket（ADR-0002），IPv6 直连也必须
+/// 落在它上面。
+async fn bind_dual_stack(port: u16) -> anyhow::Result<UdpSocket> {
+    match socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) {
+        Ok(v6) => {
+            if let Err(error) = v6.set_only_v6(false) {
+                tracing::warn!(%error, "disable IPV6_V6ONLY failed, falling back to v4");
+            } else {
+                v6.set_nonblocking(true)?;
+                let addr: std::net::SocketAddr =
+                    format!("[::]:{port}").parse().expect("valid socket addr");
+                if v6.bind(&socket2::SockAddr::from(addr)).is_ok() {
+                    return Ok(UdpSocket::from_std(v6.into())?);
+                }
+                tracing::warn!("bind [::]:{port} failed, falling back to v4 only");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "ipv6 socket unavailable, falling back to v4 only");
+        }
+    }
+    Ok(UdpSocket::bind(("0.0.0.0", port)).await?)
+}
+
 fn forward_to_tunnel(to_tunnel: &mpsc::Sender<Vec<u8>>, packets: Vec<Vec<u8>>) {
     for packet in packets {
         if to_tunnel.try_send(packet).is_err() {
             tracing::warn!("tun write channel full or closed, dropping decrypted packet");
+        }
+    }
+}
+
+/// 打洞信令帧的入站分流：是信令就投递给装配层并返回 true（引擎不处理）。
+fn route_punch_signal(
+    punch_in: &Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    datagram: &[u8],
+) -> bool {
+    if !crate::punch::is_punch(datagram) {
+        return false;
+    }
+    let slot = punch_in.lock().expect("punch handler poisoned");
+    match slot.as_ref() {
+        Some(sender) => {
+            if sender.try_send(datagram.to_vec()).is_err() {
+                tracing::warn!("punch signal queue full or closed, dropping");
+            }
+            true
+        }
+        None => {
+            tracing::debug!("punch signal received before handler registered, dropping");
+            true
         }
     }
 }

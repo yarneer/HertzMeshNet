@@ -11,6 +11,11 @@
 #   HZ_REFLECTOR 1 则在 hz-wan 内启动 UDP 反射器（报告观测到的源端口）
 #   HZ_PROXY_SIM 1 则在第一个 lan Node 内安装接管默认路由的黑洞 TUN（模拟第三方 TUN 类网络工具）
 #   HZ_WG_PORT   Node UDP 端口（兼作锥形 NAT 的静态映射端口）
+#   HZ_WAN_V6    1 则给 wan 平面与各 Node 配全球单播 IPv6（2001:db8::/32，
+#                纯路由无 NAT），供 IPv6 Direct Path 场景用；默认 0，老场景不受影响
+#   HZ_ISOLATE_LANPEERS 1 则把 NAT 内侧的 Node 桥端口设为 isolated：同类型 NAT
+#                的多个 Node 不能经内桥 L2 直达（等价于各自独立的 NAT 设备），
+#                直连只能走真正的 NAT 穿越；默认 0，老场景不受影响
 set -uo pipefail
 
 TOPO_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -54,7 +59,7 @@ load_scenario() {
   local name="$1"
   local file="$TOPO_DIR/scenarios/$name.env"
   [[ -f $file ]] || die "场景不存在：$file"
-  HZ_NODES=""; HZ_ASSERT="none"; HZ_COORD=0; HZ_RELAY=0; HZ_REFLECTOR=0; HZ_PROXY_SIM=0; HZ_WG_PORT=51820
+  HZ_NODES=""; HZ_ASSERT="none"; HZ_COORD=0; HZ_RELAY=0; HZ_REFLECTOR=0; HZ_PROXY_SIM=0; HZ_WG_PORT=51820; HZ_WAN_V6=0; HZ_ISOLATE_LANPEERS=0
   # shellcheck disable=SC1090
   source "$file"
   [[ -n $HZ_NODES ]] || die "场景 $name 未声明 HZ_NODES"
@@ -241,6 +246,33 @@ build_fabric() {
     fi
   done
   if grep -q '|lan|' "$(registry_file)"; then ensure_lan; fi
+  if [[ $HZ_WAN_V6 == 1 ]]; then ensure_wan_v6; fi
+}
+
+# v6 平面（HZ_WAN_V6=1 时由 build_fabric 调用）：hz-wan 平面 2001:db8:f00::/64，
+# 每个 NAT 内侧一个独立 /64，Node 侧静态地址 + 默认路由。IPv6 不做 NAT
+# （FR-8：V6 Endpoint 无 NAT 预期），nft 规则都是 ip 族，不波及 v6 转发。
+ensure_wan_v6() {
+  ip netns exec "$WAN_NS" sysctl -qw net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.all.forwarding=1
+  ip -n "$WAN_NS" addr add "2001:db8:f00::1/64" dev "$WAN_BR" 2>/dev/null || true
+  local num
+  for num in 1 2 3; do
+    ns_exists "hz-nat$num" || continue
+    ip netns exec "hz-nat$num" sysctl -qw net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.all.forwarding=1
+    ip -n "hz-nat$num" addr add "2001:db8:f00::1${num}/64" dev wan0 2>/dev/null || true
+    ip -n "hz-nat$num" addr add "2001:db8:${num}::1/64" dev hz-br-in 2>/dev/null || true
+    ip -n "hz-nat$num" -6 route replace default via "2001:db8:f00::1" 2>/dev/null || true
+    ip -n "$WAN_NS" -6 route replace "2001:db8:${num}::/64" via "2001:db8:f00::1${num}" 2>/dev/null || true
+  done
+  pass "IPv6 平面就绪（wan 2001:db8:f00::/64，NAT 内侧 2001:db8:N::/64，纯路由）"
+}
+
+# Node 侧 v6 地址（HZ_WAN_V6=1）：eth0 加全球单播地址 + 默认路由走 NAT 内侧网关。
+config_node_v6() { # config_node_v6 <name> <nat-num> <host-suffix>
+  local ns="hz-node-$1" num="$2" host="$3"
+  ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=0 2>/dev/null || true
+  ip -n "$ns" addr add "2001:db8:${num}::${host}/64" dev eth0 2>/dev/null || true
+  ip -n "$ns" -6 route replace default via "2001:db8:${num}::1" 2>/dev/null || true
 }
 
 create_nodes() {
@@ -261,6 +293,9 @@ create_nodes() {
       ip link set hz-v-tmp netns "$ns"
       ip link set "$peer" netns "hz-nat$num"
       ip -n "hz-nat$num" link set "$peer" master hz-br-in up
+      if [[ $HZ_ISOLATE_LANPEERS == 1 ]]; then
+        ip netns exec "hz-nat$num" bridge link set dev "$peer" isolated on
+      fi
     fi
     ip -n "$ns" link set hz-v-tmp name eth0
     ip -n "$ns" addr add "$ipaddr/24" dev eth0
@@ -272,6 +307,9 @@ create_nodes() {
     fi
     # hz0 的 ULA IPv6 依赖命名空间内 IPv6 可用（宿主内核可能默认关闭）
     ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 2>/dev/null || true
+    if [[ $HZ_WAN_V6 == 1 && $att != lan ]]; then
+      config_node_v6 "$name" "$(nat_num_of "$att")" "${ipaddr##*.}"
+    fi
   done < <(reg_list)
 }
 

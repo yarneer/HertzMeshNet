@@ -2,6 +2,7 @@
 //! WireGuard 握手是确定性的四步：发起、响应、排空排队包、解出明文。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use hz_core::wire::{Engine, EngineOutput, PeerSpec};
 
@@ -335,4 +336,101 @@ fn relay_datagram_for_unknown_index_is_dropped_silently() {
     let out = engine_a.handle_relay_datagram(&stranger_datagram);
     assert!(out.to_tunnel.is_empty());
     assert!(out.to_relay.is_empty());
+}
+
+#[test]
+fn punch_handshake_yields_init_but_never_resets_in_flight_exchange() {
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+    // 先走完整握手拿到稳定会话（Relay 场景的常态），再验证打洞行为。
+    let packet = udp_v4_packet(a.v4, b.v4, b"session-first");
+    let init = engine_a.send_ip_packet(&packet);
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let _ = deliver(&flushed, &mut engine_b, a.udp);
+
+    let datagram = engine_a
+        .punch_handshake(peer_name(&b))
+        .expect("会话存续且无进行中握手时，打洞必须能发出握手发起包");
+    assert_eq!(datagram[0], MSG_HANDSHAKE_INIT);
+    // 打洞占用握手槽位后立即再打洞必须让位：返回 None 而不是强制重置，
+    // 否则正在进行的握手交换（如 Relay 侧）会被反复打断、永远无法完成。
+    assert!(engine_a.punch_handshake(peer_name(&b)).is_none());
+    // 打洞产生的发起包仍是合法 WireGuard 报文，对端能应答。
+    let out = engine_a.handle_udp(b.udp, &datagram);
+    let _ = out;
+    assert!(engine_a.punch_handshake("stranger").is_none());
+    let response = engine_b.handle_udp(a.udp, &datagram);
+    assert_eq!(response.to_network.len(), 1, "对端必须回应打洞握手");
+    assert_eq!(response.to_network[0].datagram[0], MSG_HANDSHAKE_RESPONSE);
+}
+
+#[test]
+fn direct_rx_age_tracks_udp_reception_only() {
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+    let name = peer_name(&a);
+    assert!(
+        engine_b
+            .direct_rx_ages()
+            .get(name)
+            .copied()
+            .flatten()
+            .is_none(),
+        "未收到任何直连报文前 direct_rx 必须为 None"
+    );
+
+    let init = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"hello"));
+    let _ = deliver(&init, &mut engine_b, a.udp);
+    let age = engine_b
+        .direct_rx_ages()
+        .get(name)
+        .copied()
+        .flatten()
+        .expect("收到对端直连握手后 direct_rx 必须有值");
+    assert!(age < Duration::from_secs(5));
+
+    // 伪造对端身份的报文解不开，不应点亮 direct_rx。
+    let intruder = test_node("100.96.0.9", "fd12:3456:789a::6460:9", "192.168.1.9:51820");
+    let mut engine_intruder = Engine::new(intruder.secret.clone());
+    engine_intruder.configure(spec_for(&b));
+    let bogus = engine_intruder.send_ip_packet(&udp_v4_packet(intruder.v4, b.v4, b"spoof"));
+    let _ = deliver(&bogus, &mut engine_b, intruder.udp);
+    let still = engine_b
+        .direct_rx_ages()
+        .get(name)
+        .copied()
+        .flatten()
+        .expect("合法记录不被伪造报文清除");
+    assert!(still >= age);
+}
+
+#[test]
+fn set_use_relay_switches_outbound_dispatch_per_peer() {
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+    let name = peer_name(&b);
+    let packet = udp_v4_packet(a.v4, b.v4, b"switch-me");
+
+    // 先完成完整握手，得到稳定会话后再验证开关（无会话时首包只触发握手，
+    // 不构成对开关的判别）。
+    let init = engine_a.send_ip_packet(&packet);
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let _ = deliver(&flushed, &mut engine_b, a.udp);
+
+    let direct = engine_a.send_ip_packet(&packet);
+    assert_eq!(direct.to_network.len(), 1, "直连开关下出向走 UDP");
+    assert!(direct.to_relay.is_empty());
+
+    engine_a.set_use_relay(name, true);
+    let relayed = engine_a.send_ip_packet(&packet);
+    assert!(
+        relayed.to_network.is_empty(),
+        "开关切 Relay 后出向必须走 Relay"
+    );
+    assert_eq!(relayed.to_relay.len(), 1);
+    assert_eq!(relayed.to_relay[0].node_id, name);
+
+    engine_a.set_use_relay(name, false);
+    let back = engine_a.send_ip_packet(&packet);
+    assert_eq!(back.to_network.len(), 1, "切回直连后出向恢复 UDP");
+    assert!(back.to_relay.is_empty());
 }
