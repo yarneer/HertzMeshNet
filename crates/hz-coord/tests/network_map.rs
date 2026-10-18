@@ -546,6 +546,7 @@ async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
                     kind: hz_proto::EndpointKind::V6 as i32,
                 },
             ],
+            path_report: None,
         })
         .await
         .expect("挑战认证通过的上报必须被接受");
@@ -596,6 +597,7 @@ async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
             challenge_nonce: hello.challenge_nonce.clone(),
             challenge_signature: bad_signature.to_vec(),
             endpoints: vec![],
+            path_report: None,
         })
         .await;
     assert!(rejected.is_err(), "伪造签名的上报必须被拒绝");

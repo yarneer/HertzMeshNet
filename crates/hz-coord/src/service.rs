@@ -23,6 +23,7 @@ use crate::challenge::{CHALLENGE_TTL, Challenge, ChallengeCache};
 use crate::http::{HttpHandle, HttpState, serve_http};
 use crate::login::{LOGIN_TTL, LoginRegistry, PollResult};
 use crate::map_stream::{MapHub, MapPushConfig, node_info_from, run_fan_out};
+use crate::metrics::{Metrics, MetricsHandle, serve_metrics};
 use crate::oidc::{OidcClient, OidcConfig, new_login_token, new_pkce_verifier};
 use crate::store::Store;
 /// 下发流空差量保活间隔（FR-6 长连接）。
@@ -44,6 +45,8 @@ pub struct ServeConfig {
     /// 登录回调所在的 HTTP 面监听地址；配置了 OIDC 才有意义。
     pub http_listen: Option<SocketAddr>,
     pub oidc: Option<OidcConfig>,
+    /// Prometheus /metrics 监听地址；None 时不开指标面。
+    pub metrics_listen: Option<SocketAddr>,
     /// 一次性登录链接的有效期（默认 5 分钟）。
     pub login_ttl: Duration,
     /// 交互式登录授予的 Node 有效期（默认 90 天）。
@@ -60,6 +63,7 @@ impl ServeConfig {
             map_sweep: MAP_SWEEP,
             http_listen: None,
             oidc: None,
+            metrics_listen: None,
             login_ttl: LOGIN_TTL,
             login_node_ttl_secs: LOGIN_NODE_TTL_SECS,
         }
@@ -93,8 +97,10 @@ pub struct ServeHandle {
     pub local_addr: SocketAddr,
     connections: Arc<LiveConnections>,
     pub http_addr: Option<SocketAddr>,
+    pub metrics_addr: Option<SocketAddr>,
     shutdown: tokio::sync::watch::Sender<bool>,
     http: Option<HttpHandle>,
+    metrics: Option<MetricsHandle>,
     join: tokio::task::JoinHandle<()>,
     fan_out: tokio::task::JoinHandle<()>,
 }
@@ -107,12 +113,18 @@ impl ServeHandle {
         if let Some(http) = &self.http {
             http.shutdown();
         }
+        if let Some(metrics) = &self.metrics {
+            metrics.shutdown();
+        }
     }
 
     pub async fn terminated(self) {
         let _ = self.join.await;
         if let Some(http) = self.http {
             let _ = http.terminated().await;
+        }
+        if let Some(metrics) = self.metrics {
+            let _ = metrics.terminated().await;
         }
     }
 }
@@ -138,6 +150,12 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         _ => (Arc::new(LoginRegistry::new()), None),
     };
     let http_addr = http_handle.as_ref().map(|http| http.local_addr);
+    let metrics = Arc::new(Metrics::new()?);
+    let metrics_handle = match config.metrics_listen {
+        Some(listen) => Some(serve_metrics(listen, hub.clone(), metrics.clone()).await?),
+        None => None,
+    };
+    let metrics_addr = metrics_handle.as_ref().map(|metrics| metrics.local_addr);
     let service = CoordServiceImpl {
         store: store.clone(),
         challenges: ChallengeCache::new(),
@@ -145,6 +163,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         logins: logins.clone(),
         login_ttl: config.login_ttl,
         http_addr,
+        metrics,
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -188,6 +207,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         shutdown: shutdown_tx,
         http: http_handle,
         http_addr,
+        metrics: metrics_handle,
+        metrics_addr,
         join,
         fan_out,
     })
@@ -235,6 +256,7 @@ struct CoordServiceImpl {
     logins: Arc<LoginRegistry>,
     login_ttl: Duration,
     http_addr: Option<SocketAddr>,
+    metrics: Arc<Metrics>,
 }
 
 impl CoordServiceImpl {
@@ -702,6 +724,13 @@ impl Coord for CoordServiceImpl {
             .collect::<Result<Vec<_>, Status>>()?;
 
         tracing::info!(node_id = %record.id, ?stored, "node endpoints reported");
+        if let Some(report) = req.path_report {
+            self.metrics.note_path_report(
+                &record.id,
+                report.punch_attempts as u64,
+                report.punch_success as u64,
+            );
+        }
         self.store
             .update_udp_endpoints(&record.id, &stored)
             .await

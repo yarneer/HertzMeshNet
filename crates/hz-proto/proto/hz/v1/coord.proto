@@ -90,9 +90,19 @@ message ReportEndpointsRequest {
   bytes challenge_signature = 5;
   // 本 Node 当前的全部 Endpoint（整体覆盖旧值）。
   repeated Endpoint endpoints = 6;
+  // 打洞结果记账（FR-12 打洞成功率）：本 Node 自启动起的累计值，
+  // 服务端按 Node 去重差量后累加进全局计数。旧客户端缺省不上报。
+  optional PathReport path_report = 7;
 }
 
 message ReportEndpointsResponse {}
+
+// Node 侧路径管理的累计计数。attempts = 发起的打洞轮次，
+// success = 从 Relayed 升级到 Direct 的次数。
+message PathReport {
+  uint32 punch_attempts = 1;
+  uint32 punch_success = 2;
+}
 
 message BeginLoginRequest {
   uint32 protocol_version = 1;

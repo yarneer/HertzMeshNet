@@ -58,6 +58,18 @@ pub struct RelaySend {
     pub datagram: Vec<u8>,
 }
 
+/// 一个对端的数据面现状（`hz status` / `hz ping` 的展示来源，FR-12）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerReport {
+    pub node_id: String,
+    /// true = 发往该对端走 Relay；false = 直连 UDP。
+    pub use_relay: bool,
+    /// 当前偏好序第一的 Endpoint（直连时的实际收发地址；Relayed 时不适用）。
+    pub endpoint: Option<SocketAddr>,
+    /// 最近一次握手距今的时间；None 表示尚未握手。
+    pub handshake_age: Option<Duration>,
+}
+
 /// 引擎一次处理产生的输出。
 #[derive(Debug, Default)]
 pub struct EngineOutput {
@@ -411,6 +423,24 @@ impl Engine {
             .collect()
     }
 
+    /// 各对端的数据面现状（路径、在用 Endpoint、最近握手），供状态展示。
+    /// Relayed 时没有在用的对端 Endpoint（收发都经 Relay 按 node id 寻址）。
+    pub fn peer_reports(&self) -> Vec<PeerReport> {
+        self.peers
+            .iter()
+            .map(|(id, peer)| PeerReport {
+                node_id: id.clone(),
+                use_relay: peer.use_relay,
+                endpoint: if peer.use_relay {
+                    None
+                } else {
+                    peer.endpoints.first().copied()
+                },
+                handshake_age: peer.tunn.time_since_last_handshake(),
+            })
+            .collect()
+    }
+
     /// 各对端最近一次直连接收距今的时间；None 表示从未直连收到。
     /// 路径管理（#8）据此判断 Direct Path 存活。
     pub fn direct_rx_ages(&self) -> HashMap<String, Option<Duration>> {
@@ -625,6 +655,11 @@ impl SocketEngine {
             .lock()
             .expect("engine poisoned")
             .handshake_ages()
+    }
+
+    /// 各对端的数据面现状（路径、在用 Endpoint、最近握手）。
+    pub fn peer_reports(&self) -> Vec<PeerReport> {
+        self.engine.lock().expect("engine poisoned").peer_reports()
     }
 
     pub fn direct_rx_ages(&self) -> HashMap<String, Option<Duration>> {

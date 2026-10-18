@@ -54,6 +54,9 @@ enum Command {
         /// 交互式登录授予的 Node 有效期天数（默认 90）
         #[arg(long, default_value_t = 90)]
         login_node_ttl_days: i64,
+        /// Prometheus /metrics 监听地址（默认 127.0.0.1:9100；off 关闭）
+        #[arg(long)]
+        metrics_listen: Option<String>,
     },
     /// 签发 Auth Key（本机管理操作）
     Bootstrap {
@@ -93,6 +96,7 @@ pub fn run() -> anyhow::Result<()> {
             oidc_redirect_uri,
             oidc_ca,
             login_node_ttl_days,
+            metrics_listen,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -108,6 +112,7 @@ pub fn run() -> anyhow::Result<()> {
                 oidc_redirect_uri,
                 oidc_ca,
                 login_node_ttl_days,
+                metrics_listen,
             })),
         Command::Bootstrap {
             db,
@@ -143,6 +148,7 @@ struct ServeArgs {
     oidc_redirect_uri: Option<String>,
     oidc_ca: Option<PathBuf>,
     login_node_ttl_days: i64,
+    metrics_listen: Option<String>,
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -158,6 +164,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         oidc_redirect_uri,
         oidc_ca,
         login_node_ttl_days,
+        metrics_listen,
     } = args;
     let listen: std::net::SocketAddr = listen
         .parse()
@@ -170,6 +177,17 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         config.tls = Some(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)));
     }
     config.login_node_ttl_secs = login_node_ttl_days * 86_400;
+
+    let metrics_listen = metrics_listen
+        .or_else(|| std::env::var("HZ_COORD_METRICS_LISTEN").ok())
+        .unwrap_or_else(|| "127.0.0.1:9100".to_string());
+    if !metrics_listen.eq_ignore_ascii_case("off") {
+        config.metrics_listen = Some(
+            metrics_listen
+                .parse()
+                .map_err(|e| anyhow::anyhow!("无效的 metrics 监听地址 {metrics_listen}：{e}"))?,
+        );
+    }
 
     // OIDC 与 HTTP 面参数也接受环境变量（容器/脚本部署）。
     let env_value = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());

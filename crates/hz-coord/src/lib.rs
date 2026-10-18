@@ -7,6 +7,7 @@ pub mod cli;
 pub mod http;
 pub mod login;
 pub mod map_stream;
+pub mod metrics;
 pub mod name;
 pub mod oidc;
 pub mod service;

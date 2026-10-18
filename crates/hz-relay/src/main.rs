@@ -54,6 +54,12 @@ enum Command {
         /// 自签模式下把 CA 证书 PEM 写到该路径（Node 侧 HZD_RELAY_CA_PATH 用）
         #[arg(long)]
         tls_ca_out: Option<PathBuf>,
+        /// 每 Node 的 Relay 限速（Mbps，默认 10；环境变量 HZ_RELAY_RATE_MBPS）
+        #[arg(long)]
+        rate_limit_mbps: Option<u64>,
+        /// Prometheus /metrics 监听地址（默认 127.0.0.1:9101；off 关闭）
+        #[arg(long)]
+        metrics_listen: Option<String>,
     },
     /// 用一次性身份接入 Relay（未注册的 Machine Key 应被拒绝）
     Probe {
@@ -89,6 +95,8 @@ fn main() -> anyhow::Result<()> {
             tls_self_signed,
             tls_san,
             tls_ca_out,
+            rate_limit_mbps,
+            metrics_listen,
         } => runtime.block_on(run_serve(
             listen,
             stun_listen,
@@ -99,6 +107,8 @@ fn main() -> anyhow::Result<()> {
             tls_self_signed,
             tls_san,
             tls_ca_out,
+            rate_limit_mbps,
+            metrics_listen,
         )),
         Command::Probe { addr, ca, node_id } => {
             std::process::exit(runtime.block_on(run_probe(addr, ca, node_id)));
@@ -117,6 +127,8 @@ async fn run_serve(
     tls_self_signed: bool,
     tls_san: Vec<String>,
     tls_ca_out: Option<PathBuf>,
+    rate_limit_mbps: Option<u64>,
+    metrics_listen: Option<String>,
 ) -> anyhow::Result<()> {
     let listen: std::net::SocketAddr = listen
         .parse()
@@ -127,13 +139,31 @@ async fn run_serve(
             anyhow::anyhow!("缺少 Relay Token（--relay-token 或环境变量 HZ_RELAY_TOKEN）")
         })?,
     };
+    let rate_limit_mbps = rate_limit_mbps
+        .or_else(|| std::env::var("HZ_RELAY_RATE_MBPS").ok()?.parse().ok())
+        .unwrap_or(hz_relay::DEFAULT_RATE_LIMIT_MBPS);
+    let metrics_listen = metrics_listen
+        .or_else(|| std::env::var("HZ_RELAY_METRICS_LISTEN").ok())
+        .unwrap_or_else(|| "127.0.0.1:9101".to_string());
+    let metrics_listen = if metrics_listen.eq_ignore_ascii_case("off") {
+        None
+    } else {
+        Some(
+            metrics_listen
+                .parse()
+                .map_err(|e| anyhow::anyhow!("无效的 metrics 监听地址 {metrics_listen}：{e}"))?,
+        )
+    };
 
     let mut config = hz_relay::RelayConfig {
         listen,
         tls: None,
         coord_addr: coord,
         relay_token,
+        rate_limit_mbps,
+        metrics_listen,
     };
+    tracing::info!(rate_limit_mbps, "per-node relay rate limit configured");
     if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
         let cert = std::fs::read(&cert_path)?;
         let key = std::fs::read(&key_path)?;

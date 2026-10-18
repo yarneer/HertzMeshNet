@@ -65,6 +65,11 @@ impl MapHub {
         self.wake.notify_one();
         rx
     }
+
+    /// 打开中的下发流数（在线 Node 数，FR-12 指标用）。
+    pub fn online_nodes(&self) -> usize {
+        self.subscribers.lock().expect("map hub poisoned").len()
+    }
 }
 
 /// 推送主循环：单写者。任何流的首条消息都从这里发出（全量），

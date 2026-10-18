@@ -66,6 +66,8 @@ async fn spin_world(relay_token_override: Option<&str>) -> World {
         relay_token: relay_token_override
             .map(str::to_owned)
             .unwrap_or_else(|| token.clone()),
+        rate_limit_mbps: 10_000,
+        metrics_listen: None,
     })
     .await
     .unwrap();

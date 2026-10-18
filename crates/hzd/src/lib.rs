@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use hz_core::coord_client::{
-    DEFAULT_COORD_ADDR, LoginPoll, StartedLogin, begin_interactive_login, local_hostname,
-    open_network_map_stream, poll_login_status, register_with_auth_key, report_endpoints,
+    DEFAULT_COORD_ADDR, LoginPoll, PunchCounters, StartedLogin, begin_interactive_login,
+    local_hostname, open_network_map_stream, poll_login_status, register_with_auth_key,
+    report_endpoints,
 };
 use hz_core::endpoint::{self, DiscoveredEndpoint};
 use hz_core::ipc::{self, Handler};
@@ -23,12 +24,13 @@ use hz_core::punch::{PunchCodec, PunchMessage};
 use hz_core::status::{NodeStatus, RegisteredInfo};
 #[cfg(target_os = "linux")]
 use hz_core::tun::{DEFAULT_V4_CIDR, Tun, TunConfig};
-use hz_core::wire::{PeerSpec, SocketEngine, lan_endpoint};
+use hz_core::wire::{PeerReport, PeerSpec, SocketEngine, lan_endpoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub mod dns;
+pub mod ping;
 
 const REGISTRATION_FILE: &str = "registration.json";
 
@@ -49,7 +51,7 @@ enum LoginProgress {
     Failed { error: String },
 }
 
-/// `hz status` 展示的一个对端；来源于本地 Network Map 缓存。
+/// `hz status` 展示的一个对端；来源于本地 Network Map 缓存 + 数据面现状。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MapPeer {
     pub name: String,
@@ -57,6 +59,10 @@ pub struct MapPeer {
     pub ipv6: String,
     pub endpoints: Vec<String>,
     pub handshake_secs: Option<u64>,
+    /// 当前路径："direct" / "relay"；数据面未拉起时为 null。
+    pub path: Option<String>,
+    /// 直连时在用的 Endpoint（Relayed 时为 null）。
+    pub endpoint: Option<String>,
 }
 
 struct Daemon {
@@ -73,6 +79,10 @@ struct Daemon {
     own_endpoints: Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
     /// 路径管理的当前决定（node_id → 走 Relay）；对账数据面时保序用。
     use_relay: Arc<StdMutex<HashMap<String, bool>>>,
+    /// 路径管理的累计打洞计数（FR-12 打洞成功率的上报源）。
+    punch: Arc<StdMutex<PunchCounters>>,
+    /// 等待中的 ping 探针（应答到达时唤醒）。
+    probes: Arc<ping::Probes>,
 }
 
 pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()> {
@@ -108,6 +118,8 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         map_signal: Arc::new(tokio::sync::Notify::new()),
         own_endpoints: Arc::new(StdMutex::new(Vec::new())),
         use_relay: Arc::new(StdMutex::new(HashMap::new())),
+        punch: Arc::new(StdMutex::new(PunchCounters::default())),
+        probes: Arc::new(ping::Probes::default()),
     });
 
     // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
@@ -170,6 +182,14 @@ async fn handle_request(
             value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
             Ok(value)
         }
+        "ping" => {
+            let target = request
+                .params
+                .get("node")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "缺少 node 参数（Node Name 或 node id）".to_string())?;
+            ping_peer(&daemon, target).await
+        }
         "up" => {
             let coord_addr = request
                 .params
@@ -230,6 +250,75 @@ async fn handle_request(
         }
         _ => Err(format!("unknown method: {}", request.method)),
     }
+}
+
+/// `hz ping`（FR-12）：朝对端 Node Address 发应用层探针，测往返时延，
+/// 并报告此刻的路径形态与在用 Endpoint。冷握手的首个探针可能被
+/// WireGuard 握手吃掉，最多重试 3 次。
+async fn ping_peer(daemon: &Arc<Daemon>, target: &str) -> Result<Value, String> {
+    let engine = daemon
+        .engine
+        .lock()
+        .expect("engine poisoned")
+        .clone()
+        .ok_or_else(|| "数据面未运行（先 hz up 注册本机）".to_string())?;
+    let own = daemon
+        .registration
+        .lock()
+        .expect("registration poisoned")
+        .clone()
+        .ok_or_else(|| "本机未注册".to_string())?;
+    let peer = daemon
+        .map_cache
+        .snapshot()
+        .into_iter()
+        .find(|node| node.node_id == target || node.name == target)
+        .ok_or_else(|| format!("Network Map 中找不到对端 {target}"))?;
+    if peer.node_id == own.node_id {
+        return Err("不能 ping 本机".to_string());
+    }
+    let own_v4: std::net::Ipv4Addr = own
+        .ipv4
+        .parse()
+        .map_err(|_| format!("本机 Node Address 无效：{}", own.ipv4))?;
+    let peer_v4: std::net::Ipv4Addr = peer
+        .ipv4
+        .parse()
+        .map_err(|_| format!("对端 Node Address 无效：{}", peer.ipv4))?;
+
+    let mut rtt = None;
+    for _ in 0..3 {
+        use rand_core::RngCore;
+        let nonce = rand_core::OsRng.next_u64();
+        let done = daemon.probes.spawn(nonce);
+        let sent = std::time::Instant::now();
+        engine
+            .send_ip_packet(&ping::build(own_v4, peer_v4, false, nonce))
+            .await;
+        if tokio::time::timeout(Duration::from_secs(3), done)
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            rtt = Some(sent.elapsed());
+            break;
+        }
+    }
+    let rtt = rtt.ok_or_else(|| format!("{} 无应答（3 次尝试）", peer.name))?;
+    let report = engine
+        .peer_reports()
+        .into_iter()
+        .find(|report| report.node_id == peer.node_id);
+    let (path, endpoint) = match report {
+        Some(report) if !report.use_relay => ("direct", report.endpoint.map(|e| e.to_string())),
+        Some(_) => ("relay", None),
+        None => ("relay", None),
+    };
+    Ok(serde_json::json!({
+        "name": peer.name,
+        "rtt_ms": rtt.as_secs_f64() * 1000.0,
+        "path": path,
+        "endpoint": endpoint,
+    }))
 }
 
 /// 注册/登录完成后共用的落盘与数据面拉起。
@@ -312,20 +401,46 @@ fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {
         .as_ref()
         .map(|engine| engine.handshake_ages())
         .unwrap_or_default();
+    let reports: HashMap<String, PeerReport> = daemon
+        .engine
+        .lock()
+        .expect("engine poisoned")
+        .as_ref()
+        .map(|engine| {
+            engine
+                .peer_reports()
+                .into_iter()
+                .map(|report| (report.node_id.clone(), report))
+                .collect()
+        })
+        .unwrap_or_default();
     daemon
         .map_cache
         .snapshot()
         .into_iter()
         .filter(|node| own_node_id.as_deref() != Some(node.node_id.as_str()))
-        .map(|node| MapPeer {
-            handshake_secs: ages
-                .get(&node.node_id)
-                .and_then(|age| age.map(Duration::from))
-                .map(|age| age.as_secs()),
-            name: node.name,
-            ipv4: node.ipv4,
-            ipv6: node.ipv6,
-            endpoints: node.endpoints,
+        .map(|node| {
+            let report = reports.get(&node.node_id);
+            MapPeer {
+                handshake_secs: ages
+                    .get(&node.node_id)
+                    .and_then(|age| age.map(Duration::from))
+                    .map(|age| age.as_secs()),
+                path: report.map(|report| {
+                    if report.use_relay {
+                        "relay".to_string()
+                    } else {
+                        "direct".to_string()
+                    }
+                }),
+                endpoint: report
+                    .and_then(|report| report.endpoint)
+                    .map(|endpoint| endpoint.to_string()),
+                name: node.name,
+                ipv4: node.ipv4,
+                ipv6: node.ipv6,
+                endpoints: node.endpoints,
+            }
         })
         .collect()
 }
@@ -355,7 +470,7 @@ async fn start_dataplane(
         }
     }
 
-    spawn_tun_bridge(&engine, info);
+    spawn_tun_bridge(&engine, info, daemon.probes.clone());
     spawn_map_task(
         daemon.state_dir.clone(),
         daemon.map_cache.clone(),
@@ -372,6 +487,7 @@ async fn start_dataplane(
     spawn_endpoint_collector(
         daemon.state_dir.clone(),
         daemon.own_endpoints.clone(),
+        daemon.punch.clone(),
         engine.clone(),
         coord_addr.to_string(),
     );
@@ -380,6 +496,7 @@ async fn start_dataplane(
         daemon.map_signal.clone(),
         daemon.own_endpoints.clone(),
         daemon.use_relay.clone(),
+        daemon.punch.clone(),
         engine.clone(),
         keys.clone(),
         &info.node_id,
@@ -458,10 +575,11 @@ fn stun_server_addr() -> Option<SocketAddr> {
 }
 
 /// Endpoint 收集与上报（FR-8）：周期性收集 Lan/STUN/V6，ReportEndpoints 落库，
-/// 结果同时存进共享槽供打洞信令取本机候选。
+/// 结果同时存进共享槽供打洞信令取本机候选；打洞累计计数随上报携带（FR-12）。
 fn spawn_endpoint_collector(
     state_dir: PathBuf,
     own_slot: Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
+    punch: Arc<StdMutex<PunchCounters>>,
     engine: Arc<SocketEngine>,
     coord_addr: String,
 ) {
@@ -489,7 +607,10 @@ fn spawn_endpoint_collector(
             let found = endpoint::collect(engine.local_addr().port(), stun_mapped);
             tracing::info!(endpoints = ?found, "collected endpoints");
             *own_slot.lock().expect("own endpoints poisoned") = found.clone();
-            if let Err(error) = report_endpoints(&state_dir, &found, &coord_addr).await {
+            let counters = *punch.lock().expect("punch counters poisoned");
+            if let Err(error) =
+                report_endpoints(&state_dir, &found, &coord_addr, Some(counters)).await
+            {
                 tracing::warn!(%error, "endpoint report to coord failed");
             }
         }
@@ -499,11 +620,13 @@ fn spawn_endpoint_collector(
 /// 路径管理任务（FR-8）：每秒推进状态机 + Map 变化、打洞信令即时唤醒。
 /// 产出的事件在这里执行：切引擎传输开关（带日志）、发打洞握手、经 Relay
 /// 收发 PunchOffer/PunchAck。HZD_FORCE_RELAY=1 时全部对端钉在 Relay。
+#[allow(clippy::too_many_arguments)]
 fn spawn_path_task(
     cache: Arc<NetworkMapCache>,
     map_signal: Arc<tokio::sync::Notify>,
     own_slot: Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
     use_relay_slot: Arc<StdMutex<HashMap<String, bool>>>,
+    punch_slot: Arc<StdMutex<PunchCounters>>,
     engine: Arc<SocketEngine>,
     keys: Arc<KeyStore>,
     own_node_id: &str,
@@ -540,7 +663,16 @@ fn spawn_path_task(
                 &direct_rx,
             );
             for event in events {
-                apply_path_event(&engine, &own_slot, &use_relay_slot, &keys, &peers, event).await;
+                apply_path_event(
+                    &engine,
+                    &own_slot,
+                    &use_relay_slot,
+                    &punch_slot,
+                    &keys,
+                    &peers,
+                    event,
+                )
+                .await;
             }
         }
     });
@@ -590,6 +722,7 @@ async fn apply_path_event(
     engine: &Arc<SocketEngine>,
     own_slot: &Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
     use_relay_slot: &Arc<StdMutex<HashMap<String, bool>>>,
+    punch_slot: &Arc<StdMutex<PunchCounters>>,
     keys: &Arc<KeyStore>,
     peers: &[PeerView],
     event: PathEvent,
@@ -597,6 +730,13 @@ async fn apply_path_event(
     let forced = force_relay();
     match event {
         PathEvent::SetUseRelay { node_id, use_relay } => {
+            if !use_relay {
+                // 打洞成功一次（Relayed → Direct 的升级，FR-12 成功率分子）。
+                punch_slot
+                    .lock()
+                    .expect("punch counters poisoned")
+                    .successes += 1;
+            }
             let use_relay = use_relay || forced;
             use_relay_slot
                 .lock()
@@ -631,6 +771,8 @@ async fn apply_path_event(
             if forced {
                 return;
             }
+            // 一轮打洞（Offer + 握手并发，FR-12 成功率分母）。
+            punch_slot.lock().expect("punch counters poisoned").attempts += 1;
             let Some(relay) = engine.relay_client() else {
                 tracing::debug!(%node_id, "punch offer skipped: no relay transport");
                 return;
@@ -722,8 +864,10 @@ async fn handle_punch_frame(
     tracing::debug!("punch frame matched no known peer, dropping");
 }
 
-/// TUN 读到的包进引擎，引擎解密的包写回 TUN。TUN 不可用时只保留引擎收发。
-fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
+/// TUN 读到的包进引擎，引擎解密的包写回 TUN。解密包先过 ping 探针拦截
+/// （`hz ping` 的应答在这里被消化），其余才落 TUN。TUN 不可用时只保留
+/// 引擎收发与探针拦截。
+fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo, probes: Arc<ping::Probes>) {
     let (to_tunnel_tx, to_tunnel_rx) = mpsc::channel::<Vec<u8>>(256);
     tokio::spawn({
         let engine = engine.clone();
@@ -733,6 +877,7 @@ fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
             }
         }
     });
+    let own_v4: Option<std::net::Ipv4Addr> = info.ipv4.parse().ok();
 
     #[cfg(target_os = "linux")]
     {
@@ -745,7 +890,7 @@ fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
                     ipv6 = %info.ipv6,
                     "registration holds invalid address, skip tun setup"
                 );
-                spawn_tunnel_drain(to_tunnel_rx);
+                spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
                 return;
             }
         };
@@ -759,8 +904,14 @@ fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
                 let device = tun.device();
                 tokio::spawn({
                     let device = device.clone();
+                    let engine = engine.clone();
+                    let probes = probes.clone();
+                    let own_v4 = own_v4.expect("地址解析成功才走到 TUN 分支，own_v4 必然存在");
                     async move {
                         while let Some(packet) = to_tunnel_rx.recv().await {
+                            if ping::intercept(&engine, &probes, own_v4, &packet).await {
+                                continue;
+                            }
                             if let Err(error) = device.send(&packet).await {
                                 tracing::error!(%error, "tun write failed");
                                 break;
@@ -784,25 +935,32 @@ fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
             }
             Err(error) => {
                 tracing::warn!(%error, "tun setup failed, running without data plane forwarding");
-                spawn_tunnel_drain(to_tunnel_rx);
+                spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = info;
-        spawn_tunnel_drain(to_tunnel_rx);
+        spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
     }
 }
 
-/// 无 TUN 时丢弃解密包，防 channel 满背压拖住引擎循环。
-#[allow(clippy::unused_async)]
-async fn drain_tunnel(mut rx: mpsc::Receiver<Vec<u8>>) {
-    while rx.recv().await.is_some() {}
-}
-
-fn spawn_tunnel_drain(rx: mpsc::Receiver<Vec<u8>>) {
-    tokio::spawn(drain_tunnel(rx));
+/// 无 TUN 时丢弃解密包（探针先拦截），防 channel 满背压拖住引擎循环。
+fn spawn_tunnel_drain(
+    engine: Arc<SocketEngine>,
+    probes: Arc<ping::Probes>,
+    own_v4: Option<std::net::Ipv4Addr>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if let Some(v4) = own_v4 {
+                if ping::intercept(&engine, &probes, v4, &packet).await {
+                    continue;
+                }
+            }
+        }
+    });
 }
 
 /// Network Map 消费任务（FR-6）：启动即用本地缓存配置数据面（Coordination

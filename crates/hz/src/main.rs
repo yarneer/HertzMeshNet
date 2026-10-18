@@ -34,6 +34,11 @@ enum Command {
         #[arg(long)]
         coord: Option<String>,
     },
+    /// 探测一个对端：显示往返时延与当前路径（FR-12）
+    Ping {
+        /// 对端 Node Name 或 node id
+        node: String,
+    },
 }
 
 #[tokio::main]
@@ -43,6 +48,7 @@ async fn main() -> std::process::ExitCode {
         Command::Status { json } => status(json).await,
         Command::Up { auth_key, coord } => up(auth_key, coord).await,
         Command::Login { coord } => up(None, coord).await,
+        Command::Ping { node } => ping(node).await,
     }
 }
 
@@ -204,7 +210,57 @@ async fn interactive_login(begin: serde_json::Value) -> std::process::ExitCode {
     }
 }
 
-/// Network Map 里的对端（hzd 状态结果的 peers 字段）；更丰富的展示在 #15。
+/// Endpoint 字符串的族别判定（v6 的 SocketAddr 文本带方括号，但 v4 也带端口冒号，
+/// 不能用 contains(':') 判别）。
+fn endpoint_is_v6(endpoint: &str) -> bool {
+    endpoint
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.is_ipv6())
+}
+
+/// `hz ping`（FR-12）：显示往返时延与这次探测所走的路径。
+async fn ping(node: String) -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = Request::new(4, "ping", serde_json::json!({ "node": node }));
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = match response {
+        Response::Ok { result, .. } => result,
+        Response::Error { error, .. } => {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    let rtt_ms = result
+        .get("rtt_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(f64::NAN);
+    let endpoint = result.get("endpoint").and_then(|v| v.as_str());
+    let path_label = match result.get("path").and_then(|v| v.as_str()) {
+        Some("direct") => match endpoint {
+            Some(endpoint) => format!(
+                "Direct Path（IPv{} {}）",
+                if endpoint_is_v6(endpoint) { 6 } else { 4 },
+                endpoint
+            ),
+            None => "Direct Path".to_string(),
+        },
+        Some("relay") => "Relayed Path".to_string(),
+        _ => "未知".to_string(),
+    };
+    println!("{name} 往返 {rtt_ms:.1} ms，路径 {path_label}");
+    std::process::ExitCode::SUCCESS
+}
+
+/// Network Map 里的对端（hzd 状态结果的 peers 字段）；表格式展示
+/// Node Name / Node Address / 路径 / Endpoint / 最近握手（FR-12）。
 fn print_peers(result: &serde_json::Value) {
     let Some(peers) = result.get("peers").and_then(|v| v.as_array()) else {
         return;
@@ -214,6 +270,7 @@ fn print_peers(result: &serde_json::Value) {
         return;
     }
     println!("对端：");
+    println!("  Node Name | Node Address | 路径 | Endpoint | 最近握手");
     for peer in peers {
         let field = |name: &str| {
             peer.get(name)
@@ -221,27 +278,29 @@ fn print_peers(result: &serde_json::Value) {
                 .unwrap_or("?")
                 .to_string()
         };
-        let endpoints = peer
-            .get("endpoints")
-            .and_then(|v| v.as_array())
-            .map(|list| {
-                list.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .unwrap_or_default();
+        let address = format!("{} / {}", field("ipv4"), field("ipv6"));
+        let endpoint = peer
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let path = match peer.get("path").and_then(|v| v.as_str()) {
+            Some("direct") if endpoint_is_v6(&endpoint) => "Direct Path (IPv6)",
+            Some("direct") => "Direct Path (IPv4)",
+            Some("relay") => "Relayed Path",
+            _ => "未知",
+        };
         let handshake = peer
             .get("handshake_secs")
             .and_then(|v| v.as_u64())
             .map(|secs| format!("{secs} 秒前"))
-            .unwrap_or_else(|| "未握手".to_string());
+            .unwrap_or_else(|| "从未".to_string());
         println!(
-            "  {} {} {} 端点[{}] 握手[{}]",
+            "  {} | {} | {} | {} | {}",
             field("name"),
-            field("ipv4"),
-            field("ipv6"),
-            endpoints,
+            address,
+            path,
+            endpoint,
             handshake
         );
     }

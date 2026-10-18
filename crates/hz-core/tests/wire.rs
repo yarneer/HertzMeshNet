@@ -434,3 +434,44 @@ fn set_use_relay_switches_outbound_dispatch_per_peer() {
     assert_eq!(back.to_network.len(), 1, "切回直连后出向恢复 UDP");
     assert!(back.to_relay.is_empty());
 }
+
+#[test]
+fn peer_reports_expose_path_endpoint_and_handshake_state() {
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+    let before = engine_a
+        .peer_reports()
+        .into_iter()
+        .find(|report| report.node_id == peer_name(&b))
+        .unwrap();
+    assert!(
+        !before.use_relay && before.endpoint == Some(b.udp),
+        "直连对端应在报告中给出在用 Endpoint"
+    );
+    assert_eq!(before.handshake_age, None, "握手前无最近握手时间");
+
+    let init = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"report-me"));
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let _ = deliver(&flushed, &mut engine_b, a.udp);
+
+    let after = engine_a
+        .peer_reports()
+        .into_iter()
+        .find(|report| report.node_id == peer_name(&b))
+        .unwrap();
+    let age = after.handshake_age.expect("握手完成后必须有最近握手时间");
+    assert!(
+        age < Duration::from_secs(1),
+        "刚完成的握手应记为刚刚：{age:?}"
+    );
+
+    engine_a.set_use_relay(peer_name(&b), true);
+    let relayed = engine_a
+        .peer_reports()
+        .into_iter()
+        .find(|report| report.node_id == peer_name(&b))
+        .unwrap();
+    assert!(relayed.use_relay, "开关切 Relay 后报告路径为 Relayed");
+    assert_eq!(relayed.endpoint, None, "Relayed 时没有在用的对端 Endpoint");
+    assert!(relayed.handshake_age.is_some());
+}
