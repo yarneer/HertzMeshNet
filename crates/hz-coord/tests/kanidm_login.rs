@@ -674,9 +674,14 @@ async fn admin_loss_on_relogin_gate() {
             .to_vec(),
         "coord 库里的 Node Key 必须与本地轮换后的公钥一致"
     );
+    // 同一秒内完成的两次登录会得到相同的秒级时间戳，严格递增不成立；
+    // 续期的语义是重置出完整的有效期窗口。
+    let after_expiry = after.get::<i64, _>("expires_at_unix");
+    let before_expiry = before.get::<i64, _>("expires_at_unix");
+    let now = chrono::Utc::now().timestamp();
     assert!(
-        after.get::<i64, _>("expires_at_unix") > before.get::<i64, _>("expires_at_unix"),
-        "重新登录必须续期"
+        after_expiry >= before_expiry && after_expiry > now + LOGIN_NODE_TTL_SECS - 120,
+        "重新登录必须重置完整的有效期窗口（after={after_expiry} before={before_expiry} now={now}）"
     );
 
     env.handle.shutdown();
