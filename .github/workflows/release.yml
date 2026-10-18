@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p hzd -p hz -p hz-coord -p hz-relay
+      - name: Verify static binaries
+        run: |
+          cd target/x86_64-unknown-linux-musl/release
+          for bin in hzd hz hz-coord hz-relay; do
+            file "$bin"
+            file "$bin" | grep -q "statically linked" || { echo "$bin 不是静态二进制"; exit 1; }
+            ldd "$bin" 2>&1 | grep -q "not a dynamic executable" || { echo "$bin 仍有动态依赖"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-x86_64
+          path: |
+            target/x86_64-unknown-linux-musl/release/hzd
+            target/x86_64-unknown-linux-musl/release/hz
+            target/x86_64-unknown-linux-musl/release/hz-coord
+            target/x86_64-unknown-linux-musl/release/hz-relay
+
+  build-linux-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build (static musl)
+        run: cross build --release --target aarch64-unknown-linux-musl -p hzd -p hz -p hz-coord -p hz-relay
+      - name: Verify static binaries
+        run: |
+          cd target/aarch64-unknown-linux-musl/release
+          for bin in hzd hz hz-coord hz-relay; do
+            file "$bin"
+            file "$bin" | grep -q "statically linked" || { echo "$bin 不是静态二进制"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-aarch64
+          path: |
+            target/aarch64-unknown-linux-musl/release/hzd
+            target/aarch64-unknown-linux-musl/release/hz
+            target/aarch64-unknown-linux-musl/release/hz-coord
+            target/aarch64-unknown-linux-musl/release/hz-relay
+
+  build-macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p hzd -p hz
+      - name: Verify arm64 binaries
+        run: |
+          cd target/release
+          for bin in hzd hz; do
+            file "$bin"
+            file "$bin" | grep -q "arm64" || { echo "$bin 不是 arm64"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-darwin-arm64
+          path: |
+            target/release/hzd
+            target/release/hz
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: shellcheck install.sh 与安装测试脚本
+        run: shellcheck packaging/install.sh scripts/test/install_docker.sh
+
+  release:
+    needs: [build-linux-x86_64, build-linux-aarch64, build-macos-arm64, shellcheck]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-linux-x86_64
+          path: stage/linux-x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-linux-aarch64
+          path: stage/linux-aarch64
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-darwin-arm64
+          path: stage/darwin-arm64
+      - name: Stage assets and manifest
+        run: |
+          mkdir assets
+          for arch in x86_64 aarch64; do
+            for bin in hzd hz hz-coord hz-relay; do
+              mv "stage/linux-$arch/$bin" "assets/$bin-linux-$arch"
+            done
+          done
+          for bin in hzd hz; do
+            mv "stage/darwin-arm64/$bin" "assets/$bin-darwin-arm64"
+          done
+          cd stage
+          {
+            printf '{"version":"%s","files":{' "${GITHUB_REF_NAME#v}"
+            first=1
+            for f in $(find . -type f | sort); do
+              rel=${f#./}
+              sha=$(sha256sum "$f" | cut -d' ' -f1)
+              size=$(wc -c < "$f" | tr -d '[:space:]')
+              if [ "$first" = 1 ]; then first=0; else printf ','; fi
+              printf '"%s":{"sha256":"%s","size":%s}' "$rel" "$sha" "$size"
+            done
+            printf '}}\n'
+          } > ../assets/manifest.json
+          jq . ../assets/manifest.json > /dev/null
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp packaging/install.sh assets/install.sh
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes assets/*

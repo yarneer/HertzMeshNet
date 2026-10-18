@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 
 use crate::authkey;
 use crate::challenge::{CHALLENGE_TTL, Challenge, ChallengeCache};
-use crate::http::{HttpHandle, HttpState, serve_http};
+use crate::http::{DistConfig, DistState, HttpHandle, HttpState, serve_http};
 use crate::login::{LOGIN_TTL, LoginRegistry, PollResult};
 use crate::map_stream::{MapHub, MapPushConfig, node_info_from, run_fan_out};
 use crate::metrics::{Metrics, MetricsHandle, serve_metrics};
@@ -50,6 +50,8 @@ pub struct ServeConfig {
     /// 登录回调所在的 HTTP 面监听地址；配置了 OIDC 才有意义。
     pub http_listen: Option<SocketAddr>,
     pub oidc: Option<OidcConfig>,
+    /// 分发面（FR-13）：配置后 install.sh 与 /dl 经 http_listen 下发。
+    pub dist: Option<DistConfig>,
     /// Prometheus /metrics 监听地址；None 时不开指标面。
     pub metrics_listen: Option<SocketAddr>,
     /// 一次性登录链接的有效期（默认 5 分钟）。
@@ -68,6 +70,7 @@ impl ServeConfig {
             map_sweep: MAP_SWEEP,
             http_listen: None,
             oidc: None,
+            dist: None,
             metrics_listen: None,
             login_ttl: LOGIN_TTL,
             login_node_ttl_secs: LOGIN_NODE_TTL_SECS,
@@ -138,21 +141,31 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     let store = config.store;
     let hub = Arc::new(MapHub::new());
 
-    let (logins, http_handle) = match (config.oidc, config.http_listen) {
-        (Some(oidc_config), Some(http_listen)) => {
-            let oidc = OidcClient::discover(oidc_config).await?;
-            let logins = Arc::new(LoginRegistry::new());
-            let http_state = Arc::new(HttpState {
-                oidc,
-                logins: logins.clone(),
-                store: store.clone(),
-                login_node_ttl_secs: config.login_node_ttl_secs,
-            });
-            let http = serve_http(http_listen, http_state).await?;
-            (logins, Some(http))
-        }
-        (Some(_), None) => anyhow::bail!("配置了 OIDC 但没有提供 --http-listen，回调无处落地"),
-        _ => (Arc::new(LoginRegistry::new()), None),
+    let dist_state = match config.dist {
+        Some(dist_config) => Some(Arc::new(DistState::build(&dist_config)?)),
+        None => None,
+    };
+    // HTTP 面的两个用途（OIDC 回调、分发）只要配置了其一就要拉起。
+    let (logins, http_handle) = if config.oidc.is_some() || dist_state.is_some() {
+        let http_listen = config.http_listen.ok_or_else(|| {
+            anyhow::anyhow!("配置了 OIDC 或 --dist-dir 但缺少 --http-listen，HTTP 面无处落地")
+        })?;
+        let oidc = match config.oidc {
+            Some(oidc_config) => Some(OidcClient::discover(oidc_config).await?),
+            None => None,
+        };
+        let logins = Arc::new(LoginRegistry::new());
+        let http_state = Arc::new(HttpState {
+            oidc,
+            logins: logins.clone(),
+            store: store.clone(),
+            login_node_ttl_secs: config.login_node_ttl_secs,
+            dist: dist_state,
+        });
+        let http = serve_http(http_listen, http_state).await?;
+        (logins, Some(http))
+    } else {
+        (Arc::new(LoginRegistry::new()), None)
     };
     let http_addr = http_handle.as_ref().map(|http| http.local_addr);
     let metrics = Arc::new(Metrics::new()?);

@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use tonic::transport::{Identity, ServerTlsConfig};
 
 use crate::addr::AddressConfig;
+use crate::http::DistConfig;
 use crate::oidc::OidcConfig;
 use crate::service::{ServeConfig, serve};
 use crate::store::Store;
@@ -18,6 +19,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// serve 的 flag 数量随部署面（TLS/OIDC/metrics/分发）自然增长，两个子命令的
+// 尺寸差是 clap 参数枚举的常态，不值得为此 Box。
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// 启动 Coordination Server
     Serve {
@@ -57,6 +61,15 @@ enum Command {
         /// Prometheus /metrics 监听地址（默认 127.0.0.1:9100；off 关闭）
         #[arg(long)]
         metrics_listen: Option<String>,
+        /// 分发目录（FR-13）：内含 <os>-<arch>/{hzd,hz}，经 --http-listen 下发 /install.sh 与 /dl/
+        #[arg(long, requires = "http_listen")]
+        dist_dir: Option<PathBuf>,
+        /// install.sh 里写入的公共 HTTP 基地址（如 https://coord.example.com:8443）
+        #[arg(long)]
+        public_url: Option<String>,
+        /// install.sh 写入 HZD_COORD_ADDR 的 gRPC 公网地址（缺省取 public-url 的主机名配 https）
+        #[arg(long)]
+        public_grpc_addr: Option<String>,
     },
     /// 签发 Auth Key（本机管理操作）
     Bootstrap {
@@ -100,6 +113,9 @@ pub fn run() -> anyhow::Result<()> {
             oidc_ca,
             login_node_ttl_days,
             metrics_listen,
+            dist_dir,
+            public_url,
+            public_grpc_addr,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -116,6 +132,9 @@ pub fn run() -> anyhow::Result<()> {
                 oidc_ca,
                 login_node_ttl_days,
                 metrics_listen,
+                dist_dir,
+                public_url,
+                public_grpc_addr,
             })),
         Command::Bootstrap {
             db,
@@ -154,6 +173,9 @@ struct ServeArgs {
     oidc_ca: Option<PathBuf>,
     login_node_ttl_days: i64,
     metrics_listen: Option<String>,
+    dist_dir: Option<PathBuf>,
+    public_url: Option<String>,
+    public_grpc_addr: Option<String>,
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -170,6 +192,9 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         oidc_ca,
         login_node_ttl_days,
         metrics_listen,
+        dist_dir,
+        public_url,
+        public_grpc_addr,
     } = args;
     let listen: std::net::SocketAddr = listen
         .parse()
@@ -196,6 +221,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // OIDC 与 HTTP 面参数也接受环境变量（容器/脚本部署）。
     let env_value = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let env_http_listen = env_value("HZ_COORD_HTTP_LISTEN");
     // 亚天级 TTL 的注入通道（有效期测试用 60 秒一类值）；缺省保持 flag 值。
     if let Some(secs) =
         env_value("HZ_COORD_LOGIN_NODE_TTL_SECS").and_then(|text| text.parse::<i64>().ok())
@@ -218,7 +244,8 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             .or_else(|| env_value("KANIDM_CLIENT_SECRET"))
             .ok_or_else(|| anyhow::anyhow!("配置了 OIDC 但缺少 client secret"))?;
         let http_listen_addr: std::net::SocketAddr = http_listen
-            .or_else(|| env_value("HZ_COORD_HTTP_LISTEN"))
+            .clone()
+            .or_else(|| env_http_listen.clone())
             .ok_or_else(|| anyhow::anyhow!("配置了 OIDC 但缺少 --http-listen"))?
             .parse()
             .map_err(|e| anyhow::anyhow!("无效的 HTTP 监听地址：{e}"))?;
@@ -245,6 +272,38 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             client_secret,
             redirect_uri,
             ca_cert,
+        });
+    }
+
+    let dist_dir = dist_dir.or_else(|| env_value("HZ_COORD_DIST_DIR").map(PathBuf::from));
+    if let Some(dir) = dist_dir {
+        let url = public_url
+            .or_else(|| env_value("HZ_COORD_PUBLIC_URL"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "配置了 --dist-dir 但缺少 --public-url，install.sh 无法内置服务器地址"
+                )
+            })?;
+        let grpc_addr = public_grpc_addr
+            .or_else(|| env_value("HZ_COORD_PUBLIC_GRPC_ADDR"))
+            .or_else(|| default_grpc_addr(&url))
+            .ok_or_else(|| {
+                anyhow::anyhow!("无法从 --public-url 推导 gRPC 地址，请显式提供 --public-grpc-addr")
+            })?;
+        if config.http_listen.is_none() {
+            let addr_text = http_listen
+                .or_else(|| env_http_listen.clone())
+                .ok_or_else(|| anyhow::anyhow!("配置了 --dist-dir 但缺少 --http-listen"))?;
+            config.http_listen = Some(
+                addr_text
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("无效的 HTTP 监听地址 {addr_text}：{e}"))?,
+            );
+        }
+        config.dist = Some(DistConfig {
+            dir,
+            public_url: url,
+            public_grpc_addr: grpc_addr,
         });
     }
     let handle = serve(config).await?;
@@ -314,6 +373,16 @@ async fn run_bootstrap(
     Ok(())
 }
 
+/// gRPC 公网地址缺省值：取 public-url 的主机名配 https（生产上 gRPC 与 HTTP
+/// 面共用 coord.<域名>，gRPC 走 443，见 mvp-spec §2）。
+fn default_grpc_addr(public_url: &str) -> Option<String> {
+    let rest = public_url
+        .strip_prefix("https://")
+        .or_else(|| public_url.strip_prefix("http://"))?;
+    let host = rest.split('/').next()?.split(':').next()?;
+    (!host.is_empty()).then(|| format!("https://{host}"))
+}
+
 /// 支持 `7d`/`30d` 相对天数与 RFC3339 绝对时刻。
 fn parse_expiry(text: &str) -> anyhow::Result<i64> {
     if let Some(days) = text.strip_suffix('d') {
@@ -333,6 +402,20 @@ fn parse_expiry(text: &str) -> anyhow::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grpc_addr_defaults_to_https_host_of_public_url() {
+        assert_eq!(
+            default_grpc_addr("https://coord.example.com:8443").as_deref(),
+            Some("https://coord.example.com")
+        );
+        assert_eq!(
+            default_grpc_addr("http://192.168.1.10:8080").as_deref(),
+            Some("https://192.168.1.10")
+        );
+        assert_eq!(default_grpc_addr("ftp://coord.example.com"), None);
+        assert_eq!(default_grpc_addr("https://"), None);
+    }
 
     #[test]
     fn expiry_parsing_supports_relative_days_and_rfc3339() {
