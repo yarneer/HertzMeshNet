@@ -9,6 +9,7 @@ pub mod map;
 pub mod netif;
 pub mod path;
 pub mod paths;
+pub mod policy;
 pub mod punch;
 pub mod relay_client;
 pub mod status;

@@ -12,13 +12,15 @@ use std::time::Duration;
 
 use hz_core::coord_client::{
     DEFAULT_COORD_ADDR, LoginPoll, StartedLogin, begin_interactive_login, local_hostname,
-    open_network_map_stream, poll_login_status, register_with_auth_key, report_endpoints,
+    open_network_map_stream, policy_get, policy_push, policy_rollback, poll_login_status,
+    register_with_auth_key, report_endpoints,
 };
 use hz_core::endpoint::{self, DiscoveredEndpoint};
 use hz_core::ipc::{self, Handler};
 use hz_core::keys::KeyStore;
 use hz_core::map::{MapNode, NetworkMapCache};
 use hz_core::path::{PathEvent, PathManager, PeerEndpoints};
+use hz_core::policy::{InboundGate, InboundPolicyView};
 use hz_core::punch::{PunchCodec, PunchMessage};
 use hz_core::status::{NodeStatus, RegisteredInfo};
 #[cfg(target_os = "linux")]
@@ -73,6 +75,8 @@ struct Daemon {
     own_endpoints: Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
     /// 路径管理的当前决定（node_id → 走 Relay）；对账数据面时保序用。
     use_relay: Arc<StdMutex<HashMap<String, bool>>>,
+    /// 入站过滤闸（A1）：Map 流带来的 Policy 视图驱动，TUN 写入路径查询。
+    policy_gate: Arc<InboundGate>,
 }
 
 pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()> {
@@ -108,6 +112,7 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         map_signal: Arc::new(tokio::sync::Notify::new()),
         own_endpoints: Arc::new(StdMutex::new(Vec::new())),
         use_relay: Arc::new(StdMutex::new(HashMap::new())),
+        policy_gate: Arc::new(InboundGate::new()),
     });
 
     // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
@@ -168,6 +173,10 @@ async fn handle_request(
             value["peers"] =
                 serde_json::to_value(peers_view(&daemon)).map_err(|e| e.to_string())?;
             value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
+            value["policy"] = serde_json::json!({
+                "version": daemon.policy_gate.version(),
+                "dropped": daemon.policy_gate.dropped(),
+            });
             Ok(value)
         }
         "up" => {
@@ -211,6 +220,52 @@ async fn handle_request(
                 }
             }
         }
+        "policy_push" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let content = request
+                .params
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少 Policy 内容".to_string())?
+                .to_string();
+            let version = policy_push(&daemon.state_dir, &coord_addr, &content)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({ "version": version }))
+        }
+        "policy_get" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let snapshot = policy_get(&daemon.state_dir, &coord_addr)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            let history: Vec<serde_json::Value> = snapshot
+                .history
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "version": entry.version,
+                        "created_at_unix": entry.created_at_unix,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "version": snapshot.version,
+                "content": snapshot.content,
+                "history": history,
+            }))
+        }
+        "policy_rollback" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let version = request
+                .params
+                .get("version")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "缺少回滚目标版本号".to_string())?;
+            let rolled = policy_rollback(&daemon.state_dir, &coord_addr, version)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({ "version": rolled }))
+        }
         "login_poll" => {
             let progress = daemon.login.lock().expect("login poisoned").clone();
             let registration = daemon
@@ -230,6 +285,17 @@ async fn handle_request(
         }
         _ => Err(format!("unknown method: {}", request.method)),
     }
+}
+
+/// Policy 类 rpc 需要 hzd 已注册（拿注册时记下的 Coordination Server 地址）。
+fn daemon_coord_addr(daemon: &Daemon) -> Result<String, String> {
+    daemon
+        .coord_addr
+        .lock()
+        .expect("coord addr poisoned")
+        .clone()
+        .filter(|addr| !addr.is_empty())
+        .ok_or_else(|| "hzd 尚未注册，无法执行 Policy 操作（先 hz up）".to_string())
 }
 
 /// 注册/登录完成后共用的落盘与数据面拉起。
@@ -355,7 +421,7 @@ async fn start_dataplane(
         }
     }
 
-    spawn_tun_bridge(&engine, info);
+    spawn_tun_bridge(&engine, info, &daemon.map_cache, &daemon.policy_gate);
     spawn_map_task(
         daemon.state_dir.clone(),
         daemon.map_cache.clone(),
@@ -365,6 +431,7 @@ async fn start_dataplane(
         info.node_id.clone(),
         endpoint.to_string(),
         coord_addr.to_string(),
+        daemon.policy_gate.clone(),
     );
     if let Err(error) = dns::spawn(daemon.map_cache.clone()).await {
         tracing::warn!(%error, "dns responder unavailable");
@@ -722,8 +789,15 @@ async fn handle_punch_frame(
     tracing::debug!("punch frame matched no known peer, dropping");
 }
 
-/// TUN 读到的包进引擎，引擎解密的包写回 TUN。TUN 不可用时只保留引擎收发。
-fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
+/// TUN 读到的包进引擎，引擎解密的包写回 TUN；写入前过入站 Policy 闸（A1）：
+/// 源地址 → Map 里的对端身份（归属 User + Tag），目标端口取自 TCP/UDP 头，
+/// 规则之外默认拒绝并计数。TUN 不可用时只保留引擎收发（无写入路径即无过滤点）。
+fn spawn_tun_bridge(
+    engine: &Arc<SocketEngine>,
+    info: &RegisteredInfo,
+    cache: &Arc<NetworkMapCache>,
+    gate: &Arc<InboundGate>,
+) {
     let (to_tunnel_tx, to_tunnel_rx) = mpsc::channel::<Vec<u8>>(256);
     tokio::spawn({
         let engine = engine.clone();
@@ -759,8 +833,44 @@ fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
                 let device = tun.device();
                 tokio::spawn({
                     let device = device.clone();
+                    let cache = cache.clone();
+                    let gate = gate.clone();
                     async move {
+                        // 源地址 → 对端身份索引，随 Map 版本重建（对账口径与引擎一致）。
+                        let mut index_version = u64::MAX;
+                        let mut peer_index: HashMap<IpAddr, (String, Option<String>, Vec<String>)> =
+                            HashMap::new();
                         while let Some(packet) = to_tunnel_rx.recv().await {
+                            if cache.version() != index_version {
+                                index_version = cache.version();
+                                peer_index = cache
+                                    .snapshot()
+                                    .into_iter()
+                                    .filter_map(|node| {
+                                        let v4: Option<IpAddr> = node.ipv4.parse().ok();
+                                        let v6: Option<IpAddr> = node.ipv6.parse().ok();
+                                        let facts =
+                                            (node.node_id.clone(), node.owner_user, node.tags);
+                                        v4.into_iter()
+                                            .chain(v6)
+                                            .map(move |addr| (addr, facts.clone()))
+                                            .next()
+                                    })
+                                    .collect();
+                            }
+                            let class = hz_core::policy::classify_packet(&packet);
+                            let peer = class_src(&class).and_then(|src| peer_index.get(&src));
+                            let admitted = gate.admit(
+                                class,
+                                peer.map(|(node_id, owner, tags)| hz_core::policy::PeerFacts {
+                                    node_id,
+                                    owner_user: owner.as_deref(),
+                                    tags: tags.as_slice(),
+                                }),
+                            );
+                            if !admitted {
+                                continue;
+                            }
                             if let Err(error) = device.send(&packet).await {
                                 tracing::error!(%error, "tun write failed");
                                 break;
@@ -769,11 +879,37 @@ fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
                     }
                 });
                 let engine = engine.clone();
+                let cache = cache.clone();
+                let gate = gate.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65_535];
+                    // 出方向流登记（回包放行依据）与入方向共用对端索引口径。
+                    let mut index_version = u64::MAX;
+                    let mut peer_index: HashMap<IpAddr, String> = HashMap::new();
                     loop {
                         match device.recv(&mut buf).await {
-                            Ok(len) => engine.send_ip_packet(&buf[..len]).await,
+                            Ok(len) => {
+                                let packet = &buf[..len];
+                                let class = hz_core::policy::classify_packet(packet);
+                                if cache.version() != index_version {
+                                    index_version = cache.version();
+                                    peer_index = cache
+                                        .snapshot()
+                                        .into_iter()
+                                        .filter_map(|node| {
+                                            let v4: Option<IpAddr> = node.ipv4.parse().ok();
+                                            let v6: Option<IpAddr> = node.ipv6.parse().ok();
+                                            v4.into_iter()
+                                                .chain(v6)
+                                                .map(move |addr| (addr, node.node_id.clone()))
+                                                .next()
+                                        })
+                                        .collect();
+                                }
+                                let peer = class_dst(&class).and_then(|dst| peer_index.get(&dst));
+                                gate.note_outbound(class, peer.map(String::as_str));
+                                engine.send_ip_packet(packet).await
+                            }
                             Err(error) => {
                                 tracing::error!(%error, "tun read failed");
                                 break;
@@ -790,8 +926,27 @@ fn spawn_tun_bridge(engine: &Arc<SocketEngine>, info: &RegisteredInfo) {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = info;
+        let _ = (info, cache, gate);
         spawn_tunnel_drain(to_tunnel_rx);
+    }
+}
+
+/// 入方向：取包的源地址（对端身份索引的键）。
+#[cfg(target_os = "linux")]
+fn class_src(class: &hz_core::policy::PacketClass) -> Option<IpAddr> {
+    match class {
+        hz_core::policy::PacketClass::Flow { src, .. }
+        | hz_core::policy::PacketClass::Other { src } => Some(*src),
+        hz_core::policy::PacketClass::Malformed => None,
+    }
+}
+
+/// 出方向：取包的目的地址（对端索引的键）。
+#[cfg(target_os = "linux")]
+fn class_dst(class: &hz_core::policy::PacketClass) -> Option<IpAddr> {
+    match class {
+        hz_core::policy::PacketClass::Flow { dst, .. } => Some(*dst),
+        _ => None,
     }
 }
 
@@ -819,6 +974,7 @@ fn spawn_map_task(
     own_node_id: String,
     endpoint: String,
     coord_addr: String,
+    policy_gate: Arc<InboundGate>,
 ) {
     tokio::spawn(async move {
         let decisions = use_relay.lock().expect("use_relay poisoned").clone();
@@ -841,6 +997,9 @@ fn spawn_map_task(
                                 break;
                             }
                         };
+                        if let Some(view) = message.policy.as_ref() {
+                            policy_gate.update(InboundPolicyView::from_proto(view));
+                        }
                         if let Some(kind) = message.kind {
                             let change = match kind {
                                 hz_proto::network_map_message::Kind::Full(map) => cache

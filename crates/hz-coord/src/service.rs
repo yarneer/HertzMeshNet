@@ -10,9 +10,10 @@ use hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION;
 use hz_proto::coord_server::{Coord, CoordServer};
 use hz_proto::{
     BeginLoginRequest, BeginLoginResponse, HelloRequest, HelloResponse, LoginStatusRequest,
-    LoginStatusResponse, NetworkMapMessage, RegisterAuthKeyRequest, RegisterResponse,
-    RelayCheckRequest, RelayCheckResponse, ReportEndpointsRequest, ReportEndpointsResponse,
-    StreamMapRequest,
+    LoginStatusResponse, NetworkMapMessage, PolicyGetRequest, PolicyGetResponse, PolicyPushRequest,
+    PolicyPushResponse, PolicyRollbackRequest, PolicyRollbackResponse, PolicyVersionInfo,
+    RegisterAuthKeyRequest, RegisterResponse, RelayCheckRequest, RelayCheckResponse,
+    ReportEndpointsRequest, ReportEndpointsResponse, StreamMapRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
@@ -274,6 +275,52 @@ impl CoordServiceImpl {
             .verify(&nonce, &Signature::from_bytes(&signature))
             .map_err(|_| Status::unauthenticated("签名验证失败"))?;
         Ok(challenge)
+    }
+
+    /// Policy rpc 的共用前置：挑战认证 + Node 在册且未过期。
+    async fn authenticate_policy_caller(
+        &self,
+        req_protocol_version: u32,
+        req_machine_key_pub: &[u8],
+        req_hostname: &str,
+        req_challenge_nonce: &[u8],
+        req_challenge_signature: &[u8],
+    ) -> Result<crate::store::NodeRecord, Status> {
+        if let Some(status) = Self::hello_reject_old_version(req_protocol_version) {
+            return Err(status);
+        }
+        let machine_key_pub: [u8; 32] = req_machine_key_pub
+            .try_into()
+            .map_err(|_| Status::invalid_argument("machine_key_pub 必须是 32 字节"))?;
+        let nonce: [u8; 32] = req_challenge_nonce
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_nonce 必须是 32 字节"))?;
+        let signature: [u8; 64] = req_challenge_signature
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_signature 必须是 64 字节"))?;
+        Self::take_verified_challenge(
+            &self.challenges,
+            &machine_key_pub,
+            req_hostname,
+            nonce,
+            signature,
+        )?;
+        let record = self
+            .store
+            .node_by_machine_key(&machine_key_pub)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "lookup node for policy rpc failed");
+                Status::internal("查询 Node 失败")
+            })?
+            .ok_or_else(|| Status::permission_denied("Node 未注册或已吊销"))?;
+        if record
+            .expires_at_unix
+            .is_some_and(|expires| expires <= crate::store::unix_now())
+        {
+            return Err(Status::permission_denied("Node 已过期，请重新登录"));
+        }
+        Ok(record)
     }
 }
 
@@ -710,6 +757,116 @@ impl Coord for CoordServiceImpl {
                 Status::internal("更新 Endpoint 失败")
             })?;
         Ok(Response::new(ReportEndpointsResponse {}))
+    }
+
+    /// Policy 整份替换（FR-10）：Admin 授权 → 完整校验（失败整份拒绝）→
+    /// 入库新版本并唤醒 Map 重算（受影响 Node 秒级收到新视图）。
+    async fn policy_push(
+        &self,
+        request: Request<PolicyPushRequest>,
+    ) -> Result<Response<PolicyPushResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_policy_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        crate::policy::authorize_admin(&self.store, &record).await?;
+
+        crate::policy::validate_policy(&self.store, &req.content).await?;
+        let version = self.store.push_policy(&req.content).await.map_err(|e| {
+            tracing::error!(%e, "store policy failed");
+            Status::internal("Policy 入库失败")
+        })?;
+        tracing::info!(node_id = %record.id, version, "policy pushed");
+        Ok(Response::new(PolicyPushResponse { version }))
+    }
+
+    /// 查看当前 Policy 与历史版本（FR-10）。只读，注册 Node 即可调用。
+    async fn policy_get(
+        &self,
+        request: Request<PolicyGetRequest>,
+    ) -> Result<Response<PolicyGetResponse>, Status> {
+        let req = request.into_inner();
+        self.authenticate_policy_caller(
+            req.protocol_version,
+            &req.machine_key_pub,
+            &req.hostname,
+            &req.challenge_nonce,
+            &req.challenge_signature,
+        )
+        .await?;
+
+        let (version, content) = match self.store.current_policy().await.map_err(|e| {
+            tracing::error!(%e, "load current policy failed");
+            Status::internal("读取 Policy 失败")
+        })? {
+            Some((version, content)) => (version, Some(content)),
+            None => (0, None),
+        };
+        let history = self
+            .store
+            .policy_history()
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "load policy history failed");
+                Status::internal("读取 Policy 历史失败")
+            })?
+            .into_iter()
+            .map(|row| PolicyVersionInfo {
+                version: row.version,
+                created_at_unix: row.created_at_unix,
+            })
+            .collect();
+        Ok(Response::new(PolicyGetResponse {
+            content,
+            version,
+            history,
+        }))
+    }
+
+    /// 回滚到历史版本：内容按当前 users 表重新校验（引用可能已失效），
+    /// 失败拒绝并保持现行版本不变。
+    async fn policy_rollback(
+        &self,
+        request: Request<PolicyRollbackRequest>,
+    ) -> Result<Response<PolicyRollbackResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_policy_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        crate::policy::authorize_admin(&self.store, &record).await?;
+
+        let content = self
+            .store
+            .policy_version_content(req.version)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "load policy version for rollback failed");
+                Status::internal("读取 Policy 版本失败")
+            })?
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("版本 {} 不存在，无法回滚", req.version))
+            })?;
+        crate::policy::validate_policy(&self.store, &content).await?;
+        self.store.rollback_policy(req.version).await.map_err(|e| {
+            tracing::error!(%e, "rollback policy failed");
+            Status::internal("Policy 回滚失败")
+        })?;
+        tracing::info!(node_id = %record.id, version = req.version, "policy rolled back");
+        Ok(Response::new(PolicyRollbackResponse {
+            version: req.version,
+        }))
     }
 }
 

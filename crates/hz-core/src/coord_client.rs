@@ -13,8 +13,9 @@ use ed25519_dalek::Signer;
 use hyper_util::rt::TokioIo;
 use hz_proto::coord_client::CoordClient;
 use hz_proto::{
-    BeginLoginRequest, HelloRequest, LoginStatusRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest,
-    ReportEndpointsRequest, StreamMapRequest,
+    BeginLoginRequest, HelloRequest, LoginStatusRequest, PROTOCOL_VERSION, PolicyGetRequest,
+    PolicyPushRequest, PolicyRollbackRequest, RegisterAuthKeyRequest, ReportEndpointsRequest,
+    StreamMapRequest,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tonic::Streaming;
@@ -280,6 +281,119 @@ pub async fn poll_login_status(
 
 async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {
     connect_tls_channel(coord_addr, None).await
+}
+
+/// Hello → 签挑战的公共两步；返回（nonce, signature）。
+async fn signed_challenge(
+    client: &mut CoordClient<Channel>,
+    keys: &crate::keys::KeyStore,
+    hostname: &str,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let hello = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: hostname.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("Hello 被拒绝（{status}）"))?
+        .into_inner();
+    let nonce = hello.challenge_nonce;
+    let signature = keys.machine().sign(&nonce).to_bytes().to_vec();
+    Ok((nonce, signature))
+}
+
+/// `hz policy get` 取回的当前 Policy 与历史。
+#[derive(Debug, Clone)]
+pub struct PolicySnapshot {
+    /// 当前版本号；尚无 Policy 时为 0。
+    pub version: i64,
+    /// 当前 Policy 的 TOML 原文；尚无 Policy 时为 None。
+    pub content: Option<String>,
+    pub history: Vec<PolicyVersionEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVersionEntry {
+    pub version: i64,
+    pub created_at_unix: i64,
+}
+
+/// Policy 整份替换（FR-10）。返回服务端分配的版本号。
+pub async fn policy_push(state_dir: &Path, coord_addr: &str, content: &str) -> anyhow::Result<i64> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .policy_push(PolicyPushRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            content: content.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("Policy 推送被拒绝（{status}）"))?
+        .into_inner();
+    Ok(response.version)
+}
+
+/// 查看当前 Policy 与历史版本（FR-10）。
+pub async fn policy_get(state_dir: &Path, coord_addr: &str) -> anyhow::Result<PolicySnapshot> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .policy_get(PolicyGetRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+        })
+        .await
+        .map_err(|status| anyhow!("Policy 查询失败（{status}）"))?
+        .into_inner();
+    Ok(PolicySnapshot {
+        version: response.version,
+        content: response.content,
+        history: response
+            .history
+            .into_iter()
+            .map(|entry| PolicyVersionEntry {
+                version: entry.version,
+                created_at_unix: entry.created_at_unix,
+            })
+            .collect(),
+    })
+}
+
+/// 回滚到指定历史版本（FR-10）。引用已失效的版本会被服务端拒绝。
+pub async fn policy_rollback(
+    state_dir: &Path,
+    coord_addr: &str,
+    version: i64,
+) -> anyhow::Result<i64> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .policy_rollback(PolicyRollbackRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            version,
+        })
+        .await
+        .map_err(|status| anyhow!("Policy 回滚被拒绝（{status}）"))?
+        .into_inner();
+    Ok(response.version)
 }
 
 /// 面向 Node 侧长连接服务的 TLS 通道：https 走 TLS（ca_pem 为 Some 时信任

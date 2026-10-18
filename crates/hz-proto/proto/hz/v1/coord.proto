@@ -23,6 +23,13 @@ service Coord {
   // 服务端落库并随 Network Map 差量推给其他 Node。与打洞信令无关——
   // 实时协商走 Relay 通道，不经 Coordination Server。
   rpc ReportEndpoints(ReportEndpointsRequest) returns (ReportEndpointsResponse);
+  // Policy 整份替换（FR-10）：调用方 Node 用 Machine Key 挑战认证，
+  // 服务端按 Node 归属 User 的 Admin 身份授权（A3）。校验失败整份拒绝。
+  rpc PolicyPush(PolicyPushRequest) returns (PolicyPushResponse);
+  // 查看当前 Policy 与历史版本列表（FR-10）。
+  rpc PolicyGet(PolicyGetRequest) returns (PolicyGetResponse);
+  // 回滚到历史版本：内容须仍通过校验，否则拒绝。
+  rpc PolicyRollback(PolicyRollbackRequest) returns (PolicyRollbackResponse);
 }
 
 message HelloRequest {
@@ -142,6 +149,30 @@ message NetworkMapMessage {
     NetworkMap full = 1;
     MapDelta delta = 2;
   }
+  // Policy 语境（#13）：当前版本号 + 本 Node 视角的入站过滤规则。
+  // 无 Policy（bootstrap 全互通）时不携带；Policy 变化时随消息下发，
+  // 目标 Node 据此过滤入站流量（A1）。
+  PolicyView policy = 3;
+}
+
+// 下发给单个 Node 的 Policy 视图：version 与 Group 定义是全局的，
+// inbound_rules 已按"to 侧命中该 Node"筛过。
+message PolicyView {
+  int64 version = 1;
+  repeated PolicyGroup groups = 2;
+  repeated InboundRule inbound_rules = 3;
+}
+
+message PolicyGroup {
+  string name = 1;
+  repeated string users = 2;
+}
+
+// to 侧命中本 Node 的一条规则：from 主体 + 允许端口。
+message InboundRule {
+  // "group:dev" | "user:alice" | "tag:ci"
+  string from = 1;
+  repeated uint32 ports = 2;
 }
 
 message NetworkMap {
@@ -164,4 +195,53 @@ message RelayCheckRequest {
 message RelayCheckResponse {
   bool valid = 1;
   string reason = 2;
+}
+
+message PolicyPushRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  // TOML 原文，整份替换。
+  string content = 6;
+}
+
+message PolicyPushResponse {
+  // 服务端分配的新版本号。
+  int64 version = 1;
+}
+
+message PolicyGetRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+}
+
+message PolicyGetResponse {
+  // 当前 Policy 的 TOML 原文；尚无 Policy 时为空。
+  optional string content = 1;
+  // 当前版本号；尚无 Policy 时为 0。
+  int64 version = 2;
+  repeated PolicyVersionInfo history = 3;
+}
+
+message PolicyVersionInfo {
+  int64 version = 1;
+  int64 created_at_unix = 2;
+}
+
+message PolicyRollbackRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  int64 version = 6;
+}
+
+message PolicyRollbackResponse {
+  int64 version = 1;
 }

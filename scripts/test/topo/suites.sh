@@ -695,3 +695,242 @@ assert_suite_proxysim() {
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
 }
+
+# ---------------------------------------------------------------------------
+# 套件 policy_dev_db：ticket #13 Policy（FR-10 / ADR-0006 / A1）
+# ---------------------------------------------------------------------------
+peer_names_of() { # peer_names_of <node>：status json 的对端名列表（逗号分隔、排序）
+  node_status_json "$1" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(",".join(sorted(p["name"] for p in (d.get("peers") or []))))'
+}
+
+wait_peer_set() { # wait_peer_set <node> <期望对端名逗号串>
+  local node="$1" expected="$2" i
+  for i in $(seq 1 60); do
+    if [[ $(peer_names_of "$node") == "$expected" ]]; then return 0; fi
+    sleep 0.5
+  done
+  fail "$node：对端视图未在 30s 内变为 [$expected]，实际 [$(peer_names_of "$node")]"
+  return 1
+}
+
+policy_field() { # policy_field <node> <field>（status json 的 policy 段）
+  node_status_json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["policy"]["'"$2"'"])'
+}
+
+tcp_connect() { # tcp_connect <node> <ip> <port> <timeout-secs>：成功打印 OK
+  local ns; ns=$(node_ns "$1")
+  ip netns exec "$ns" timeout "$4" python3 -c '
+import socket, sys
+s = socket.socket(); s.settimeout(float(sys.argv[3]))
+try:
+    s.connect((sys.argv[1], int(sys.argv[2])))
+except OSError as e:
+    sys.exit(1)
+s.sendall(b"ping")
+print("OK")
+' "$2" "$3" "$4" 2>/dev/null
+}
+
+listen_forever() { # listen_forever <node> <port>：ns 内起一个回显式 TCP 监听（后台）
+  local ns; ns=$(node_ns "$1")
+  ip netns exec "$ns" setsid python3 -c '
+import socket, sys
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", int(sys.argv[1]))); srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    try:
+        conn.recv(64); conn.sendall(b"pong")
+    finally:
+        conn.close()
+' "$2" > "$ART_DIR/listener-$1-$2.log" 2>&1 &
+}
+
+assert_suite_policy_dev_db() {
+  local db="$ART_DIR/coord.db" a b d
+  a=$(reg_list | awk -F'|' '$1 == "a" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$1 == "b" { print $1; exit }')
+  d=$(reg_list | awk -F'|' '$1 == "d" { print $1; exit }')
+  [[ -n $a && -n $b && -n $d ]] || { fail "场景需要 a/b/d 三个节点"; return 1; }
+
+  note "[$d] 签发带 tag:db 的 Auth Key（FR-1：预绑定 Tag）"
+  ip netns exec "$WAN_NS" "$BIN_DIR/hz-coord" bootstrap --db "$db" \
+    --auth-key-expiry 1d --tag db --json > "$ART_DIR/key-db-tag.json" || { fail "bootstrap tag key 失败"; return 1; }
+
+  note "[a/b/d] 启动 hzd 并注册（a、b 用普通 Key，d 用 tag Key）"
+  start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$d" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-db-tag.json"))["auth_key"])')" || return 1
+
+  note "等待无 Policy 时的全互通（bootstrap 态）"
+  wait_peer_set "$a" "hznodeb,hznoded" || return 1
+  wait_peer_set "$b" "hznodea,hznoded" || return 1
+  wait_peer_set "$d" "hznodea,hznodeb" || return 1
+  pass "无 Policy 时三方全互通"
+
+  note "种入 alice(Admin)/bob 身份与 Node 归属（生产路径是交互式登录，此处直写库）"
+  python3 - "$db" <<'PY' || { fail "身份种子写入失败"; return 1; }
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=10)
+db.execute("INSERT OR IGNORE INTO users (id, name, is_admin) VALUES ('u-alice', 'alice', 1)")
+db.execute("INSERT OR IGNORE INTO users (id, name, is_admin) VALUES ('u-bob', 'bob', 0)")
+db.execute("UPDATE nodes SET user_id = 'u-alice' WHERE name = 'hznodea'")
+db.execute("UPDATE nodes SET user_id = 'u-bob' WHERE name = 'hznodeb'")
+db.commit()
+PY
+
+  cat > "$ART_DIR/policy-5432.toml" <<'EOF'
+[[group]]
+name = "dev"
+users = ["alice"]
+
+[[rule]]
+from = "group:dev"
+to = "tag:db"
+ports = [5432]
+EOF
+
+  note "[$a] alice（Admin）推送 Policy：group:dev → tag:db:5432"
+  if out=$(hz_cli "$a" policy push "$ART_DIR/policy-5432.toml"); then
+    pass "Policy 推送成功：$out"
+  else
+    fail "Policy 推送失败：$out"
+    return 1
+  fi
+
+  note "断言 1：Network Map 按订阅者过滤（ADR-0006）"
+  wait_peer_set "$a" "hznoded" || return 1
+  pass "a（dev 成员）的 Map 只剩 db"
+  wait_peer_set "$b" "" || return 1
+  pass "b（非 dev 成员）的 Map 没有 hznoded（Seam A AC）"
+  wait_peer_set "$d" "hznodea" || return 1
+  pass "d 的 Map 只剩 a（可见性方向无关）"
+
+  local d4
+  d4=$(node_status_json "$a" | python3 -c 'import json,sys; print(json.load(sys.stdin)["peers"][0]["ipv4"])')
+  note "d 的 Node Address（a 视角）：$d4"
+
+  note "断言 2：a → d:5432 可达（目标侧监听走 wg 路径）"
+  listen_forever "$d" 5432
+  sleep 0.5
+  if [[ $(tcp_connect "$a" "$d4" 5432 5) == OK ]]; then
+    pass "a → d:5432 连通（dev 成员连 tag:db:5432）"
+  else
+    fail "a → d:5432 不通"
+  fi
+
+  note "断言 3：a → d:22 被目标 Node 入站过滤拒绝（A1）+ 丢弃计数"
+  local dropped_before
+  dropped_before=$(policy_field "$d" dropped)
+  if tcp_connect "$a" "$d4" 22 4; then
+    fail "a → d:22 不应连通（Policy 只放行 5432）"
+  else
+    pass "a → d:22 连接失败（超时/拒绝）"
+  fi
+  local dropped_after i
+  for i in $(seq 1 10); do
+    dropped_after=$(policy_field "$d" dropped)
+    (( dropped_after > dropped_before )) && break
+    sleep 0.5
+  done
+  if (( dropped_after > dropped_before )); then
+    pass "d 的 Policy 丢弃计数增加：$dropped_before → $dropped_after"
+  else
+    fail "d 的丢弃计数未增加（$dropped_before → $dropped_after）"
+  fi
+
+  note "断言 4：b → d:5432 不通（b 的 Map 没有 d，无路由/无对端）"
+  if tcp_connect "$b" "$d4" 5432 4; then
+    fail "b → d:5432 不应连通"
+  else
+    pass "b → d:5432 连接失败（非成员不可见）"
+  fi
+
+  note "断言 5：a ping d 可达（非 TCP/UDP 跟随 Map 可见性）"
+  ping_assert "$a" "$d4" "a → d ICMP（$d4）"
+
+  note "断言 6：第二份 Policy 放行 22 → 5 秒内生效"
+  cat > "$ART_DIR/policy-5432-22.toml" <<'EOF'
+[[group]]
+name = "dev"
+users = ["alice"]
+
+[[rule]]
+from = "group:dev"
+to = "tag:db"
+ports = [5432, 22]
+EOF
+  listen_forever "$d" 22
+  sleep 0.5
+  if out=$(hz_cli "$a" policy push "$ART_DIR/policy-5432-22.toml"); then
+    pass "第二份 Policy 推送成功：$out"
+  else
+    fail "第二份 Policy 推送失败：$out"
+    return 1
+  fi
+  local push_time connected
+  push_time=$(date +%s.%N)
+  connected=""
+  for i in $(seq 1 50); do
+    if [[ $(tcp_connect "$a" "$d4" 22 1) == OK ]]; then connected=yes; break; fi
+    sleep 0.1
+  done
+  local elapsed
+  elapsed=$(python3 -c "import sys, time; sys.stdout.write('%.1f' % (time.time() - float(sys.argv[1])))" "$push_time")
+  if [[ -n $connected ]]; then
+    if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5.0 else 1)" "$elapsed"; then
+      pass "Policy 更新后 ${elapsed}s 内 a → d:22 连通（< 5s AC）"
+    else
+      fail "a → d:22 最终连通但耗时 ${elapsed}s，超过 5s AC"
+    fi
+  else
+    fail "第二份 Policy 后 a → d:22 仍不通"
+  fi
+
+  note "断言 7：校验失败的 Policy 整份被拒绝、现行不变"
+  echo 'this is [not toml' > "$ART_DIR/policy-bad.toml"
+  if hz_cli "$a" policy push "$ART_DIR/policy-bad.toml" >/dev/null 2>&1; then
+    fail "语法错误的 Policy 不应推送成功"
+  else
+    pass "语法错误的 Policy 被整份拒绝"
+  fi
+  if hz_cli "$a" policy get | grep -q 'ports = \[5432, 22\]'; then
+    pass "现行 Policy 保持版本 2 内容"
+  else
+    fail "现行 Policy 内容异常（get 输出：$(hz_cli "$a" policy get 2>&1 | head -4 | tr '\n' ' ')）"
+  fi
+
+  note "断言 8：历史版本与回滚"
+  if hz_cli "$a" policy rollback 1 >/dev/null 2>&1; then
+    pass "回滚到版本 1 成功"
+  else
+    fail "回滚到版本 1 失败"
+  fi
+  if wait_peer_set "$a" "hznoded"; then
+    pass "回滚后 a 的 Map 仍只含 d（规则同形）"
+  else
+    fail "回滚后 a 的 Map 异常"
+  fi
+  if tcp_connect "$a" "$d4" 22 3; then
+    fail "回滚到只放行 5432 后 a → d:22 不应连通"
+  else
+    pass "回滚后 a → d:22 重新被拒（5 秒内生效同一条通道）"
+  fi
+
+  note "断言 9：非 Admin 的 Node 不能推送"
+  if hz_cli "$b" policy push "$ART_DIR/policy-5432.toml" >/dev/null 2>&1; then
+    fail "b（非 Admin）不应能推送 Policy"
+  else
+    pass "b（非 Admin）推送被拒绝"
+  fi
+  if hz_cli "$d" policy push "$ART_DIR/policy-5432.toml" >/dev/null 2>&1; then
+    fail "d（带 Tag 无归属）不应能推送 Policy"
+  else
+    pass "d（带 Tag）推送被拒绝（A3）"
+  fi
+
+  (( FAILURES == 0 ))
+}
