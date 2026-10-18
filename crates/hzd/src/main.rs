@@ -3,6 +3,15 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("install-launchd") {
+        let plist_path = args
+            .iter()
+            .position(|arg| arg == "--plist")
+            .and_then(|pos| args.get(pos + 1))
+            .cloned();
+        return hzd::launchd::install(plist_path.as_deref().map(std::path::Path::new));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

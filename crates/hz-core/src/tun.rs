@@ -1,13 +1,16 @@
-//! TUN 设备 hz0：设备创建走 `tun` crate（macOS utun 在 #16 接入），
-//! 地址与路由用 `ip` 命令配置。只接管 HzNet 的 IPv4 段（默认 100.96.0.0/16）
-//! 与本部署的 ULA /48，绝不路由 100.64.0.0/10（ADR-0003，阿里云内网服务所在段）。
-//! `route_args` 是纯函数，可在无 root 的主机上单测路由边界。
+//! TUN 设备：Linux 上是 hz0（`ip` 命令配置），macOS 上是内核分配的 utun
+//! （`ifconfig`/`route` 命令配置，名字创建后才可知）。只接管 HzNet 的 IPv4 段
+//! （默认 100.96.0.0/16）与本部署的 ULA /48，绝不路由 100.64.0.0/10
+//! （ADR-0003，阿里云内网服务所在段）。`route_args`/`macos_config_args`
+//! 是纯函数，可在无 root 的主机上单测路由边界。
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use anyhow::Context;
 use anyhow::bail;
 
@@ -98,14 +101,14 @@ pub fn remove_secondary_addr(addr: &Ipv4Addr) -> anyhow::Result<()> {
 }
 
 /// 非 Linux 平台 hz0 尚未落地（#16），辅助地址同样不可用。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn add_secondary_addr(_addr: &Ipv4Addr) -> anyhow::Result<()> {
-    bail!("hz0 辅助地址目前仅支持 Linux；macOS 支持在后续票据实现")
+    bail!("hz0 辅助地址目前仅支持 Linux/macOS；其他平台在后续票据实现")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn remove_secondary_addr(_addr: &Ipv4Addr) -> anyhow::Result<()> {
-    bail!("hz0 辅助地址目前仅支持 Linux；macOS 支持在后续票据实现")
+    bail!("hz0 辅助地址目前仅支持 Linux/macOS；其他平台在后续票据实现")
 }
 
 /// ULA /48 前缀 = 本机 ULA 地址的前三组。
@@ -114,9 +117,104 @@ fn ula_prefix48(addr: Ipv6Addr) -> String {
     format!("{:x}:{:x}:{:x}::/48", segments[0], segments[1], segments[2])
 }
 
-/// 已创建并配置完毕的 hz0。读循环与写循环共享同一设备句柄。
+/// macOS：本进程创建的 utun 设备名（内核分配，如 utun9）。
+/// 辅助地址（本地 DNS 应答的 100.96.0.53）挂靠它，DNS 启动晚于 TUN，
+/// 用进程级槽位传递而不是穿过 IPC。
+#[cfg(target_os = "macos")]
+static MAC_IFACE: OnceLock<String> = OnceLock::new();
+
+/// 计算配置 macOS utun 需要的全部命令参数序列（首元素是程序名）。
+/// 点对点地址（本机地址兼任对端），路由只挂 HzNet v4 段与 ULA /48。
+#[cfg(target_os = "macos")]
+pub fn macos_config_args(cfg: &TunConfig, iface: &str) -> Vec<Vec<String>> {
+    let ula48 = ula_prefix48(cfg.ipv6);
+    vec![
+        cmd_args(
+            "ifconfig",
+            &[iface, &cfg.ipv4.to_string(), &cfg.ipv4.to_string(), "up"],
+        ),
+        cmd_args("ifconfig", &[iface, "mtu", &MTU.to_string()]),
+        cmd_args(
+            "ifconfig",
+            &[iface, "inet6", &format!("{}/128", cfg.ipv6), "add"],
+        ),
+        cmd_args(
+            "route",
+            &["-n", "add", "-net", &cfg.v4_cidr, "-interface", iface],
+        ),
+        cmd_args(
+            "route",
+            &["-n", "add", "-inet6", &ula48, "-interface", iface],
+        ),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_args(program: &str, parts: &[&str]) -> Vec<String> {
+    std::iter::once(program.to_string())
+        .chain(parts.iter().map(|s| s.to_string()))
+        .collect()
+}
+
+/// macOS 上给 utun 追加/移除辅助地址（如本地 DNS 应答地址）的命令参数。
+#[cfg(target_os = "macos")]
+pub fn macos_secondary_alias_args(iface: &str, addr: &Ipv4Addr, add: bool) -> Vec<String> {
+    let action = if add { "add" } else { "remove" };
+    cmd_args(
+        "ifconfig",
+        &[iface, &addr.to_string(), &addr.to_string(), action],
+    )
+}
+
+/// macOS：给 utun 追加辅助地址。地址已存在视为成功——重复启动幂等。
+/// 数据面（Tun::setup）未拉起时没有可挂靠的 utun，直接失败。
+#[cfg(target_os = "macos")]
+pub fn add_secondary_addr(addr: &Ipv4Addr) -> anyhow::Result<()> {
+    let iface = MAC_IFACE.get().ok_or_else(|| {
+        anyhow::anyhow!("utun 数据面未创建，无法挂辅助地址 {addr}（数据面需要 root 权限）")
+    })?;
+    let args = macos_secondary_alias_args(iface, addr, true);
+    run_macos_cmd(&args)
+}
+
+/// macOS：从 utun 移除辅助地址。地址本来不存在也视为成功——清理路径幂等。
+#[cfg(target_os = "macos")]
+pub fn remove_secondary_addr(addr: &Ipv4Addr) -> anyhow::Result<()> {
+    let Some(iface) = MAC_IFACE.get() else {
+        return Ok(());
+    };
+    let args = macos_secondary_alias_args(iface, addr, false);
+    run_macos_cmd(&args).or_else(|error| {
+        // alias 不存在时 ifconfig 报 can't address unresolved destination 之类的错。
+        if error.to_string().contains("can't address")
+            || error.to_string().contains("does not seem to be")
+        {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_cmd(args: &[String]) -> anyhow::Result<()> {
+    let output = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .output()
+        .with_context(|| format!("execute {} 失败（命令不存在？）", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "{} 失败：{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// 已创建并配置完毕的 TUN 设备。读循环与写循环共享同一设备句柄。
 pub struct Tun {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     device: Arc<tun::AsyncDevice>,
 }
 
@@ -144,13 +242,49 @@ impl Tun {
         })
     }
 
-    /// 非 Linux 平台的数据面在 #16 接入；控制面照常工作。
-    #[cfg(not(target_os = "linux"))]
-    pub fn setup(_cfg: &TunConfig) -> anyhow::Result<Self> {
-        bail!("TUN 数据面目前仅支持 Linux；macOS 支持在后续票据实现")
+    /// 创建 utun 并接管路由（设备名由内核分配）。需要 root；
+    /// 无 root 时内核对 utun 控制socket 返回 EPERM，这里给出明确提示。
+    #[cfg(target_os = "macos")]
+    pub fn setup(cfg: &TunConfig) -> anyhow::Result<Self> {
+        let mut config = tun::Configuration::default();
+        // utun 名字带内核分配的序号，不能像 Linux 那样指定 hz0。
+        config.mtu(MTU);
+        let device = tun::create_as_async(&config).map_err(|error| {
+            if error.to_string().contains("os error 1") || error.to_string().contains("EPERM") {
+                anyhow::anyhow!(
+                    "创建 utun 设备需要 root 权限（以 sudo 运行或经 launchd 安装）：{error}"
+                )
+            } else {
+                anyhow::anyhow!("create utun device failed: {error}")
+            }
+        })?;
+        use tun::AbstractDevice as _;
+        let iface = device
+            .tun_name()
+            .with_context(|| "query utun device name failed")?;
+        for args in macos_config_args(cfg, &iface) {
+            run_macos_cmd(&args)?;
+        }
+        let _ = MAC_IFACE.set(iface.clone());
+        tracing::info!(
+            iface = %iface,
+            ipv4 = %cfg.ipv4,
+            ipv6 = %cfg.ipv6,
+            v4_cidr = %cfg.v4_cidr,
+            "utun device configured"
+        );
+        Ok(Self {
+            device: Arc::new(device),
+        })
     }
 
-    #[cfg(target_os = "linux")]
+    /// 其余平台的数据面尚未落地；控制面照常工作。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn setup(_cfg: &TunConfig) -> anyhow::Result<Self> {
+        bail!("TUN 数据面目前仅支持 Linux/macOS；其他平台在后续票据实现")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn device(&self) -> Arc<tun::AsyncDevice> {
         self.device.clone()
     }
@@ -225,6 +359,69 @@ mod tests {
         assert_eq!(
             secondary_addr_args(&Ipv4Addr::new(100, 96, 0, 53), false).join(" "),
             "addr del 100.96.0.53/32 dev hz0"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_config_args_configure_addresses_mtu_and_only_hznet_routes() {
+        let args = macos_config_args(&config(), "utun9");
+        let joined: Vec<String> = args.iter().map(|a| a.join(" ")).collect();
+        assert_eq!(
+            joined[0], "ifconfig utun9 100.96.0.1 100.96.0.1 up",
+            "点对点：本机地址兼任对端"
+        );
+        assert_eq!(joined[1], "ifconfig utun9 mtu 1280");
+        assert_eq!(
+            joined[2],
+            "ifconfig utun9 inet6 fd12:3456:789a::6460:1/128 add"
+        );
+        assert_eq!(
+            joined[3],
+            "route -n add -net 100.96.0.0/16 -interface utun9"
+        );
+        assert_eq!(
+            joined[4],
+            "route -n add -inet6 fd12:3456:789a::/48 -interface utun9"
+        );
+        assert_eq!(joined.len(), 5, "不得有多余命令：{joined:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_config_args_never_capture_the_wider_cgnat_range() {
+        for args in macos_config_args(&config(), "utun9") {
+            assert!(
+                !args.iter().any(|a| a.contains(FORBIDDEN_CIDR)),
+                "不得把 {FORBIDDEN_CIDR} 路由进 utun：{args:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_config_args_honor_custom_v4_cidr() {
+        let cfg = TunConfig {
+            v4_cidr: "10.200.0.0/16".to_string(),
+            ..config()
+        };
+        let joined: Vec<String> = macos_config_args(&cfg, "utun3")
+            .iter()
+            .map(|a| a.join(" "))
+            .collect();
+        assert!(joined.contains(&"route -n add -net 10.200.0.0/16 -interface utun3".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_secondary_alias_adds_and_removes_on_the_utun() {
+        assert_eq!(
+            macos_secondary_alias_args("utun9", &Ipv4Addr::new(100, 96, 0, 53), true).join(" "),
+            "ifconfig utun9 100.96.0.53 100.96.0.53 add"
+        );
+        assert_eq!(
+            macos_secondary_alias_args("utun9", &Ipv4Addr::new(100, 96, 0, 53), false).join(" "),
+            "ifconfig utun9 100.96.0.53 100.96.0.53 remove"
         );
     }
 }

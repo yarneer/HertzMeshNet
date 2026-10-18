@@ -7,6 +7,8 @@ pub mod ipc;
 pub mod keys;
 pub mod map;
 pub mod netif;
+#[cfg(target_os = "macos")]
+pub mod netwatch_mac;
 pub mod path;
 pub mod paths;
 pub mod policy;

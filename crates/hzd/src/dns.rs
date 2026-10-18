@@ -3,7 +3,9 @@
 //! 系统接入是声明式配置而不是一串命令：systemd-resolved 环境写
 //! conf.d/hznet.conf 分域接管（`Domains=~<suffix>`，只吃 HzNet 后缀）；
 //! 无 systemd 的容器/测试环境在 HZD_DNS_RESOLVCONF_FALLBACK=1 显式要求下才
-//! 重写 /etc/resolv.conf，停止时逐字节还原；两者之外的文件一概不碰。
+//! 重写 /etc/resolv.conf，停止时逐字节还原；macOS 写 `/etc/resolver/<suffix>`
+//! 分域接管（mDNSResponder 按文件名匹配后缀，只吃 HzNet 后缀），停止时删除
+//! 或逐字节还原；三者之外的文件一概不碰。
 //! 线格式按 RFC 1035 手写编码（只做 应答 A/AAAA + REFUSED/NXDOMAIN，
 //! 不递归），垃圾报文回 FORMERR。
 
@@ -282,6 +284,20 @@ impl ResolvedConfig {
     }
 }
 
+/// macOS `/etc/resolver/<suffix>` 分域接管的声明式配置；文件名即接管的后缀，
+/// mDNSRecognizer 只把该后缀的查询交给指定 nameserver。render 是纯函数，
+/// 字面量可测。
+pub struct ResolverFileConfig {
+    pub suffix: String,
+    pub dns_addr: Ipv4Addr,
+}
+
+impl ResolverFileConfig {
+    pub fn render(&self) -> String {
+        format!("nameserver {}\n", self.dns_addr)
+    }
+}
+
 /// resolv.conf 显式退路的生成内容：本服务 nameserver 置顶（后缀内应答、
 /// 后缀外 REFUSED 让 glibc 顺序落到原 nameserver），search 合并进后缀。
 /// 纯函数，字面量可测。
@@ -311,13 +327,35 @@ pub fn fallback_resolvconf_content(previous: &str, dns: Ipv4Addr, suffix: &str) 
 pub struct SystemDnsPaths {
     pub resolved_conf: PathBuf,
     pub resolv_conf: PathBuf,
+    /// macOS `/etc/resolver/<suffix>`；Linux 机制不会选它。
+    pub resolver_file: PathBuf,
 }
 
 impl SystemDnsPaths {
     pub fn system() -> Self {
+        let suffix = hz_core::dns::dns_suffix();
         Self {
             resolved_conf: PathBuf::from("/etc/systemd/resolved/conf.d/hznet.conf"),
             resolv_conf: PathBuf::from("/etc/resolv.conf"),
+            resolver_file: PathBuf::from("/etc/resolver").join(suffix),
+        }
+    }
+}
+
+/// 本平台的系统接入机制（FR-5）：macOS 走 /etc/resolver/ 分域接管，
+/// 其余走 systemd-resolved（退路见 allow_fallback）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mechanism {
+    ResolvedOrFallback,
+    ResolverFile,
+}
+
+impl Mechanism {
+    fn system() -> Self {
+        if cfg!(target_os = "macos") {
+            Mechanism::ResolverFile
+        } else {
+            Mechanism::ResolvedOrFallback
         }
     }
 }
@@ -333,11 +371,29 @@ enum Integration {
         path: PathBuf,
         previous: Vec<u8>,
     },
+    /// macOS `/etc/resolver/<suffix>`：快照/还原语义与 ResolvedConf 相同
+    /// （启动前不存在则停止时删除，存在则原样还原）。
+    ResolverFile {
+        path: PathBuf,
+        previous: Option<Vec<u8>>,
+    },
     None,
 }
 
 impl Integration {
-    fn apply(paths: &SystemDnsPaths, config: &ResolvedConfig, allow_fallback: bool) -> Integration {
+    fn apply(
+        paths: &SystemDnsPaths,
+        config: &ResolvedConfig,
+        mechanism: Mechanism,
+        allow_fallback: bool,
+    ) -> Integration {
+        if mechanism == Mechanism::ResolverFile {
+            let resolver_config = ResolverFileConfig {
+                suffix: config.suffix.clone(),
+                dns_addr: config.dns_addr,
+            };
+            return apply_resolver_file(&paths.resolver_file, &resolver_config);
+        }
         let Some(conf_dir) = paths.resolved_conf.parent().map(PathBuf::from) else {
             return Integration::None;
         };
@@ -394,15 +450,11 @@ impl Integration {
     fn restore(self) -> anyhow::Result<()> {
         match self {
             Integration::ResolvedConf { path, previous } => {
-                match previous {
-                    Some(bytes) => std::fs::write(&path, bytes)?,
-                    None => match std::fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    },
-                }
+                restore_written_file(&path, previous)?;
                 flush_resolved_caches();
+            }
+            Integration::ResolverFile { path, previous } => {
+                restore_written_file(&path, previous)?;
             }
             Integration::ResolvConfFallback { path, previous } => {
                 std::fs::write(&path, previous)?;
@@ -420,6 +472,41 @@ fn flush_resolved_caches() {
     {
         Ok(output) if output.status.success() => {}
         _ => tracing::debug!("resolvectl flush-caches unavailable, skipped"),
+    }
+}
+
+/// 启动前不存在则停止时删除，存在则逐字节还原（ResolvedConf 与
+/// ResolverFile 共用的快照/还原语义）。
+fn restore_written_file(path: &std::path::Path, previous: Option<Vec<u8>>) -> anyhow::Result<()> {
+    match previous {
+        Some(bytes) => std::fs::write(path, bytes)?,
+        None => match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+    }
+    Ok(())
+}
+
+/// macOS：写 `/etc/resolver/<suffix>`（目录不存在则创建，须 root；
+/// 测试用临时目录注入）。写失败降级为 None（应答器仍在，仅系统接入缺失）。
+fn apply_resolver_file(path: &std::path::Path, config: &ResolverFileConfig) -> Integration {
+    let previous = std::fs::read(path).ok();
+    let write = std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("/")))
+        .and_then(|()| std::fs::write(path, config.render()));
+    match write {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "resolver file written (domain split)");
+            Integration::ResolverFile {
+                path: path.to_path_buf(),
+                previous,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "write resolver file failed");
+            Integration::None
+        }
     }
 }
 
@@ -449,12 +536,8 @@ pub async fn spawn(cache: Arc<NetworkMapCache>) -> anyhow::Result<()> {
         return Ok(());
     }
     let suffix = hz_core::dns::dns_suffix();
-    let config = ResolvedConfig {
-        suffix: suffix.clone(),
-        dns_addr: DNS_BIND_V4,
-    };
     hz_core::tun::add_secondary_addr(&DNS_BIND_V4).with_context(|| {
-        format!("hz0 辅助地址 {DNS_BIND_V4}/32 添加失败（hz0 未就绪则本地 DNS 应答不可用）")
+        format!("TUN 辅助地址 {DNS_BIND_V4}/32 添加失败（TUN 未就绪则本地 DNS 应答不可用）")
     })?;
     let addr = SocketAddr::from((DNS_BIND_V4, DNS_PORT));
     let bound = match spawn_responder(addr, cache, suffix.clone()).await {
@@ -469,7 +552,16 @@ pub async fn spawn(cache: Arc<NetworkMapCache>) -> anyhow::Result<()> {
         std::env::var("HZD_DNS_RESOLVCONF_FALLBACK").as_deref(),
         Ok("1") | Ok("true")
     );
-    let integration = Integration::apply(&SystemDnsPaths::system(), &config, allow_fallback);
+    let config = ResolvedConfig {
+        suffix: suffix.clone(),
+        dns_addr: DNS_BIND_V4,
+    };
+    let integration = Integration::apply(
+        &SystemDnsPaths::system(),
+        &config,
+        Mechanism::system(),
+        allow_fallback,
+    );
     spawn_signal_task(Arc::new(ShutdownGuard(StdMutex::new(Some(integration)))));
     Ok(())
 }
@@ -699,13 +791,14 @@ mod tests {
         let paths = SystemDnsPaths {
             resolved_conf: conf_dir.join("hznet.conf"),
             resolv_conf: dir.path().join("resolv.conf"),
+            resolver_file: dir.path().join("resolver").join("hznet.internal"),
         };
         let config = ResolvedConfig {
             suffix: "hznet.internal".to_string(),
             dns_addr: DNS_BIND_V4,
         };
 
-        let integration = Integration::apply(&paths, &config, false);
+        let integration = Integration::apply(&paths, &config, Mechanism::ResolvedOrFallback, false);
         assert_eq!(
             std::fs::read_to_string(&paths.resolved_conf).unwrap(),
             config.render()
@@ -729,13 +822,14 @@ mod tests {
         let paths = SystemDnsPaths {
             resolved_conf: conf_dir.join("hznet.conf"),
             resolv_conf: dir.path().join("resolv.conf"),
+            resolver_file: dir.path().join("resolver").join("hznet.internal"),
         };
         let config = ResolvedConfig {
             suffix: "hznet.internal".to_string(),
             dns_addr: DNS_BIND_V4,
         };
 
-        Integration::apply(&paths, &config, false)
+        Integration::apply(&paths, &config, Mechanism::ResolvedOrFallback, false)
             .restore()
             .unwrap();
         assert_eq!(
@@ -753,6 +847,7 @@ mod tests {
         let paths = SystemDnsPaths {
             resolved_conf: dir.path().join("conf.d").join("hznet.conf"),
             resolv_conf: dir.path().join("resolv.conf"),
+            resolver_file: dir.path().join("resolver").join("hznet.internal"),
         };
         let config = ResolvedConfig {
             suffix: "hznet.internal".to_string(),
@@ -760,7 +855,7 @@ mod tests {
         };
 
         assert!(matches!(
-            Integration::apply(&paths, &config, false),
+            Integration::apply(&paths, &config, Mechanism::ResolvedOrFallback, false),
             Integration::None
         ));
         assert_eq!(
@@ -769,11 +864,91 @@ mod tests {
             "未显式要求退路时绝不改 resolv.conf"
         );
 
-        Integration::apply(&paths, &config, true).restore().unwrap();
+        Integration::apply(&paths, &config, Mechanism::ResolvedOrFallback, true)
+            .restore()
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(&paths.resolv_conf).unwrap(),
             original,
             "停止后 resolv.conf 逐字节还原"
+        );
+    }
+
+    #[test]
+    fn resolver_file_mechanism_writes_only_the_resolver_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_dir = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        let paths = SystemDnsPaths {
+            resolved_conf: conf_dir.join("hznet.conf"),
+            resolv_conf: dir.path().join("resolv.conf"),
+            resolver_file: dir.path().join("resolver").join("hznet.internal"),
+        };
+        let config = ResolvedConfig {
+            suffix: "hznet.internal".to_string(),
+            dns_addr: DNS_BIND_V4,
+        };
+
+        let integration = Integration::apply(&paths, &config, Mechanism::ResolverFile, false);
+        assert_eq!(
+            std::fs::read_to_string(&paths.resolver_file).unwrap(),
+            "nameserver 100.96.0.53\n",
+            "resolver-file 机制应写 /etc/resolver/<suffix> 形态"
+        );
+        assert!(
+            !paths.resolved_conf.exists(),
+            "macOS 机制绝不写 systemd-resolved 配置"
+        );
+        assert!(!paths.resolv_conf.exists(), "macOS 机制绝不改 resolv.conf");
+        integration.restore().unwrap();
+        assert!(!paths.resolver_file.exists(), "停止后应删除 resolver 文件");
+    }
+
+    #[test]
+    fn resolver_file_renders_nameserver_only() {
+        let config = ResolverFileConfig {
+            suffix: "hznet.internal".to_string(),
+            dns_addr: Ipv4Addr::new(100, 96, 0, 53),
+        };
+        assert_eq!(config.render(), "nameserver 100.96.0.53\n");
+    }
+
+    #[test]
+    fn resolver_file_integration_creates_dir_writes_then_removes_on_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolver").join("hznet.internal");
+        let config = ResolverFileConfig {
+            suffix: "hznet.internal".to_string(),
+            dns_addr: DNS_BIND_V4,
+        };
+
+        let integration = apply_resolver_file(&path, &config);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "nameserver 100.96.0.53\n"
+        );
+        integration.restore().unwrap();
+        assert!(!path.exists(), "停止后 /etc/resolver/<suffix> 应被删除");
+        assert!(path.parent().unwrap().exists(), "resolver 目录本身保留");
+    }
+
+    #[test]
+    fn resolver_file_integration_restores_preexisting_file_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver_dir = dir.path().join("resolver");
+        std::fs::create_dir_all(&resolver_dir).unwrap();
+        let path = resolver_dir.join("corp.mesh");
+        std::fs::write(&path, "nameserver 10.0.0.1\n").unwrap();
+        let config = ResolverFileConfig {
+            suffix: "corp.mesh".to_string(),
+            dns_addr: DNS_BIND_V4,
+        };
+
+        apply_resolver_file(&path, &config).restore().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "nameserver 10.0.0.1\n",
+            "启动前就存在的 resolver 文件停止时逐字节还原"
         );
     }
 }
