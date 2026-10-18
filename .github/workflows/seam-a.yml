@@ -56,6 +56,14 @@ jobs:
             -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
             -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run lan-proxysim
 
+      - name: Seam A 场景 relay-sym-sym
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run relay-sym-sym
+
       - name: 保留各 namespace 日志与现场
         if: failure()
         uses: actions/upload-artifact@v4
