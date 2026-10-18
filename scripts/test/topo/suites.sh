@@ -439,6 +439,14 @@ assert_suite_direct() {
   note "断言 2：双方 hzd 日志出现 path=direct（打洞升级成功）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
+  # 数据面报告交叉验证（#15）：hz status 的路径不再只能靠日志判断。
+  wait_peer_path "$a" direct 30 || return 1
+  wait_peer_path "$b" direct 30 || return 1
+  if hz_cli "$a" status | grep -q "Direct Path"; then
+    pass "$a：hz status 对端表出现 Direct Path"
+  else
+    fail "$a：hz status 缺少 Direct Path：$(hz_cli "$a" status | tail -2)"
+  fi
 
   note "断言 3：STUN 公网 Endpoint 已发现并上报（锥形静态映射端口）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 60 || return 1
@@ -691,6 +699,165 @@ assert_suite_proxysim() {
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path（黑洞共存）" 90 || return 1
   ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
   ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 ratelimit（FR-9 / issue #15）：双对称 NAT 强制 Relay，限速生效且可观测
+# ---------------------------------------------------------------------------
+wait_peer_path() { # wait_peer_path <node> <direct|relay> [timeout-secs]
+  local node="$1" expected="$2" timeout="${3:-60}" i current
+  for i in $(seq 1 $((timeout * 2))); do
+    current=$(peer_field "$node" path 2>/dev/null)
+    if [[ $current == "$expected" ]]; then
+      pass "$node：hz status 路径=$expected（数据面报告）"
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "$node：hz status 路径未变为 $expected（当前 ${current:-无}）"
+  return 1
+}
+
+own_node_id() { # own_node_id <node>
+  node_status_json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node_id"])'
+}
+
+mesh_udp_throughput() { # mesh_udp_throughput <sender> <receiver> <dst-v4> <secs> → 输出接收侧 Mbps
+  local sender="$1" receiver="$2" dst="$3" secs="$4" sns rns recv_bytes
+  sns=$(node_ns "$sender"); rns=$(node_ns "$receiver")
+  ip netns exec "$rns" python3 - "$((secs + 3))" > "$ART_DIR/tput-recv.out" <<PY &
+import socket, sys, time
+window = float(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8_000_000)
+s.bind(("0.0.0.0", 9999))
+s.settimeout(1.0)
+total = 0
+deadline = time.time() + window
+while time.time() < deadline:
+    try:
+        data, _ = s.recvfrom(2048)
+        total += len(data)
+    except socket.timeout:
+        pass
+print(total)
+PY
+  sleep 1
+  ip netns exec "$sns" python3 - "$dst" "$secs" > /dev/null <<PY
+import socket, sys, time
+dst, secs = sys.argv[1], float(sys.argv[2])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8_000_000)
+payload = b"z" * 1200  # hz0 MTU 1280：留出 IP+UDP 头，避免分片
+deadline = time.time() + secs
+while time.time() < deadline:
+    s.sendto(payload, (dst, 9999))
+PY
+  wait
+  recv_bytes=$(cat "$ART_DIR/tput-recv.out")
+  python3 -c "print(f'{$recv_bytes * 8 / ($secs * 1_000_000):.2f}')"
+}
+
+metrics_value() { # metrics_value <metrics-text> <metric-prefix> → 数值（空=缺失）
+  local text="$1" prefix="$2"
+  grep -F "$prefix" <<<"$text" | tail -1 | awk '{print $2}'
+}
+
+assert_suite_ratelimit() {
+  local a b b4 a4 out rc tput limit lo hi ida metrics bytes_in dropped sessions
+  read -r a b <<<"$(pick_two symmetric)"
+  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 symmetric 节点"; return 1; }
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+
+  note "断言 0：双向 ping 打热 Relayed Path"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+
+  note "断言 1：hz status 显示每个对端的路径 Relayed Path"
+  wait_peer_path "$a" relay || return 1
+  wait_peer_path "$b" relay || return 1
+  if hz_cli "$a" status | grep -q "Relayed Path"; then
+    pass "$a：hz status 对端表出现 Relayed Path"
+  else
+    fail "$a：hz status 缺少 Relayed Path：$(hz_cli "$a" status | tail -2)"
+  fi
+
+  note "断言 2：hz ping 显示往返时延与所走路径"
+  rc=0; out=$(hz_cli "$a" ping "hznode$b") || rc=$?
+  if [[ $rc -eq 0 && $out == *"往返"* && $out == *"Relayed Path"* ]]; then
+    pass "$a → $b：$out"
+  else
+    fail "hz ping 输出异常（rc=$rc）：$out"
+  fi
+  rc=0; out=$(hz_cli "$b" ping "hznode$a") || rc=$?
+  if [[ $rc -eq 0 && $out == *"往返"* && $out == *"Relayed Path"* ]]; then
+    pass "$b → $a：$out"
+  else
+    fail "hz ping 输出异常（rc=$rc）：$out"
+  fi
+
+  note "断言 3：单个 Node 经 Relay 的吞吐不超过配置上限"
+  limit=${HZ_RELAY_RATE_MBPS:-2}
+  tput=$(mesh_udp_throughput "$a" "$b" "$b4" 10)
+  lo=$(python3 -c "print(f'{$limit * 0.5:.2f}')")
+  hi=$(python3 -c "print(f'{$limit * 1.2:.2f}')")
+  note "实测 ${tput} Mbps（限速 ${limit} Mbps，判据 ${lo}–${hi}；差额=WireGuard 封装开销+令牌桶 1s 突发）"
+  if python3 -c "import sys; sys.exit(0 if $lo <= $tput <= $hi else 1)"; then
+    pass "$a → $b 经 Relay 吞吐 ${tput} Mbps ≤ ${limit} Mbps×1.2 且 ≥ ×0.5"
+  else
+    fail "吞吐 ${tput} Mbps 越界（限速 ${limit} Mbps，判据 ${lo}–${hi}）"
+  fi
+
+  note "断言 4：Relay /metrics 可抓取按 Node 流量、丢弃与在线会话"
+  ida=$(own_node_id "$a")
+  metrics=$(ip netns exec "$WAN_NS" curl -s http://127.0.0.1:9101/metrics)
+  bytes_in=$(metrics_value "$metrics" "hz_relay_node_bytes_total{direction=\"in\",node_id=\"$ida\"}")
+  dropped=$(metrics_value "$metrics" "hz_relay_dropped_bytes_total{node_id=\"$ida\"}")
+  sessions=$(metrics_value "$metrics" "hz_relay_sessions")
+  if [[ -n $bytes_in && $bytes_in -gt 0 ]]; then
+    pass "hz_relay_node_bytes_total{in}[$ida] = $bytes_in"
+  else
+    fail "缺少 $ida 的 in 字节计数：$bytes_in"
+  fi
+  if [[ -n $dropped && $dropped -gt 0 ]]; then
+    pass "hz_relay_dropped_bytes_total[$ida] = $dropped（限速丢帧在案）"
+  else
+    fail "丢弃计数缺失或为零：$dropped（限速 2 Mbps 下超限帧应有丢弃）"
+  fi
+  if [[ $sessions == 2 ]]; then
+    pass "hz_relay_sessions = 2"
+  else
+    fail "hz_relay_sessions = ${sessions:-缺失}（应为 2）"
+  fi
+
+  note "断言 5：Coordination Server /metrics 可抓取在线数与打洞计数"
+  local coord_metrics online attempts ratio i
+  attempts=""
+  for i in $(seq 1 90); do
+    coord_metrics=$(ip netns exec "$WAN_NS" curl -s http://127.0.0.1:9100/metrics)
+    attempts=$(metrics_value "$coord_metrics" "hz_coord_punch_attempts_total")
+    [[ -n $attempts && $attempts -gt 0 ]] && break
+    sleep 1
+  done
+  online=$(metrics_value "$coord_metrics" "hz_coord_online_nodes")
+  ratio=$(metrics_value "$coord_metrics" "hz_coord_punch_success_ratio")
+  if [[ $online == 2 ]]; then
+    pass "hz_coord_online_nodes = 2"
+  else
+    fail "hz_coord_online_nodes = ${online:-缺失}（应为 2）"
+  fi
+  if [[ -n $attempts && $attempts -gt 0 ]]; then
+    pass "hz_coord_punch_attempts_total = $attempts（双对称打洞在案）"
+  else
+    fail "hz_coord_punch_attempts_total = ${attempts:-缺失}（应为 >0）"
+  fi
+  [[ -n $ratio ]] && pass "hz_coord_punch_success_ratio = $ratio" || fail "缺少 hz_coord_punch_success_ratio"
 
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
