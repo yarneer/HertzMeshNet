@@ -261,6 +261,7 @@ ensure_wan_v6() {
     ip netns exec "hz-nat$num" sysctl -qw net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.all.forwarding=1
     ip -n "hz-nat$num" addr add "2001:db8:f00::1${num}/64" dev wan0 2>/dev/null || true
     ip -n "hz-nat$num" addr add "2001:db8:${num}::1/64" dev hz-br-in 2>/dev/null || true
+    ip -n "hz-nat$num" -6 route replace default via "2001:db8:f00::1" 2>/dev/null || true
     ip -n "$WAN_NS" -6 route replace "2001:db8:${num}::/64" via "2001:db8:f00::1${num}" 2>/dev/null || true
   done
   pass "IPv6 平面就绪（wan 2001:db8:f00::/64，NAT 内侧 2001:db8:N::/64，纯路由）"

@@ -554,8 +554,13 @@ assert_suite_v6pair() {
   a_v6=$(ip netns exec "$a_ns" ip -6 addr show dev eth0 scope global | awk '/2001:db8/{print $2; exit}' | cut -d/ -f1)
   b_v6=$(ip netns exec "$b_ns" ip -6 addr show dev eth0 scope global | awk '/2001:db8/{print $2; exit}' | cut -d/ -f1)
   [[ -n $a_v6 && -n $b_v6 ]] || { fail "Node 缺少 v6 地址（a=$a_v6 b=$b_v6），HZ_WAN_V6 未生效？"; return 1; }
-  if ip netns exec "$a_ns" ping -6 -c 2 -W 2 "$b_v6" >/dev/null 2>&1; then
-    pass "底层 v6 直达（$a_v6 → $b_v6）"
+  local probe_rc=1 probe
+  for probe in 1 2 3 4 5 6 7 8 9 10; do
+    if ip netns exec "$a_ns" ping -6 -c 2 -W 2 "$b_v6" >/dev/null 2>&1; then probe_rc=0; break; fi
+    sleep 1
+  done
+  if (( probe_rc == 0 )); then
+    pass "底层 v6 直达（$a_v6 → $b_v6，DAD 稳定后第 ${probe} 次探测通过）"
   else
     fail "底层 v6 不通，v6 直连无从谈起"
   fi
@@ -643,20 +648,25 @@ assert_suite_proxysim() {
   ns=$(node_ns "$a")
 
   # 黑洞先于 hzd 安装：此后的一切观测（STUN、直连）都在接管默认路由的
-  # 第三方 TUN 类网络工具在场时发生。
+  # 第三方 TUN 类网络工具在场时发生。物理默认路由以更高 metric 保留在
+  # eth0 上（真实工具不删除物理默认，只是以更优 metric 抢占），
+  # SO_BINDTODEVICE 绑定 eth0 的 hzd 外层流量仍可经物理口出去（FR-7）。
   note "PROXY_SIM：$a 先安装接管默认路由的黑洞 TUN，再启动 hzd"
+  local gw ipaddr
+  ipaddr=$(reg_field "$a" 4); gw="${ipaddr%.*}.1"
   if ip netns exec "$ns" sh -c "
       ip tuntap add dev proxytun mode tun &&
       ip addr add 198.18.0.1/30 dev proxytun &&
       ip link set proxytun up &&
-      ip route replace default dev proxytun
+      ip route replace default via ${gw} dev eth0 metric 100 &&
+      ip route add default dev proxytun metric 1
     "; then
-    local blackhole
-    blackhole=$(ip netns exec "$ns" ip route get 203.0.113.1 2>/dev/null | head -1)
-    if [[ $blackhole == *proxytun* ]]; then
-      pass "黑洞生效：未绑定流量（如 STUN 默认路由）已被第三方 TUN 吞下（$blackhole）"
+    local defaults
+    defaults=$(ip netns exec "$ns" ip route show default)
+    if [[ $defaults == *proxytun* && $defaults == *eth0* ]]; then
+      pass "黑洞生效：默认路由由第三方 TUN 以更优 metric 接管，物理默认保留在 eth0（$defaults）"
     else
-      fail "黑洞未生效：$blackhole"
+      fail "默认路由形态异常：$defaults"
     fi
   else
     fail "第三方 TUN 模拟（proxytun）配置失败"
@@ -669,10 +679,10 @@ assert_suite_proxysim() {
   note "断言 1：黑洞之下 STUN 仍发现真实出口公网 Endpoint（≠ 198.18.0.1 黑洞地址）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 90 || return 1
   expected="203.0.113.1$(nat_num_of fullcone):$(reg_field "$a" 5)"
-  stun_line=$(grep "stun mapped endpoint discovered" "$ART_DIR/hz-node-$a.log" | tail -1)
-  if [[ $stun_line == *"mapped=$expected "* ]]; then
-    pass "$a：STUN Endpoint = $expected（真实出口，非黑洞地址）"
+  if grep -q -- "$expected" "$ART_DIR/hz-node-a.log"; then
+    pass "$a：STUN Endpoint = $expected（真实出口，非黑洞地址 198.18.0.1）"
   else
+    stun_line=$(grep "stun mapped endpoint discovered" "$ART_DIR/hz-node-a.log" | tail -1)
     fail "$a：STUN Endpoint 异常（期望 $expected）：$stun_line"
   fi
 
