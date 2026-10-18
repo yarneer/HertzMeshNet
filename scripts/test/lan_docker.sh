@@ -199,25 +199,25 @@ note "断言 3：hz0 只接管 HzNet 段（阿里云内网 DNS 100.100.2.136 不
 for node in "$NODE1" "$NODE2"; do
   route=$(docker exec "$node" ip route get 100.100.2.136 2>/dev/null | head -1)
   if [[ "$route" != *hz0* ]]; then
-    pass "$node：100.100.2.136 不经 hz0（$route）"
+    pass "${node}：100.100.2.136 不经 hz0（${route}）"
   else
-    fail "$node：100.100.2.136 被路由进 hz0：$route"
+    fail "${node}：100.100.2.136 被路由进 hz0：$route"
   fi
   hz_route=$(docker exec "$node" ip route show dev hz0 2>/dev/null)
   if [[ "$hz_route" == *"100.96.0.0/16"* ]] && [[ "$hz_route" != *"100.64.0.0/10"* ]]; then
-    pass "$node：hz0 仅接管 100.96.0.0/16（$hz_route）"
+    pass "${node}：hz0 仅接管 100.96.0.0/16（${hz_route}）"
   else
-    fail "$node：hz0 路由异常：$hz_route"
+    fail "${node}：hz0 路由异常：$hz_route"
   fi
 done
 
 note "断言 4：hzd 仅持有唯一 UDP socket（WireGuard 与打洞共用，ADR-0002）"
 for node in "$NODE1" "$NODE2"; do
-  count=$(docker exec "$node" sh -c "ss -u -p 2>/dev/null | grep -c 'hzd' || true")
+  count=$(docker exec "$node" sh -c "ss -u -a -p 2>/dev/null | grep -c 'hzd' || true")
   if [[ "$count" == "1" ]]; then
-    pass "$node：hzd 恰好 1 个 UDP socket"
+    pass "${node}：hzd 恰好 1 个 UDP socket"
   else
-    fail "$node：hzd UDP socket 数量为 $count（应为 1）"
+    fail "${node}：hzd UDP socket 数量为 ${count}（应为 1）"
   fi
 done
 
