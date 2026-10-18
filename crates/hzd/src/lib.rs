@@ -809,7 +809,7 @@ async fn apply_path_event(
                     .expect("punch counters poisoned")
                     .successes += 1;
             }
-            let use_relay = use_relay || forced;
+            let use_relay = (use_relay || forced) && relay_transport_configured();
             use_relay_slot
                 .lock()
                 .expect("use_relay poisoned")
@@ -1267,13 +1267,25 @@ fn peer_spec(node: &MapNode, use_relay: &HashMap<String, bool>) -> Option<PeerSp
         endpoints,
         dst_addrs: vec![ipv4, ipv6],
         // 默认走 Relay（FR-8 连通优先），路径管理打洞成功后切直连；
+        // 没配 Relay 传输时直连是唯一存在的路径，不能默认进黑洞。
         // HZD_FORCE_RELAY=1 在事件应用处把一切直连决定压回 Relay。
-        use_relay: use_relay.get(&node.node_id).copied().unwrap_or(true),
+        use_relay: use_relay
+            .get(&node.node_id)
+            .copied()
+            .unwrap_or_else(relay_transport_configured),
     })
 }
 
 fn force_relay() -> bool {
     std::env::var("HZD_FORCE_RELAY").ok().as_deref() == Some("1")
+}
+
+/// 是否配置了 Relay 传输（数据面据此决定是否允许把对端钉在 Relay）。
+/// 没配 Relay 时选 Relay 是把引擎流量（重握手、保活、数据）路由进不存在
+/// 的通道——全部被静默丢弃，数据面只剩按退避节奏的打洞包，握手在慢
+/// 机器上永远完不成；此时对端必须直连（有候选 Endpoint 就朝它们发）。
+fn relay_transport_configured() -> bool {
+    std::env::var("HZD_RELAY_ADDR").is_ok_and(|addr| !addr.is_empty())
 }
 
 /// registration.json 的落盘形态：注册身份 + 记下 coord 地址供重启后自动重连；
