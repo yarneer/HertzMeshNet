@@ -14,7 +14,7 @@
 - 兼容官方 Tailscale 客户端或协议（[ADR-0001](adr/0001-full-stack-own-protocol.md)）
 - 多租户、一次部署多个 HzNet
 - 子网路由、出口节点、管理 Web 界面、密钥轮换 UI（第二阶段）
-- Windows、iOS、Android、macOS Network Extension
+- Windows、iOS、Android、macOS Network Extension（注：iOS 同时只允许一个 VPN 激活，届时 HzNet 与 Shadowrocket 等无法同时开启）
 - Coordination Server 高可用、多地域 Relay
 - 与 Kanidm 的实时联动（User 被禁用后靠有效期兜底）、从 IdP 同步 Group
 - Node 自动升级
@@ -71,6 +71,7 @@
 - 在 Node 上用 `<Node Name>.hznet.internal` 可以解析到对端的 Node Address（后缀可配置）。
 - Linux 上通过 systemd-resolved 做分域 DNS，macOS 上通过 `/etc/resolver/` 实现，只接管 HzNet 的域名后缀，不影响系统其他 DNS 解析。
 - **AC**：`ping db-1.hznet.internal` 能通；`hzd` 停止后，系统的普通 DNS 解析不受影响。
+- 代理工具的 fake-IP DNS 可能截获 `*.hznet.internal` 查询。运维手册须给出 Shadowrocket / Clash 的推荐规则（`hznet.internal` 域名后缀与 Node Address 段直连、加入 fake-IP 过滤列表）。
 
 ### FR-6 Network Map 下发
 
@@ -84,6 +85,8 @@
 
 - `hzd` 在用户态运行 WireGuard（`boringtun`），通过 TUN（Linux）或 utun（macOS）收发流量（[ADR-0002](adr/0002-userspace-wireguard.md)）。
 - 打洞用的 UDP socket 和 WireGuard 收发数据用的是同一个 socket。
+- **与其他 VPN / 代理工具共存**：`hzd` 自身的隧道外层流量（WireGuard/打洞 UDP、STUN、到 Coordination Server 与 Relay 的连接）绑定到当前的物理出口网卡（macOS `IP_BOUND_IF`，Linux `SO_BINDTODEVICE` 或 fwmark 策略路由），不进入 Shadowrocket、Clash、sing-box 等工具的虚拟网卡；物理出口变化时随之重新绑定。
+- **AC**：本机同时运行一个接管默认路由的代理型 TUN（全局模式）时，`hzd` 的外层流量仍从物理网卡发出，STUN 发现的公网 Endpoint 是本机真实出口地址，HzNet 连通不受影响；发往 Node Address 的流量走 HzNet 的 TUN 而非代理。
 
 ### FR-8 NAT 穿透与路径选择
 
@@ -96,6 +99,7 @@
   - 一端是对称型 NAT、另一端是锥形 NAT：尽力尝试直连，失败时稳定走 Relayed Path
   - 两端都是对称型 NAT：走 Relayed Path
   - 模拟网络切换后，30 秒内恢复连通
+  - 一端本机开着接管默认路由的代理型 TUN 时，上述结果不变
 
 ### FR-9 Relay
 
@@ -143,7 +147,7 @@
 ## 5. 测试策略
 
 - 单元测试和集成测试随代码一起写，CI 中运行 `fmt`、`clippy`、`test`。
-- **NAT 测试拓扑**：在 Linux 上用 network namespace 加 nftables 搭建。拓扑包括一个模拟公网的 namespace（运行 Coordination Server 和 Relay），以及若干放在完全锥形、端口受限、对称型 NAT 后面的 Node namespace。它负责在 CI 中自动验证 FR-8 的验收标准，与 MVP 同期建设。
+- **NAT 测试拓扑**：在 Linux 上用 network namespace 加 nftables 搭建。拓扑包括一个模拟公网的 namespace（运行 Coordination Server 和 Relay），以及若干放在完全锥形、端口受限、对称型 NAT 后面的 Node namespace。它负责在 CI 中自动验证 FR-7 与 FR-8 的验收标准，与 MVP 同期建设。拓扑需提供"Node namespace 内额外运行一个接管默认路由的代理型 TUN"的场景，用于验证与其他 VPN 工具共存。
 - macOS 只做手工冒烟测试：注册、直连、Relay、名字解析。
 
 ## 6. 里程碑
