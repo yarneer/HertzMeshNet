@@ -1,14 +1,22 @@
 //! Node 侧的 Coordination Server 客户端：Hello → Machine Key 签挑战 → 注册、
 //! Network Map 订阅。
 
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, anyhow};
 use ed25519_dalek::Signer;
+use hyper_util::rt::TokioIo;
 use hz_proto::coord_client::CoordClient;
 use hz_proto::{HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest, StreamMapRequest};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tonic::Streaming;
-use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::transport::{Channel, ClientTlsConfig, Uri};
+use tower_service::Service;
 
 use crate::keys::KeyStore;
 use crate::status::RegisteredInfo;
@@ -104,7 +112,7 @@ pub async fn open_network_map_stream(
 }
 
 async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {
-    let uri: tonic::transport::Uri = coord_addr
+    let uri: Uri = coord_addr
         .parse()
         .with_context(|| format!("无效的 Coordination Server 地址：{coord_addr}"))?;
     let endpoint = tonic::transport::Endpoint::from_shared(uri.to_string())
@@ -113,11 +121,94 @@ async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {
         Some("https") => endpoint.tls_config(ClientTlsConfig::new())?,
         _ => endpoint,
     };
-    let channel = tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.connect())
-        .await
-        .map_err(|_| anyhow!("连接 {coord_addr} 超时"))?
-        .map_err(|error| anyhow!("连接 {coord_addr} 失败：{error}"))?;
+    // 自带连接器在 connect(2) 之前把 socket 绑到物理出口网卡（FR-7 共存）；
+    // TLS 仍由 endpoint 的配置包裹（connect_with_connector 内部处理）。
+    let channel = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        endpoint.connect_with_connector(PhysicalEgressConnector),
+    )
+    .await
+    .map_err(|_| anyhow!("连接 {coord_addr} 超时"))?
+    .map_err(|error| anyhow!("连接 {coord_addr} 失败：{error}"))?;
     Ok(channel)
+}
+
+/// 到 Coordination Server 的 TCP 连接器：socket2 建栈、绑定物理出口网卡、
+/// 非阻塞连接后交给 tokio。
+#[derive(Clone)]
+struct PhysicalEgressConnector;
+
+impl Service<Uri> for PhysicalEgressConnector {
+    type Response = TokioIo<tokio::net::TcpStream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        Box::pin(async move {
+            let stream = dial(&uri).await?;
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+async fn dial(uri: &Uri) -> io::Result<tokio::net::TcpStream> {
+    let host = uri
+        .host()
+        .ok_or_else(|| io::Error::other(format!("coord uri 缺少主机名：{uri}")))?;
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    let mut last_error = io::Error::other(format!("{host}:{port} 未解析出可用地址"));
+    for addr in addrs {
+        match connect_bound(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+/// 非阻塞 TCP 连接：SO_BINDTODEVICE 只约束发送路径，必须抢在 SYN 发出前生效，
+/// 所以先绑物理出口网卡再 connect(2)。目标是 loopback 时不绑（本地测试服务
+/// 无法从物理网卡到达）。
+async fn connect_bound(addr: SocketAddr) -> io::Result<tokio::net::TcpStream> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if !addr.ip().is_loopback() {
+        crate::netif::bind_to_physical_egress(&socket);
+    }
+    socket.set_nonblocking(true)?;
+    match socket.connect(&SockAddr::from(addr)) {
+        Ok(()) => {}
+        // 非阻塞 connect(2) 立即返回 EINPROGRESS（std 未把它归入 WouldBlock，
+        // 须按原始错误码识别）；立即连上的情况（本地回环）为 Ok。
+        Err(error) if in_progress(&error) => {}
+        Err(error) => return Err(error),
+    }
+    let stream = tokio::net::TcpStream::from_std(socket.into())?;
+    stream.writable().await?;
+    if let Some(error) = stream.take_error()? {
+        return Err(error);
+    }
+    Ok(stream)
+}
+
+/// 非阻塞 connect(2) 的"进行中"判定。
+fn in_progress(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::EINPROGRESS)
 }
 
 /// 本机主机名（供注册用）；取不到时退化为 "localhost"。

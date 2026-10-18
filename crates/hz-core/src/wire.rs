@@ -381,10 +381,13 @@ pub struct SocketEngine {
 
 impl SocketEngine {
     /// port 为 0 时由内核分配。实例携带实际绑定地址。
+    /// socket 绑定到物理出口网卡（FR-7 共存），默认路由被第三方 TUN 类
+    /// 网络工具接管时外层收发仍走物理网卡。
     pub async fn bind(own_secret: StaticSecret, port: u16) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .await
             .with_context(|| format!("bind udp 0.0.0.0:{port} failed"))?;
+        crate::netif::bind_to_physical_egress(&socket);
         let local_addr = socket
             .local_addr()
             .with_context(|| "query udp local addr failed")?;

@@ -3,6 +3,7 @@
 pub mod coord_client;
 pub mod ipc;
 pub mod keys;
+pub mod netif;
 pub mod paths;
 pub mod status;
 pub mod tun;

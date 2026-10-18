@@ -35,8 +35,10 @@ cleanup() {
       echo "--- $c ip route ---"
       docker exec "$c" ip route || true
       docker exec "$c" ip -6 route || true
-      echo "--- $c ss -u -p ---"
-      docker exec "$c" ss -u -p || true
+      echo "--- $c ss -u -a -p ---"
+      docker exec "$c" ss -u -a -p || true
+      echo "--- $c ss -t -n -p ---"
+      docker exec "$c" ss -t -n -p || true
     done
     echo "--- coord 日志 ---"
     docker logs "$COORD" 2>&1 | tail -30 || true
@@ -185,6 +187,46 @@ IPV6_OF_NODE2=$(peer_field "$NODE1" ipv6)
 IPV4_OF_NODE1=$(peer_field "$NODE2" ipv4)
 IPV6_OF_NODE1=$(peer_field "$NODE2" ipv6)
 note "node2=${IPV4_OF_NODE2} / ${IPV6_OF_NODE2}; node1=${IPV4_OF_NODE1} / ${IPV6_OF_NODE1}"
+
+# 共存场景（FR-7）：node1 上模拟一台接管默认路由的第三方 TUN 类网络工具。
+# proxytun 没有读取者，等同黑洞；它同时吃掉默认路由与 docker 网段路由——
+# 只黑洞默认路由时，同网段对端会走 eth0 的在链路由绕过黑洞，测不出绑定。
+# hzd 的外层流量已绑物理出口网卡（SO_BINDTODEVICE），后续断言必须照常通过。
+PROXY_SIM="${PROXY_SIM:-1}"
+if [[ "$PROXY_SIM" == "1" ]]; then
+  NODE2_LAN_IP=$(docker exec "$NODE2" hostname -i | awk '{print $1}')
+  LAN_SUBNET=$(docker network inspect "$NETWORK" -f '{{(index .IPAM.Config 0).Subnet}}')
+  note "PROXY_SIM：node1 安装黑洞 TUN（default 与 $LAN_SUBNET 均改道 proxytun）"
+  if docker exec "$NODE1" sh -c "
+      ip tuntap add dev proxytun mode tun &&
+      ip addr add 198.18.0.1/30 dev proxytun &&
+      ip link set proxytun up &&
+      ip route replace default dev proxytun &&
+      ip route replace $LAN_SUBNET dev proxytun
+    "; then
+    blackhole=$(docker exec "$NODE1" ip route get "$NODE2_LAN_IP" 2>/dev/null | head -1)
+    if [[ "$blackhole" == *proxytun* ]]; then
+      pass "黑洞生效：未绑定流量到 $NODE2_LAN_IP 已被第三方 TUN 吞下（${blackhole}）"
+    else
+      fail "黑洞未生效，共存场景不成立：$blackhole"
+    fi
+  else
+    fail "第三方 TUN 模拟（proxytun）配置失败"
+  fi
+  estab=$(docker exec "$NODE1" sh -c "ss -t -n -p 2>/dev/null | grep hzd | grep -c ESTAB || true")
+  if (( estab >= 1 )); then
+    pass "node1：黑洞之下 hzd 与 Coordination Server 的 TCP 连接仍存活（ESTAB x${estab}）"
+  else
+    fail "node1：hzd 到 Coordination Server 的 TCP 连接丢失"
+  fi
+  if docker exec -e HZD_SOCK_PATH=/tmp/hzd.sock "$NODE1" /out/hz status >/dev/null 2>&1; then
+    pass "node1：hz status 经本地 IPC 正常返回"
+  else
+    fail "node1：hz status 失败"
+  fi
+else
+  note "PROXY_SIM=0：未安装第三方 TUN 模拟（基线路径）"
+fi
 
 # 主机名决定 Node Name 的规范化基名；hz status 的 name 已断言互见，这里直接 ping 地址。
 note "断言 1：双向 IPv4 Node Address ping"
