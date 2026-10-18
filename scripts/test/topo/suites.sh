@@ -813,6 +813,12 @@ EOF
   d4=$(node_status_json "$a" | python3 -c 'import json,sys; print(json.load(sys.stdin)["peers"][0]["ipv4"])')
   note "d 的 Node Address（a 视角）：$d4"
 
+  # 数据面就绪门槛：对端可见（Map）不等于路径已建立（打洞/握手）。
+  # 慢速 runner 上首条连接断言可能落在打洞退避窗口内；等 a 的日志出现
+  # 指向 d 的 path=direct 再断言连通性，其余断言口径不变。
+  wait_for_log "$ART_DIR/hz-node-a.log" "path=direct.*$(reg_field "$d" 4)" \
+    "a 至 d 直连路径就绪" 60 || return 1
+
   note "断言 2：a → d:5432 可达（目标侧监听走 wg 路径）"
   listen_forever "$d" 5432
   sleep 0.5
