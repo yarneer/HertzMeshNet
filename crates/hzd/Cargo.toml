@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 hz-core.workspace = true
+rand_core.workspace = true
 hz-proto.workspace = true
 anyhow.workspace = true
 serde.workspace = true

@@ -172,6 +172,23 @@ fn deliver(
 }
 
 pub fn node_info_from(record: NodeRecord) -> NodeInfo {
+    let detailed = record
+        .udp_endpoints
+        .iter()
+        .filter_map(|stored| {
+            let addr: std::net::SocketAddr = stored.addr.parse().ok()?;
+            let kind = match stored.kind.as_str() {
+                "stun" => hz_proto::EndpointKind::Stun,
+                "v6" => hz_proto::EndpointKind::V6,
+                _ => hz_proto::EndpointKind::Lan,
+            };
+            Some(hz_proto::Endpoint {
+                addr: addr.ip().to_string(),
+                port: addr.port() as u32,
+                kind: kind as i32,
+            })
+        })
+        .collect::<Vec<_>>();
     NodeInfo {
         node_id: record.id,
         name: record.name,
@@ -181,7 +198,12 @@ pub fn node_info_from(record: NodeRecord) -> NodeInfo {
         owner_user: record.owner_user,
         expires_at_unix: record.expires_at_unix,
         node_key_pub: record.node_key_pub,
-        endpoints: record.udp_endpoints,
+        endpoints: record
+            .udp_endpoints
+            .iter()
+            .map(|stored| stored.addr.clone())
+            .collect(),
+        detailed_endpoints: detailed,
     }
 }
 
@@ -189,7 +211,7 @@ pub fn node_info_from(record: NodeRecord) -> NodeInfo {
 mod tests {
     use super::*;
 
-    fn record(id: &str, endpoints: &[&str]) -> NodeRecord {
+    fn record(id: &str, endpoints: &[(&str, &str)]) -> NodeRecord {
         NodeRecord {
             id: id.to_string(),
             name: format!("node-{id}"),
@@ -199,14 +221,17 @@ mod tests {
             owner_user: None,
             expires_at_unix: None,
             node_key_pub: vec![1u8; 32],
-            udp_endpoints: endpoints.iter().map(|e| e.to_string()).collect(),
+            udp_endpoints: endpoints
+                .iter()
+                .map(|(addr, kind)| crate::store::StoredEndpoint::of_kind(*addr, kind))
+                .collect(),
         }
     }
 
     #[test]
     fn diff_reports_added_changed_and_removed() {
-        let a = record("1", &["10.0.0.1:1"]);
-        let a_moved = record("1", &["10.0.0.9:9"]);
+        let a = record("1", &[("10.0.0.1:1", "lan")]);
+        let a_moved = record("1", &[("10.0.0.9:9", "lan")]);
         let b = record("2", &[]);
 
         let delta = diff(std::slice::from_ref(&a), std::slice::from_ref(&a));
@@ -219,5 +244,40 @@ mod tests {
         let delta = diff(&[a.clone(), b.clone()], std::slice::from_ref(&a)).unwrap();
         assert_eq!(delta.removed_node_ids, vec!["2".to_string()]);
         assert!(delta.added_or_updated.is_empty());
+    }
+
+    #[test]
+    fn node_info_carries_legacy_and_detailed_endpoint_views() {
+        let info = node_info_from(record(
+            "7",
+            &[
+                ("203.0.113.5:41001", "stun"),
+                ("192.168.1.2:51820", "lan"),
+                ("[2001:db8::2]:51820", "v6"),
+            ],
+        ));
+        assert_eq!(
+            info.endpoints,
+            vec![
+                "203.0.113.5:41001".to_string(),
+                "192.168.1.2:51820".to_string(),
+                "[2001:db8::2]:51820".to_string(),
+            ]
+        );
+        assert_eq!(info.detailed_endpoints.len(), 3);
+        assert_eq!(
+            info.detailed_endpoints[0].kind,
+            hz_proto::EndpointKind::Stun as i32
+        );
+        assert_eq!(
+            info.detailed_endpoints[1].kind,
+            hz_proto::EndpointKind::Lan as i32
+        );
+        assert_eq!(
+            info.detailed_endpoints[2].kind,
+            hz_proto::EndpointKind::V6 as i32
+        );
+        assert_eq!(info.detailed_endpoints[2].addr, "2001:db8::2");
+        assert_eq!(info.detailed_endpoints[2].port, 51820);
     }
 }

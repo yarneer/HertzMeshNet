@@ -27,10 +27,48 @@ pub struct MapNode {
     pub expires_at_unix: Option<i64>,
     pub node_key_pub: Vec<u8>,
     pub endpoints: Vec<String>,
+    /// 按来源区分的 Endpoint（FR-8）；旧缓存文件没有该字段时按空装载。
+    #[serde(default)]
+    pub detailed_endpoints: Vec<DetailedEndpoint>,
+}
+
+/// 一个带来源的 Endpoint：addr 是 "ip:port"，kind ∈ lan/stun/v6。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetailedEndpoint {
+    pub addr: String,
+    pub kind: String,
+}
+
+impl DetailedEndpoint {
+    pub fn socket_addr(&self) -> Option<std::net::SocketAddr> {
+        self.addr.parse().ok()
+    }
+
+    pub fn kind(&self) -> crate::endpoint::EndpointKind {
+        crate::endpoint::EndpointKind::parse(&self.kind)
+            .unwrap_or(crate::endpoint::EndpointKind::Lan)
+    }
 }
 
 impl From<hz_proto::NodeInfo> for MapNode {
     fn from(node: hz_proto::NodeInfo) -> Self {
+        let detailed_endpoints = node
+            .detailed_endpoints
+            .iter()
+            .filter_map(|endpoint| {
+                let ip: std::net::IpAddr = endpoint.addr.parse().ok()?;
+                let kind = hz_proto::EndpointKind::try_from(endpoint.kind).ok()?;
+                Some(DetailedEndpoint {
+                    addr: std::net::SocketAddr::new(ip, endpoint.port as u16).to_string(),
+                    kind: match kind {
+                        hz_proto::EndpointKind::Stun => "stun",
+                        hz_proto::EndpointKind::V6 => "v6",
+                        _ => "lan",
+                    }
+                    .to_string(),
+                })
+            })
+            .collect();
         Self {
             node_id: node.node_id,
             name: node.name,
@@ -41,6 +79,7 @@ impl From<hz_proto::NodeInfo> for MapNode {
             expires_at_unix: node.expires_at_unix,
             node_key_pub: node.node_key_pub,
             endpoints: node.endpoints,
+            detailed_endpoints,
         }
     }
 }

@@ -26,6 +26,8 @@ const INBOUND_DEPTH: usize = 256;
 pub struct RelayClient {
     outbound: mpsc::Sender<RelayFrame>,
     incoming: StdMutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// 流断开（服务端关闭、错误帧、网络故障）时被唤醒；监督任务据此重连。
+    closed: Arc<tokio::sync::Notify>,
 }
 
 /// 连接 Relay 并完成挑战接入。ca_pem 为 Some 时信任该私有 CA（自签部署），
@@ -65,15 +67,24 @@ pub async fn connect_relay(
         .with_context(|| format!("打开 RelayStream 失败：{relay_addr}"))?
         .into_inner();
 
-    tokio::spawn(pump_stream(stream, inbound_tx));
+    let closed = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn({
+        let closed = closed.clone();
+        pump_stream(stream, inbound_tx, closed)
+    });
     tracing::info!(%relay_addr, node_id, "relay stream opened");
     Ok(RelayClient {
         outbound: frame_tx,
         incoming: StdMutex::new(Some(inbound_rx)),
+        closed,
     })
 }
 
-async fn pump_stream(mut stream: Streaming<RelayFrame>, inbound: mpsc::Sender<Vec<u8>>) {
+async fn pump_stream(
+    mut stream: Streaming<RelayFrame>,
+    inbound: mpsc::Sender<Vec<u8>>,
+    closed: Arc<tokio::sync::Notify>,
+) {
     loop {
         match stream.message().await {
             Ok(Some(frame)) => match frame.kind {
@@ -106,6 +117,8 @@ async fn pump_stream(mut stream: Streaming<RelayFrame>, inbound: mpsc::Sender<Ve
             }
         }
     }
+    closed.notify_waiters();
+    tracing::warn!("relay stream down, waiting for supervisor to reconnect");
 }
 
 impl RelayClient {
@@ -129,5 +142,11 @@ impl RelayClient {
             .lock()
             .expect("relay incoming poisoned")
             .take()
+    }
+
+    /// 等待本条 Relay 流断开。注意 Notify 不积存：断开已发生后调用本方法会
+    /// 一直等，监督任务应在连接成功后立刻进入等待。
+    pub async fn wait_closed(&self) {
+        self.closed.notified().await;
     }
 }

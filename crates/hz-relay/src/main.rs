@@ -30,6 +30,9 @@ enum Command {
         /// 监听地址，如 0.0.0.0:8443
         #[arg(long)]
         listen: String,
+        /// STUN（UDP 3478）监听地址；FR-8 规定 Node 在 Relay 主机上发现公网映射
+        #[arg(long, default_value = "0.0.0.0:3478")]
+        stun_listen: String,
         /// Coordination Server 地址（http:// 或 https://）
         #[arg(long)]
         coord: String,
@@ -78,6 +81,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve {
             listen,
+            stun_listen,
             coord,
             relay_token,
             tls_cert,
@@ -87,6 +91,7 @@ fn main() -> anyhow::Result<()> {
             tls_ca_out,
         } => runtime.block_on(run_serve(
             listen,
+            stun_listen,
             coord,
             relay_token,
             tls_cert,
@@ -104,6 +109,7 @@ fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn run_serve(
     listen: String,
+    stun_listen: String,
     coord: String,
     relay_token: Option<String>,
     tls_cert: Option<PathBuf>,
@@ -150,6 +156,16 @@ async fn run_serve(
     }
 
     let handle = hz_relay::serve_relay(config).await?;
+
+    // STUN（FR-8）：与中继同一主机的 UDP 3478，Node 从 WireGuard 共享 socket
+    // 来查询自己的公网映射。socket 同样绑物理出口网卡（FR-7）。
+    let stun_addr: std::net::SocketAddr = stun_listen
+        .parse()
+        .map_err(|e| anyhow::anyhow!("无效的 STUN 监听地址 {stun_listen}：{e}"))?;
+    let stun_sock = std::sync::Arc::new(tokio::net::UdpSocket::bind(stun_addr).await?);
+    hz_core::netif::bind_to_physical_egress(stun_sock.as_ref());
+    tokio::spawn(hz_core::stun::serve(stun_sock));
+
     tokio::signal::ctrl_c().await?;
     tracing::info!("ctrl-c received, hz-relay shutting down");
     handle.shutdown();

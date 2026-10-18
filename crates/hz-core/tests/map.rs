@@ -16,6 +16,7 @@ fn node(id: &str, name: &str, endpoints: &[&str]) -> MapNode {
         expires_at_unix: None,
         node_key_pub: vec![0u8; 32],
         endpoints: endpoints.iter().map(|e| e.to_string()).collect(),
+        detailed_endpoints: vec![],
     }
 }
 

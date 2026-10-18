@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hz-core.workspace = true
 hz-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -21,5 +22,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 hz-coord.workspace = true
-hz-core.workspace = true
 tempfile.workspace = true

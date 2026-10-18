@@ -1,12 +1,16 @@
 //! hz-core：`hzd` 与 `hz` 共享的领域类型、本地 IPC 与 Node 侧控制面客户端。
 
 pub mod coord_client;
+pub mod endpoint;
 pub mod ipc;
 pub mod keys;
 pub mod map;
 pub mod netif;
+pub mod path;
 pub mod paths;
+pub mod punch;
 pub mod relay_client;
 pub mod status;
+pub mod stun;
 pub mod tun;
 pub mod wire;
