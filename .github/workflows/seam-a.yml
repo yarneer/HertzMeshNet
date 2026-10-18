@@ -64,6 +64,54 @@ jobs:
             -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
             -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run relay-sym-sym
 
+      - name: Seam A 场景 cone-cone-direct
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run cone-cone-direct
+
+      - name: Seam A 场景 sym-cone-relay
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run sym-cone-relay
+
+      - name: Seam A 场景 sym-sym-relay
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run sym-sym-relay
+
+      - name: Seam A 场景 v6-pair-direct
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run v6-pair-direct
+
+      - name: Seam A 场景 block-direct-fallback
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run block-direct-fallback
+
+      - name: Seam A 场景 cone-cone-proxysim
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run cone-cone-proxysim
+
       - name: 保留各 namespace 日志与现场
         if: failure()
         uses: actions/upload-artifact@v4
