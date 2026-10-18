@@ -1,9 +1,9 @@
-//! gRPC 服务：挑战签发与校验、Auth Key 注册、协议版本闸门。
-//! BeginInteractiveLogin 与 StreamNetworkMap 在本票据只定义接口（#10、#6 实现）。
+//! gRPC 服务：挑战签发与校验、Auth Key 注册、协议版本闸门、Network Map 快照流。
+//! BeginInteractiveLogin 只定义接口（#10 实现）；Map 增量推送与断线重连在 #6。
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION;
@@ -13,18 +13,25 @@ use hz_proto::{
     NodeInfo, RegisterAuthKeyRequest, RegisterResponse, StreamMapRequest,
 };
 use sqlx::SqlitePool;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 
 use crate::addr::AddressConfig;
 use crate::challenge::{CHALLENGE_TTL, ChallengeCache};
-use crate::store::Store;
+use crate::store::{NodeRecord, Store};
+
+/// Network Map 快照重发间隔。既是保活，也让对端看到迟注册的 Node；
+/// 事件式推送（MapDelta）在 #6 实现。
+const MAP_REFRESH: Duration = Duration::from_secs(30);
 
 pub struct ServeConfig {
     pub pool: SqlitePool,
     pub addr: AddressConfig,
     pub listen: SocketAddr,
     pub tls: Option<ServerTlsConfig>,
+    pub map_refresh: Duration,
 }
 
 impl ServeConfig {
@@ -34,6 +41,7 @@ impl ServeConfig {
             addr: AddressConfig::default(),
             listen,
             tls: None,
+            map_refresh: MAP_REFRESH,
         }
     }
 }
@@ -55,10 +63,12 @@ impl ServeHandle {
 }
 
 pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
+    let map_refresh = config.map_refresh;
     let store = Store::from_pool(config.pool, config.addr).await?;
     let service = CoordServiceImpl {
         store,
         challenges: ChallengeCache::new(),
+        map_refresh,
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -93,6 +103,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
 struct CoordServiceImpl {
     store: Store,
     challenges: ChallengeCache,
+    map_refresh: Duration,
 }
 
 impl CoordServiceImpl {
@@ -103,6 +114,20 @@ impl CoordServiceImpl {
                  {MIN_SUPPORTED_PROTOCOL_VERSION}，请升级 hzd 后重试"
             ))
         })
+    }
+}
+
+fn node_info_from(record: NodeRecord) -> NodeInfo {
+    NodeInfo {
+        node_id: record.id,
+        name: record.name,
+        ipv4: record.ipv4.to_string(),
+        ipv6: record.ipv6.to_string(),
+        tags: record.tags,
+        owner_user: record.owner_user,
+        expires_at_unix: record.expires_at_unix,
+        node_key_pub: record.node_key_pub,
+        endpoints: record.udp_endpoints,
     }
 }
 
@@ -187,15 +212,7 @@ impl Coord for CoordServiceImpl {
 
         tracing::info!(node_id = %record.id, name = %record.name, "node registered");
         Ok(Response::new(RegisterResponse {
-            node: Some(NodeInfo {
-                node_id: record.id,
-                name: record.name,
-                ipv4: record.ipv4.to_string(),
-                ipv6: record.ipv6.to_string(),
-                tags: record.tags,
-                owner_user: record.owner_user,
-                expires_at_unix: record.expires_at_unix,
-            }),
+            node: Some(node_info_from(record)),
         }))
     }
 
@@ -215,14 +232,134 @@ impl Coord for CoordServiceImpl {
 
     async fn stream_network_map(
         &self,
-        _request: Request<StreamMapRequest>,
+        request: Request<StreamMapRequest>,
     ) -> Result<Response<Self::StreamNetworkMapStream>, Status> {
-        Err(Status::unimplemented("Network Map 下发尚未实现"))
+        let req = request.into_inner();
+        if let Some(status) = Self::hello_reject_old_version(req.protocol_version) {
+            return Err(status);
+        }
+        let machine_key_pub: [u8; 32] = req
+            .machine_key_pub
+            .try_into()
+            .map_err(|_| Status::invalid_argument("machine_key_pub 必须是 32 字节"))?;
+        let nonce: [u8; 32] = req
+            .challenge_nonce
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_nonce 必须是 32 字节"))?;
+        let signature: [u8; 64] = req
+            .challenge_signature
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_signature 必须是 64 字节"))?;
+
+        let challenge = self
+            .challenges
+            .take(&nonce)
+            .ok_or_else(|| Status::permission_denied("挑战不存在或已过期，请重新发起"))?;
+        if challenge.machine_key_pub != machine_key_pub {
+            return Err(Status::unauthenticated("签名验证失败：挑战与公钥不匹配"));
+        }
+        let verifying_key = VerifyingKey::from_bytes(&machine_key_pub)
+            .map_err(|_| Status::unauthenticated("签名验证失败：Machine Key 公钥无效"))?;
+        verifying_key
+            .verify(&nonce, &Signature::from_bytes(&signature))
+            .map_err(|_| Status::unauthenticated("签名验证失败"))?;
+
+        let record = self
+            .store
+            .node_by_machine_key(&machine_key_pub)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "lookup node for map stream failed");
+                Status::internal("查询 Node 失败")
+            })?
+            .ok_or_else(|| {
+                Status::permission_denied("Node 未注册或已吊销，无法下发 Network Map")
+            })?;
+        if record
+            .expires_at_unix
+            .is_some_and(|expires| expires <= crate::store::unix_now())
+        {
+            return Err(Status::permission_denied("Node 已过期，请重新登录"));
+        }
+
+        // Endpoint 是边界输入：逐条解析成 SocketAddr，坏一条就拒绝整份上报。
+        let endpoints = parse_endpoints(&req.endpoints)?;
+        if !endpoints.is_empty() {
+            self.store
+                .update_udp_endpoints(&record.id, &endpoints)
+                .await
+                .map_err(|e| {
+                    tracing::error!(%e, "update udp endpoints failed");
+                    Status::internal("更新 Endpoint 失败")
+                })?;
+            tracing::info!(node_id = %record.id, ?endpoints, "node endpoints updated");
+        }
+
+        // 打开发一份全量快照，然后周期性重发快照兼作保活；流保持打开。
+        // 接收端断开时 send 失败，任务随之结束。
+        let (tx, rx) = mpsc::channel(4);
+        let store = self.store.clone();
+        let refresh = self.map_refresh;
+        tokio::spawn(async move {
+            loop {
+                let nodes = match store.network_map().await {
+                    Ok(nodes) => nodes,
+                    Err(error) => {
+                        tracing::error!(%error, "build network map failed");
+                        break;
+                    }
+                };
+                let message = NetworkMapMessage {
+                    kind: Some(hz_proto::network_map_message::Kind::Full(
+                        hz_proto::NetworkMap {
+                            nodes: nodes.into_iter().map(node_info_from).collect(),
+                        },
+                    )),
+                };
+                if tx.send(Ok(message)).await.is_err() {
+                    tracing::debug!("map stream receiver dropped");
+                    break;
+                }
+                tokio::time::sleep(refresh).await;
+            }
+        });
+        tracing::info!(node_id = %record.id, "network map stream opened");
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+}
+
+/// 校验并规范化 Endpoint 上报；空列表合法（Node 还没拿到地址）。
+fn parse_endpoints(raw: &[String]) -> Result<Vec<String>, Status> {
+    raw.iter()
+        .map(|endpoint| {
+            endpoint
+                .parse::<SocketAddr>()
+                .map(|addr| addr.to_string())
+                .map_err(|_| {
+                    Status::invalid_argument(format!("无效的 Endpoint：{endpoint}，期望 ip:port"))
+                })
+        })
+        .collect()
 }
 
 fn system_time_to_unix(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_parsing_accepts_ip_port_and_rejects_garbage() {
+        assert_eq!(
+            parse_endpoints(&["192.168.1.2:51820".to_string()]).unwrap(),
+            vec!["192.168.1.2:51820".to_string()]
+        );
+        assert_eq!(parse_endpoints(&[]).unwrap(), Vec::<String>::new());
+        assert!(parse_endpoints(&["not-an-endpoint".to_string()]).is_err());
+        assert!(parse_endpoints(&["192.168.1.2".to_string()]).is_err());
+    }
 }

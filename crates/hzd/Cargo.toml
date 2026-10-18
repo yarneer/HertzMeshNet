@@ -6,7 +6,9 @@ rust-version.workspace = true
 
 [dependencies]
 hz-core.workspace = true
+hz-proto.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

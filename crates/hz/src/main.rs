@@ -14,7 +14,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// 查看 Node 状态
-    Status,
+    Status {
+        /// 输出 hzd 应答的原始 JSON（脚本用）
+        #[arg(long)]
+        json: bool,
+    },
     /// 用 Auth Key 注册本机（FR-1）
     Up {
         /// Auth Key 明文（hz-coord bootstrap 签发）
@@ -30,12 +34,12 @@ enum Command {
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Status => status().await,
+        Command::Status { json } => status(json).await,
         Command::Up { auth_key, coord } => up(auth_key, coord).await,
     }
 }
 
-async fn status() -> std::process::ExitCode {
+async fn status(json_output: bool) -> std::process::ExitCode {
     let socket = paths::socket_path();
     let request = Request::new(1, "status", serde_json::json!({}));
     let response = match ipc::request(&socket, request).await {
@@ -47,7 +51,11 @@ async fn status() -> std::process::ExitCode {
         }
     };
     match response {
-        Response::Ok { result, .. } => match serde_json::from_value::<NodeStatus>(result) {
+        Response::Ok { result, .. } if json_output => {
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            std::process::ExitCode::SUCCESS
+        }
+        Response::Ok { result, .. } => match serde_json::from_value::<NodeStatus>(result.clone()) {
             Ok(NodeStatus::Unregistered) => {
                 println!("未加入 HzNet");
                 std::process::ExitCode::SUCCESS
@@ -55,6 +63,7 @@ async fn status() -> std::process::ExitCode {
             Ok(NodeStatus::Registered(info)) => {
                 println!("已加入 HzNet");
                 print_identity(&info);
+                print_peers(&result);
                 std::process::ExitCode::SUCCESS
             }
             Err(error) => {
@@ -103,6 +112,49 @@ async fn up(auth_key: String, coord: Option<String>) -> std::process::ExitCode {
             eprintln!("{error}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// Network Map 里的对端（hzd 状态结果的 peers 字段）；更丰富的展示在 #15。
+fn print_peers(result: &serde_json::Value) {
+    let Some(peers) = result.get("peers").and_then(|v| v.as_array()) else {
+        return;
+    };
+    if peers.is_empty() {
+        println!("对端：无");
+        return;
+    }
+    println!("对端：");
+    for peer in peers {
+        let field = |name: &str| {
+            peer.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+        let endpoints = peer
+            .get("endpoints")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let handshake = peer
+            .get("handshake_secs")
+            .and_then(|v| v.as_u64())
+            .map(|secs| format!("{secs} 秒前"))
+            .unwrap_or_else(|| "未握手".to_string());
+        println!(
+            "  {} {} {} 端点[{}] 握手[{}]",
+            field("name"),
+            field("ipv4"),
+            field("ipv6"),
+            endpoints,
+            handshake
+        );
     }
 }
 

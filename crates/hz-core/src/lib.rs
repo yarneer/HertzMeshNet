@@ -5,3 +5,5 @@ pub mod ipc;
 pub mod keys;
 pub mod paths;
 pub mod status;
+pub mod tun;
+pub mod wire;

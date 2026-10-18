@@ -47,6 +47,9 @@ enum Command {
         /// 预绑定 Tag，可多次出现
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// 只输出一行 JSON（脚本友好），不含人类可读说明
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -67,10 +70,11 @@ pub fn run() -> anyhow::Result<()> {
             auth_key_expiry,
             once,
             tags,
+            json,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run_bootstrap(db, auth_key_expiry, once, tags)),
+            .block_on(run_bootstrap(db, auth_key_expiry, once, tags, json)),
     }
 }
 
@@ -103,10 +107,18 @@ async fn run_bootstrap(
     auth_key_expiry: String,
     once: bool,
     tags: Vec<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
     let expires_at_unix = parse_expiry(&auth_key_expiry)?;
     let store = Store::open(&db, AddressConfig::default()).await?;
     let plaintext = store.create_auth_key(expires_at_unix, once, &tags).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"auth_key": plaintext, "expires_at_unix": expires_at_unix})
+        );
+        return Ok(());
+    }
     let expires_at = chrono::DateTime::from_timestamp(expires_at_unix, 0)
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| expires_at_unix.to_string());

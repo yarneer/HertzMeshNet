@@ -1,11 +1,13 @@
-//! Node 侧的 Coordination Server 客户端：Hello → Machine Key 签挑战 → 注册。
+//! Node 侧的 Coordination Server 客户端：Hello → Machine Key 签挑战 → 注册、
+//! Network Map 订阅。
 
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use ed25519_dalek::Signer;
 use hz_proto::coord_client::CoordClient;
-use hz_proto::{HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest};
+use hz_proto::{HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest, StreamMapRequest};
+use tonic::Streaming;
 use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::keys::KeyStore;
@@ -61,6 +63,44 @@ pub async fn register_with_auth_key(
         owner_user: node.owner_user,
         expires_at_unix: node.expires_at_unix,
     })
+}
+
+/// 打开 Network Map 下发流。请求经同一 Hello → 签挑战认证，
+/// 并把本机的 UDP Endpoint（"ip:port"）上报给服务端。
+pub async fn open_network_map_stream(
+    state_dir: &Path,
+    endpoints: Vec<String>,
+    coord_addr: &str,
+) -> anyhow::Result<Streaming<hz_proto::NetworkMapMessage>> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+
+    let hello = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+        })
+        .await
+        .map_err(|status| anyhow!("Network Map 订阅失败：Hello 被拒绝（{status}）"))?
+        .into_inner();
+
+    let nonce = hello.challenge_nonce;
+    let signature = keys.machine().sign(&nonce).to_bytes();
+    let stream = client
+        .stream_network_map(StreamMapRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature.to_vec(),
+            endpoints,
+        })
+        .await
+        .map_err(|status| anyhow!("Network Map 订阅失败：{status}"))?
+        .into_inner();
+    Ok(stream)
 }
 
 async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {

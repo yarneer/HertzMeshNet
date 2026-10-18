@@ -35,8 +35,11 @@ pub struct NodeRecord {
     pub tags: Vec<String>,
     pub owner_user: Option<String>,
     pub expires_at_unix: Option<i64>,
+    pub node_key_pub: Vec<u8>,
+    pub udp_endpoints: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
     addr: AddressConfig,
@@ -155,13 +158,14 @@ impl Store {
     ) -> anyhow::Result<NodeRecord> {
         let mut tx = self.pool.begin().await?;
 
-        if let Some(existing) = node_by_machine_key(&mut tx, machine_key_pub).await? {
+        if let Some(mut existing) = node_by_machine_key(&mut tx, machine_key_pub).await? {
             sqlx::query("UPDATE nodes SET node_key_pub = ?1 WHERE id = ?2")
                 .bind(node_key_pub)
                 .bind(&existing.id)
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
+            existing.node_key_pub = node_key_pub.to_vec();
             tracing::info!(node_id = %existing.id, "re-registered existing node");
             return Ok(existing);
         }
@@ -221,7 +225,49 @@ impl Store {
             tags: tags.to_vec(),
             owner_user,
             expires_at_unix,
+            node_key_pub: node_key_pub.to_vec(),
+            udp_endpoints: Vec::new(),
         })
+    }
+
+    /// StreamNetworkMap 打开时整体覆盖该 Node 的 UDP Endpoint 列表。
+    pub async fn update_udp_endpoints(
+        &self,
+        node_id: &str,
+        endpoints: &[String],
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE nodes SET udp_endpoints = ?1 WHERE id = ?2")
+            .bind(serde_json::to_string(endpoints)?)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Network Map 快照：所有未吊销、未过期的 Node（含 Node Key 与 Endpoint）。
+    pub async fn network_map(&self) -> anyhow::Result<Vec<NodeRecord>> {
+        let rows = sqlx::query(
+            "SELECT n.id, n.name, n.ipv4, n.ipv6, n.tags, u.name AS owner_user,
+                    n.expires_at_unix, n.node_key_pub, n.udp_endpoints
+             FROM nodes n LEFT JOIN users u ON u.id = n.user_id
+             WHERE n.revoked_at_unix IS NULL
+               AND (n.expires_at_unix IS NULL OR n.expires_at_unix > ?1)",
+        )
+        .bind(unix_now())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(node_record_from_row).collect()
+    }
+
+    /// 按 Machine Key 查未吊销的 Node；StreamNetworkMap 认证用。
+    pub async fn node_by_machine_key(
+        &self,
+        machine_key_pub: &[u8],
+    ) -> anyhow::Result<Option<NodeRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let record = node_by_machine_key(&mut tx, machine_key_pub).await?;
+        tx.commit().await?;
+        Ok(record)
     }
 }
 
@@ -235,7 +281,8 @@ async fn node_by_machine_key(
     machine_key_pub: &[u8],
 ) -> anyhow::Result<Option<NodeRecord>> {
     let row = sqlx::query(
-        "SELECT n.id, n.name, n.ipv4, n.ipv6, n.tags, u.name AS owner_user, n.expires_at_unix
+        "SELECT n.id, n.name, n.ipv4, n.ipv6, n.tags, u.name AS owner_user,
+                n.expires_at_unix, n.node_key_pub, n.udp_endpoints
          FROM nodes n LEFT JOIN users u ON u.id = n.user_id
          WHERE n.machine_key_pub = ?1 AND n.revoked_at_unix IS NULL",
     )
@@ -257,6 +304,9 @@ fn node_record_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<NodeRec
         tags: serde_json::from_str(&row.get::<String, _>("tags")).unwrap_or_default(),
         owner_user: row.try_get("owner_user").ok().flatten(),
         expires_at_unix: row.get("expires_at_unix"),
+        node_key_pub: row.get("node_key_pub"),
+        udp_endpoints: serde_json::from_str(&row.get::<String, _>("udp_endpoints"))
+            .map_err(|e| anyhow::anyhow!("invalid udp_endpoints in db: {e}"))?,
     })
 }
 

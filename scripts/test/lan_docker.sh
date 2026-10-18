@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# M1 局域网互通门禁：docker 网络上一台 hz-coord + 两台 Linux Node（特权、/dev/net/tun）。
+# 通过标准：两个方向都 ping 通对端 IPv4 与 ULA IPv6 Node Address；
+# hz0 只接管 100.96.0.0/16 与 ULA /48（100.100.2.136 不走 hz0）；
+# hzd 只持有唯一一个 UDP socket（打洞与 WireGuard 共用，ADR-0002）。
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+NETWORK=hz-lan-test
+COORD=hz-coord-test
+NODE1=hz-node1-test
+NODE2=hz-node2-test
+VOL_BIN=hz-bin-test
+VOL_TGT=hz-build-test
+CARGO_CACHE="${HZMN_CARGO_CACHE:-/Users/lixin/Develop/.hmn-cache/cargo}"
+IMAGE="${HZMN_IMAGE:-rust:1-bookworm}"
+MAP_WAIT_SECS=90
+
+FAILURES=0
+declare -a LOGS
+
+note() { printf '\n[lan-test] %s\n' "$*"; }
+pass() { printf 'PASS %s\n' "$*"; }
+fail() { printf 'FAIL %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
+
+cleanup() {
+  local dump="${1:-}"
+  if [[ "$dump" == "dump" && "$FAILURES" -gt 0 ]]; then
+    note "===== 失败现场 ====="
+    for c in "$NODE1" "$NODE2"; do
+      echo "--- $c hzd 日志 ---"
+      docker exec "$c" sh -c 'cat /tmp/hzd.log 2>/dev/null | tail -40' || true
+      echo "--- $c ip addr ---"
+      docker exec "$c" ip addr || true
+      echo "--- $c ip route ---"
+      docker exec "$c" ip route || true
+      docker exec "$c" ip -6 route || true
+      echo "--- $c ss -u -p ---"
+      docker exec "$c" ss -u -p || true
+    done
+    echo "--- coord 日志 ---"
+    docker logs "$COORD" 2>&1 | tail -30 || true
+  fi
+  for c in "$COORD" "$NODE1" "$NODE2"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  docker network rm "$NETWORK" >/dev/null 2>&1 || true
+  docker volume rm "$VOL_BIN" >/dev/null 2>&1 || true
+}
+trap 'cleanup dump' EXIT
+
+# 读取节点 status JSON 里第一个对端的字段（hz status --json 输出 IPC 原始结果）。
+peer_field() {
+  local node="$1" field="$2"
+  docker exec "$node" /out/hz status --json 2>/dev/null \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); p=d["peers"][0]; print(p["'"$field"'"])'
+}
+
+wait_for_peer() {
+  local node="$1" other="$2"
+  for _ in $(seq 1 $((MAP_WAIT_SECS * 2))); do
+    if docker exec "$node" /out/hz status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    peers = d.get("peers") or []
+    assert len(peers) == 1, f"期望恰好 1 个对端，实际 {len(peers)}"
+    p = peers[0]
+    assert p["name"] == "'"$other"'", p["name"]
+    assert p["ipv4"] and p["ipv6"] and p["endpoints"], p
+except Exception as e:
+    sys.exit(1)
+sys.exit(0)
+' ; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+ping_assert() {
+  local node="$1" target="$2" label="$3" flags=("${@:4}")
+  if docker exec "$node" ping "${flags[@]}" -c 3 -W 2 "$target" >/tmp/hz-ping.out 2>&1; then
+    pass "$label（$(grep -c 'bytes from' /tmp/hz-ping.out)/3 应答）"
+  else
+    fail "$label：$(tail -3 /tmp/hz-ping.out | tr '\n' ' ')"
+  fi
+}
+
+note "清理旧环境并创建 docker 网络 $NETWORK"
+cleanup nodump >/dev/null 2>&1 || true
+docker network create "$NETWORK" >/dev/null
+docker volume create "$VOL_BIN" >/dev/null
+docker volume create "$VOL_TGT" >/dev/null
+
+
+note "coord 容器：构建 release 二进制 + bootstrap 两把可复用 Auth Key + 启动 serve"
+docker run -d --name "$COORD" --network "$NETWORK" \
+  -v "$ROOT:/src" -v "$CARGO_CACHE:/usr/local/cargo/registry" -v "$VOL_BIN:/out" \
+  -v "$VOL_TGT:/target" -w /src -e CARGO_TARGET_DIR=/target \
+  "$IMAGE" bash -c '
+    set -euo pipefail
+    apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping python3 >/dev/null
+    cargo build --release -p hz-coord -p hzd -p hz 2>&1 | tail -3
+    cp /target/release/hz-coord /target/release/hzd /target/release/hz /out/
+    /out/hz-coord bootstrap --db /tmp/hz.db --auth-key-expiry 1d --json > /tmp/key1.json
+    /out/hz-coord bootstrap --db /tmp/hz.db --auth-key-expiry 1d --json > /tmp/key2.json
+    exec /out/hz-coord serve --db /tmp/hz.db --listen 0.0.0.0:443
+  ' >/dev/null 2>&1
+
+note "等待二进制构建与服务就绪（首次约数分钟）"
+for _ in $(seq 1 720); do
+  if docker exec "$COORD" test -f /out/hzd 2>/dev/null && \
+     docker exec "$COORD" /out/hz-coord bootstrap --help >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+docker exec "$COORD" test -f /out/hzd || { fail "release 二进制构建超时"; exit 1; }
+for _ in $(seq 1 60); do
+  docker exec "$COORD" bash -c '</dev/tcp/127.0.0.1/443' 2>/dev/null && break
+  sleep 1
+done
+docker exec "$COORD" bash -c '</dev/tcp/127.0.0.1/443' 2>/dev/null || { fail "hz-coord serve 未就绪"; exit 1; }
+KEY1=$(docker exec "$COORD" python3 -c 'import json;print(json.load(open("/tmp/key1.json"))["auth_key"])')
+KEY2=$(docker exec "$COORD" python3 -c 'import json;print(json.load(open("/tmp/key2.json"))["auth_key"])')
+
+note "两个特权 Node 容器（/dev/net/tun）"
+docker run -d --name "$NODE1" --network "$NETWORK" --privileged --hostname hznode1 \
+  -v "$VOL_BIN:/out" "$IMAGE" bash -c '
+    set -euo pipefail
+    apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping python3 >/dev/null
+    sleep infinity
+  ' >/dev/null 2>&1
+docker run -d --name "$NODE2" --network "$NETWORK" --privileged --hostname hznode2 \
+  -v "$VOL_BIN:/out" "$IMAGE" bash -c '
+    set -euo pipefail
+    apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping python3 >/dev/null
+    sleep infinity
+  ' >/dev/null 2>&1
+
+start_node() {
+  local node="$1" key="$2"
+  docker exec -d "$node" bash -c "
+    export HZD_STATE_DIR=/tmp/hzd-state HZD_SOCK_PATH=/tmp/hzd.sock \
+           HZD_COORD_ADDR=http://$COORD:443 HZD_WG_PORT=51820
+    mkdir -p \$HZD_STATE_DIR
+    /out/hzd > /tmp/hzd.log 2>&1
+  "
+  for _ in $(seq 1 40); do
+    docker exec "$node" test -S /tmp/hzd.sock 2>/dev/null && break
+    sleep 0.5
+  done
+  docker exec -e HZD_SOCK_PATH=/tmp/hzd.sock "$node" /out/hz up --auth-key "$key" \
+    || { fail "$node 注册失败"; docker exec "$node" cat /tmp/hzd.log 2>/dev/null | tail -5; }
+}
+note "node1/node2 注册（各自 Auth Key）"
+start_node "$NODE1" "$KEY1"
+start_node "$NODE2" "$KEY2"
+
+note "等待两端的 Network Map 都出现对方（快照周期最长 ${MAP_WAIT_SECS}s）"
+if wait_for_peer "$NODE1" "hznode2" && wait_for_peer "$NODE2" "hznode1"; then
+  pass "双方 Network Map 互见（name/ipv4/ipv6/endpoints 齐全）"
+else
+  fail "Network Map 未在 ${MAP_WAIT_SECS}s 内互通"
+fi
+
+IPV4_OF_NODE2=$(peer_field "$NODE1" ipv4)
+IPV6_OF_NODE2=$(peer_field "$NODE1" ipv6)
+IPV4_OF_NODE1=$(peer_field "$NODE2" ipv4)
+IPV6_OF_NODE1=$(peer_field "$NODE2" ipv6)
+note "node2=$IPV4_OF_NODE2 / $IPV6_OF_NODE2；node1=$IPV4_OF_NODE1 / $IPV6_OF_NODE1"
+
+# 主机名决定 Node Name 的规范化基名；hz status 的 name 已断言互见，这里直接 ping 地址。
+note "断言 1：双向 IPv4 Node Address ping"
+ping_assert "$NODE1" "$IPV4_OF_NODE2" "node1 → node2 IPv4 ($IPV4_OF_NODE2)"
+ping_assert "$NODE2" "$IPV4_OF_NODE1" "node2 → node1 IPv4 ($IPV4_OF_NODE1)"
+
+note "断言 2：双向 ULA IPv6 Node Address ping"
+ping_assert "$NODE1" "$IPV6_OF_NODE2" "node1 → node2 IPv6 ($IPV6_OF_NODE2)" -6
+ping_assert "$NODE2" "$IPV6_OF_NODE1" "node2 → node1 IPv6 ($IPV6_OF_NODE1)" -6
+
+note "断言 3：hz0 只接管 HzNet 段（阿里云内网 DNS 100.100.2.136 不入隧道）"
+for node in "$NODE1" "$NODE2"; do
+  route=$(docker exec "$node" ip route get 100.100.2.136 2>/dev/null | head -1)
+  if [[ "$route" != *hz0* ]]; then
+    pass "$node：100.100.2.136 不经 hz0（$route）"
+  else
+    fail "$node：100.100.2.136 被路由进 hz0：$route"
+  fi
+  hz_route=$(docker exec "$node" ip route show dev hz0 2>/dev/null)
+  if [[ "$hz_route" == *"100.96.0.0/16"* ]] && [[ "$hz_route" != *"100.64.0.0/10"* ]]; then
+    pass "$node：hz0 仅接管 100.96.0.0/16（$hz_route）"
+  else
+    fail "$node：hz0 路由异常：$hz_route"
+  fi
+done
+
+note "断言 4：hzd 仅持有唯一 UDP socket（WireGuard 与打洞共用，ADR-0002）"
+for node in "$NODE1" "$NODE2"; do
+  count=$(docker exec "$node" sh -c "ss -u -p 2>/dev/null | grep -c 'hzd' || true")
+  if [[ "$count" == "1" ]]; then
+    pass "$node：hzd 恰好 1 个 UDP socket"
+  else
+    fail "$node：hzd UDP socket 数量为 $count（应为 1）"
+  fi
+done
+
+note "===== 结果 ====="
+if [[ "$FAILURES" -gt 0 ]]; then
+  printf 'FAILED： %d 项断言未通过\n' "$FAILURES"
+  exit 1
+fi
+printf 'PASSED： 两节点局域网互通（v4+v6 双向）、路由边界、单 UDP socket 全部通过\n'
+exit 0

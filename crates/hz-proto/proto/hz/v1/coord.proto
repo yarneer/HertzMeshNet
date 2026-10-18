@@ -12,7 +12,7 @@ service Coord {
   rpc RegisterWithAuthKey(RegisterAuthKeyRequest) returns (RegisterResponse);
   // 交互式登录，票据 #10 实现。
   rpc BeginInteractiveLogin(BeginLoginRequest) returns (BeginLoginResponse);
-  // Network Map 下发流，票据 #6 实现。
+  // Network Map 下发流：打开即发全量快照并保持打开；推送更新在票据 #6。
   rpc StreamNetworkMap(StreamMapRequest) returns (stream NetworkMapMessage);
 }
 
@@ -47,6 +47,10 @@ message NodeInfo {
   repeated string tags = 5;
   optional string owner_user = 6;
   optional int64 expires_at_unix = 7;
+  // Node Key 公钥（x25519，32 字节），数据面建立 WireGuard 会话用。
+  bytes node_key_pub = 8;
+  // 该 Node 的 UDP Endpoint（"ip:port"）。打洞 Endpoint 种类在 #8 扩展。
+  repeated string endpoints = 9;
 }
 
 message BeginLoginRequest {
@@ -68,6 +72,8 @@ message StreamMapRequest {
   string hostname = 3;
   bytes challenge_nonce = 4;
   bytes challenge_signature = 5;
+  // 本 Node 当前可用的 UDP Endpoint（"ip:port"），服务端在打开流时落库。
+  repeated string endpoints = 6;
 }
 
 message NetworkMapMessage {
