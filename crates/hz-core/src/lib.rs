@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod keys;
 pub mod map;
 pub mod netif;
+pub mod netwatch;
 pub mod path;
 pub mod paths;
 pub mod policy;

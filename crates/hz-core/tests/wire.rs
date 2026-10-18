@@ -644,3 +644,126 @@ fn key_change_rebuild_keeps_learned_endpoints() {
         "重建后的会话必须仍能向学到的 Endpoint 发送"
     );
 }
+
+#[test]
+fn reset_direct_rx_makes_path_manager_fall_back_and_re_punch() {
+    use hz_core::path::{PathEvent, PathManager, PeerEndpoints};
+    use std::time::Instant;
+
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+    let name = peer_name(&a);
+    let candidates = PeerEndpoints {
+        node_id: name.to_string(),
+        stun: vec![a.udp],
+        ..Default::default()
+    };
+    let mut manager = PathManager::new();
+    let start = Instant::now();
+
+    // 完整握手交换（发起 → 响应 → 排空），b 直连收到 a 的报文，路径管理升级 Direct。
+    let init = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"hi"));
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let _ = deliver(&flushed, &mut engine_b, a.udp);
+    let ages = engine_b.direct_rx_ages();
+    let upgrade = manager.tick(start, std::slice::from_ref(&candidates), &ages);
+    assert_eq!(
+        upgrade,
+        vec![PathEvent::SetUseRelay {
+            node_id: name.to_string(),
+            use_relay: false
+        }]
+    );
+
+    // 网络变化恢复序列作废直连记账：路径管理立刻退回 Relay；
+    // 重启打洞按既有退避节奏（RETRY_START 后的下一拍），不在同一拍里重置
+    // 进行中的握手（对称 NAT 下 Relay 会话会因此饿死，见 #8）。
+    engine_b.reset_direct_rx();
+    let reverted = manager.tick(
+        start,
+        std::slice::from_ref(&candidates),
+        &engine_b.direct_rx_ages(),
+    );
+    assert_eq!(
+        reverted,
+        vec![PathEvent::SetUseRelay {
+            node_id: name.to_string(),
+            use_relay: true
+        }]
+    );
+    // 退避窗口内不重试；窗口过后发出 Offer + 握手（重启打洞轮次）。
+    assert!(
+        manager
+            .tick(
+                start + Duration::from_secs(1),
+                std::slice::from_ref(&candidates),
+                &engine_b.direct_rx_ages()
+            )
+            .is_empty()
+    );
+    assert_eq!(
+        manager.tick(
+            start + Duration::from_secs(5),
+            std::slice::from_ref(&candidates),
+            &engine_b.direct_rx_ages()
+        ),
+        vec![
+            PathEvent::SendOffer {
+                node_id: name.to_string()
+            },
+            PathEvent::SendHandshake {
+                node_id: name.to_string()
+            },
+        ]
+    );
+    // 记账清除后打洞握手再次直达对端，direct_rx 重新点亮（恢复后的直连重建路径）。
+    let punch = engine_a
+        .punch_handshake(peer_name(&b))
+        .expect("恢复序列应能重新发出打洞握手");
+    let answered = engine_b.handle_udp(a.udp, &punch);
+    assert_eq!(answered.to_network.len(), 1, "对端必须应答恢复后的打洞握手");
+    assert!(
+        engine_b
+            .direct_rx_ages()
+            .get(name)
+            .copied()
+            .flatten()
+            .is_some(),
+        "恢复后重新直连必须重新点亮 direct_rx"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rebind_reapplies_device_idempotently_and_keeps_the_port() {
+    use hz_core::wire::{RebindOutcome, SocketEngine};
+
+    // SO_BINDTODEVICE 需要 CAP_NET_RAW：无特权的普通 CI runner 上探测即失败，
+    // 重绑的真实行为由特权容器里的 network-change 场景验证，这里让位。
+    let probe = SocketEngine::bind(NodeStaticSecret::random_from_rng(OsRng), 0)
+        .await
+        .unwrap();
+    if probe.rebind("lo").await.is_err() {
+        eprintln!("跳过：环境无 CAP_NET_RAW，无法设置 SO_BINDTODEVICE");
+        return;
+    }
+
+    let secret = NodeStaticSecret::random_from_rng(OsRng);
+    let engine = SocketEngine::bind(secret, 0).await.unwrap();
+    let port = engine.local_addr().port();
+
+    // 绑到回环设备（换网卡的等价物）：要么改绑成功，要么本就绑着（无物理出口的环境）。
+    let first = engine.rebind("lo").await.unwrap();
+    assert!(
+        matches!(first, RebindOutcome::Rebound | RebindOutcome::Kept),
+        "改绑回环设备应成功：{first:?}"
+    );
+    // 幂等：重复重绑同一目标是空操作，端口不变。
+    assert_eq!(engine.rebind("lo").await.unwrap(), RebindOutcome::Kept);
+    assert_eq!(engine.local_addr().port(), port);
+
+    // 目标网卡不存在：改绑失败必须显式报错，不能悄悄换掉 socket 或端口。
+    assert!(engine.rebind("hz-no-such-iface").await.is_err());
+    assert_eq!(engine.local_addr().port(), port);
+    assert_eq!(engine.rebind("lo").await.unwrap(), RebindOutcome::Kept);
+}

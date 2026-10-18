@@ -1107,3 +1107,105 @@ assert_suite_ratelimit() {
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
 }
+
+# ---------------------------------------------------------------------------
+# 套件 netchange（FR-8 / issue #9）：直连建立后把一个 Node 搬到另一个 NAT
+# （新出口 IP + 网卡改名），断言旧路径确实断开、30 秒内恢复连通（计时打印）、
+# STUN Endpoint 更换、之后再次升级 Direct Path。
+# ---------------------------------------------------------------------------
+last_stun_endpoint() { # last_stun_endpoint <node>：日志里最近一次 STUN 映射（ip:port）
+  grep 'stun mapped endpoint discovered' "$ART_DIR/hz-node-$1.log" 2>/dev/null \
+    | tail -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$'
+}
+
+wait_new_direct_log() { # wait_new_direct_log <node> <已有条数> [timeout-secs]：等 path=direct 条数增长
+  local node="$1" before="$2" timeout="${3:-60}" i now
+  for i in $(seq 1 $((timeout * 2))); do
+    now=$(grep -c "path=direct" "$ART_DIR/hz-node-$node.log" 2>/dev/null || true)
+    if (( now > before )); then
+      pass "$node：换网后再次出现 path=direct（第 ${now} 条）"
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "$node：${timeout}s 内未见新的 path=direct（仍 ${now:-0} 条）"
+  return 1
+}
+
+assert_suite_netchange() {
+  local a b b4 a4 old_ext new_ext t0 measured i now direct_a direct_b
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个"; return 1; }
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+
+  note "断言 1：换网前双向 ping 且已建立 Direct Path"
+  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
+  wait_peer_path "$a" direct 30 || return 1
+  old_ext=$(last_stun_endpoint "$a")
+  [[ $old_ext == 203.0.113.11:* ]] || { fail "$a 换网前 STUN Endpoint 异常：${old_ext:-无}"; return 1; }
+  pass "$a 换网前 STUN Endpoint = $old_ext（NAT1 出口）"
+
+  note "断言 2：更换 $a 的上游出口（NAT 换 WAN IP + 新静态映射 + 换网卡与新内网地址，模拟换 Wi-Fi）"
+  # path=direct 基线在搬移前取：恢复可能快过后续断言的簿记，事后取会漏计。
+  direct_a=$(grep -c "path=direct" "$ART_DIR/hz-node-$a.log" || true)
+  direct_b=$(grep -c "path=direct" "$ART_DIR/hz-node-$b.log" || true)
+  t0=$(date +%s)
+  new_ext=$(HZ_TOPO_STATE_DIR="$STATE_DIR" HZ_TOPO_WG_PORT="$HZ_WG_PORT" \
+    bash "$TOPO_DIR/netmove.sh" "$a") \
+    || { fail "netmove 执行失败"; return 1; }
+  [[ $new_ext == 203.0.113.21:40211 ]] || { fail "netmove 返回的新 Endpoint 异常：$new_ext"; return 1; }
+  pass "$a 上游已更换，新静态映射 $new_ext"
+
+  note "断言 3：负控——搬移后旧路径确实断开（重绑生效前 ping 不通）"
+  if ip netns exec "$(node_ns "$a")" ping -c 1 -W 1 "$b4" >"$ART_DIR/negctl.out" 2>&1; then
+    fail "负控失败：搬移后立即 ping 即通（旧路径未真正断开，测试证明不了恢复）"
+  else
+    pass "负控：搬移后 1s 探测窗口内 $a → $b 不通"
+  fi
+
+  note "断言 4：30 秒内恢复与对端连通（Seam A，从搬移完成起计时）"
+  measured=0
+  while (( $(date +%s) - t0 < 30 )); do
+    if ip netns exec "$(node_ns "$a")" ping -c 1 -W 1 "$b4" >/dev/null 2>&1; then
+      measured=$(( $(date +%s) - t0 ))
+      break
+    fi
+  done
+  if (( measured > 0 )); then
+    pass "$a → $b 连通恢复，实测 ${measured}s（≤30s，AC）"
+  else
+    fail "30s 内未恢复连通（AC 不满足，现场见 forensics）"
+  fi
+  ping_assert "$b" "$a4" "$b → $a 恢复后双向（$a4）"
+
+  note "断言 5：恢复后 a 的 STUN Endpoint 已更换为新 NAT 出口"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "$new_ext" "$a 新 STUN Endpoint $new_ext" 30 || return 1
+  now=$(last_stun_endpoint "$a")
+  if [[ $now == "$new_ext" && $now != "$old_ext" ]]; then
+    pass "$a STUN Endpoint $old_ext → $now（出口 IP 已更换）"
+  else
+    fail "$a 最近 STUN Endpoint = ${now:-无}（期望 $new_ext，旧值 $old_ext）"
+  fi
+
+  note "断言 6：条件允许时再次升级 Direct Path（≤60s）"
+  # a 侧确定性经历 relay→direct 轮回（恢复序列作废直连记账后重新升级，日志可数）；
+  # b 侧可能全程未掉出 Direct（direct_rx 新鲜度未超窗，对端直连流量无缝续上），
+  # 以数据面报告的路径形态为准。
+  wait_new_direct_log "$a" "$direct_a" 60 || return 1
+  wait_peer_path "$a" direct 30 || return 1
+  wait_peer_path "$b" direct 30 || return 1
+
+  note "断言 7：换网重绑后 hzd 仍只持一个 UDP socket"
+  assert_single_udp_socket "$a" "$b"
+
+  note "实测：连通恢复 ${measured}s（上限 30s；构成=去抖 1s+重绑+STUN+上报+重拨）"
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}

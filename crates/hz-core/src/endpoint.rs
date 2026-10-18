@@ -115,7 +115,8 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
 
 /// 非虚拟网卡上的全部地址（getifaddrs）。虚拟网卡名沿用
 /// [`crate::netif`] 的排除表——第三方 TUN 类网络工具的地址不是我们的出口。
-fn interface_addrs() -> Vec<IpAddr> {
+/// 收集 Endpoint 与网络变化侦测（netwatch 的快照比对）共用。
+pub(crate) fn interface_addrs() -> Vec<IpAddr> {
     use std::ffi::CStr;
     let mut out = Vec::new();
     unsafe {
