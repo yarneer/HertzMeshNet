@@ -77,7 +77,7 @@ impl Tun {
     #[cfg(target_os = "linux")]
     pub fn setup(cfg: &TunConfig) -> anyhow::Result<Self> {
         let mut config = tun::Configuration::default();
-        config.name(DEVICE_NAME).mtu(MTU).up();
+        config.tun_name(DEVICE_NAME).mtu(MTU).up();
         let device = tun::create_as_async(&config)
             .with_context(|| format!("create tun device {DEVICE_NAME} failed"))?;
 
