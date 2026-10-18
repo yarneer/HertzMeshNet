@@ -265,8 +265,7 @@ async fn connect_relay_transport(
         },
         _ => None,
     };
-    match hz_core::relay_client::connect_relay(keys, node_id, relay_addr, ca_pem.as_deref()).await
-    {
+    match hz_core::relay_client::connect_relay(keys, node_id, relay_addr, ca_pem.as_deref()).await {
         Ok(client) => {
             engine.set_relay(Arc::new(client));
             tracing::info!(%relay_addr, "relay transport connected");

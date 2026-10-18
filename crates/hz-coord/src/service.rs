@@ -403,12 +403,14 @@ impl Coord for CoordServiceImpl {
             Err(_) => return Ok(rejected("挑战签名格式无效")),
         };
 
-        let Some(record) = self.store.node_by_machine_key(&machine_key_pub).await.map_err(
-            |error| {
+        let Some(record) = self
+            .store
+            .node_by_machine_key(&machine_key_pub)
+            .await
+            .map_err(|error| {
                 tracing::error!(%error, "lookup node for relay check failed");
                 Status::internal("查询 Node 失败")
-            },
-        )?
+            })?
         else {
             return Ok(rejected("Node 未注册或已吊销"));
         };

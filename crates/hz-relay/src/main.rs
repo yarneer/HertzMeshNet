@@ -72,7 +72,9 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     match cli.command {
         Command::Serve {
             listen,
@@ -134,7 +136,10 @@ async fn run_serve(
                 .identity(tonic::transport::Identity::from_pem(cert, key)),
         );
     } else if tls_self_signed {
-        let SelfSignedTls { server_config, ca_pem } = hz_relay::tls::generate(&tls_san)?;
+        let SelfSignedTls {
+            server_config,
+            ca_pem,
+        } = hz_relay::tls::generate(&tls_san)?;
         if let Some(path) = tls_ca_out {
             std::fs::write(&path, &ca_pem)?;
             tracing::info!(path = %path.display(), "self-signed CA written");

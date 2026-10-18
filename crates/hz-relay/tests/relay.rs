@@ -21,8 +21,8 @@ use hz_relay::tls;
 use hz_relay::{RelayConfig, RelayHandle, serve_relay};
 use rand_core::{OsRng, RngCore};
 use tokio::sync::mpsc;
-use tonic::transport::Channel;
 use tonic::Streaming;
+use tonic::transport::Channel;
 
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
@@ -48,11 +48,17 @@ async fn spin_world(relay_token_override: Option<&str>) -> World {
         .unwrap();
     let token = store.create_relay_token().await.unwrap();
 
-    let coord = serve_coord(ServeConfig::new(store.clone(), "127.0.0.1:0".parse().unwrap()))
-        .await
-        .unwrap();
+    let coord = serve_coord(ServeConfig::new(
+        store.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+    ))
+    .await
+    .unwrap();
 
-    let tls::SelfSignedTls { server_config, ca_pem } = tls::generate(&[]).unwrap();
+    let tls::SelfSignedTls {
+        server_config,
+        ca_pem,
+    } = tls::generate(&[]).unwrap();
     let relay = serve_relay(RelayConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: Some(server_config),
@@ -151,12 +157,9 @@ async fn raw_hello_stream(
 ) -> anyhow::Result<(Streaming<RelayFrame>, mpsc::Sender<RelayFrame>)> {
     let channel = Channel::from_shared(format!("https://{}", world.relay_addr))
         .unwrap()
-        .tls_config(
-            tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(tonic::transport::Certificate::from_pem(
-                    world.ca_pem.as_bytes(),
-                )),
-        )
+        .tls_config(tonic::transport::ClientTlsConfig::new().ca_certificate(
+            tonic::transport::Certificate::from_pem(world.ca_pem.as_bytes()),
+        ))
         .unwrap()
         .connect()
         .await
@@ -168,7 +171,9 @@ async fn raw_hello_stream(
     OsRng.fill_bytes(&mut nonce);
     let hello = RelayHello {
         node_id: node_id.to_owned(),
-        node_key_pub: x25519_dalek::PublicKey::from(&node_secret).to_bytes().to_vec(),
+        node_key_pub: x25519_dalek::PublicKey::from(&node_secret)
+            .to_bytes()
+            .to_vec(),
         machine_key_pub: machine.verifying_key().to_bytes().to_vec(),
         challenge_nonce: nonce.to_vec(),
         challenge_signature: machine.sign(&nonce).to_bytes().to_vec(),
@@ -265,10 +270,7 @@ async fn unregistered_machine_key_is_rejected_without_forwarding() {
         "拒绝后流必须已被 Relay 关闭，出站发送必须失败"
     );
     let leaked = tokio::time::timeout(Duration::from_millis(500), node_a.to_tunnel.recv()).await;
-    assert!(
-        leaked.is_err(),
-        "被拒绝的流不得向任何已连接 Node 转发数据"
-    );
+    assert!(leaked.is_err(), "被拒绝的流不得向任何已连接 Node 转发数据");
 
     world.relay.shutdown();
     world.relay.terminated().await;
@@ -283,7 +285,10 @@ async fn revoked_and_expired_nodes_are_rejected() {
 
     let revoked = register_node(&world.store, dir_r.path(), "revoked-node").await;
     world.store.revoke_node(&revoked.id).await.unwrap();
-    let machine = KeyStore::load_or_create(dir_r.path()).unwrap().machine().clone();
+    let machine = KeyStore::load_or_create(dir_r.path())
+        .unwrap()
+        .machine()
+        .clone();
     let (mut stream, _) = raw_hello_stream(&machine, &revoked.id, &world)
         .await
         .unwrap();
@@ -304,7 +309,7 @@ async fn revoked_and_expired_nodes_are_rejected() {
         )
         .await
         .unwrap();
-    let (mut stream, _) = raw_hello_stream(&expired_keys.machine(), &expired.id, &world)
+    let (mut stream, _) = raw_hello_stream(expired_keys.machine(), &expired.id, &world)
         .await
         .unwrap();
     let (code, message) = next_error_frame(&mut stream).await;
@@ -322,7 +327,10 @@ async fn wrong_relay_token_makes_coord_reject_every_check() {
     let dir_a = tempfile::tempdir().unwrap();
     let record_a = register_node(&world.store, dir_a.path(), "token-test-node").await;
 
-    let machine = KeyStore::load_or_create(dir_a.path()).unwrap().machine().clone();
+    let machine = KeyStore::load_or_create(dir_a.path())
+        .unwrap()
+        .machine()
+        .clone();
     let (mut stream, _) = raw_hello_stream(&machine, &record_a.id, &world)
         .await
         .unwrap();

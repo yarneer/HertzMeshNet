@@ -5,8 +5,9 @@
 #
 # 场景字段：
 #   HZ_NODES     空格分隔的 name:attachment；attachment ∈ lan|fullcone|portrestricted|symmetric
-#   HZ_ASSERT    断言套件名（suites.sh 里的 assert_suite_<name>）：lan|selftest|none
+#   HZ_ASSERT    断言套件名（suites.sh 里的 assert_suite_<name>）：lan|selftest|relay|none
 #   HZ_COORD     1 则在 hz-wan 内构建并启动 Coordination Server
+#   HZ_RELAY     1 则在 hz-wan 内启动 Relay（TLS 自签，coord 同机；默认 0，老场景不受影响）
 #   HZ_REFLECTOR 1 则在 hz-wan 内启动 UDP 反射器（报告观测到的源端口）
 #   HZ_PROXY_SIM 1 则在第一个 lan Node 内安装接管默认路由的黑洞 TUN（模拟第三方 TUN 类网络工具）
 #   HZ_WG_PORT   Node UDP 端口（兼作锥形 NAT 的静态映射端口）
@@ -30,6 +31,7 @@ REFL_ADDR=$WAN_GW
 REFL_PORT_A=19990
 REFL_PORT_B=19991
 UNSOLICIT_PORT=33333
+RELAY_PORT=8443               # Relay TLS 监听端口（coord 占用 443）
 
 FAILURES=0
 
@@ -52,7 +54,7 @@ load_scenario() {
   local name="$1"
   local file="$TOPO_DIR/scenarios/$name.env"
   [[ -f $file ]] || die "场景不存在：$file"
-  HZ_NODES=""; HZ_ASSERT="none"; HZ_COORD=0; HZ_REFLECTOR=0; HZ_PROXY_SIM=0; HZ_WG_PORT=51820
+  HZ_NODES=""; HZ_ASSERT="none"; HZ_COORD=0; HZ_RELAY=0; HZ_REFLECTOR=0; HZ_PROXY_SIM=0; HZ_WG_PORT=51820
   # shellcheck disable=SC1090
   source "$file"
   [[ -n $HZ_NODES ]] || die "场景 $name 未声明 HZ_NODES"
@@ -278,15 +280,15 @@ create_nodes() {
 # ---------------------------------------------------------------------------
 build_binaries() {
   local bin
-  for bin in hz-coord hzd hz; do
+  for bin in hz-coord hz-relay hzd hz; do
     [[ -x $BIN_DIR/$bin ]] && continue
     command -v cargo >/dev/null 2>&1 || die "$BIN_DIR/$bin 缺失且无 cargo 可构建"
     note "构建 release 二进制到 $BIN_DIR（首次约数分钟）"
     (cd "$REPO_ROOT" && CARGO_TARGET_DIR="${HZ_TOPO_CARGO_TARGET_DIR:-/target}" \
-       cargo build --release -p hz-coord -p hzd -p hz || exit 1)
+       cargo build --release -p hz-coord -p hz-relay -p hzd -p hz || exit 1)
     local tgt="${HZ_TOPO_CARGO_TARGET_DIR:-/target}/release"
     mkdir -p "$BIN_DIR"
-    cp "$tgt/hz-coord" "$tgt/hzd" "$tgt/hz" "$BIN_DIR/"
+    cp "$tgt/hz-coord" "$tgt/hz-relay" "$tgt/hzd" "$tgt/hz" "$BIN_DIR/"
     return
   done
 }
@@ -311,16 +313,33 @@ except OSError:
 }
 
 start_coord() {
-  local row name keyfile db="$ART_DIR/coord.db"
+  local row name keyfile db="$ART_DIR/coord.db" first=1
+  local -a relay_args=()
   while IFS='|' read -r row; do
     name=$(echo "$row" | cut -d'|' -f1)
+    # Relay Token 只签发一次（meta 里只存哈希，后续 bootstrap 不覆盖）
+    relay_args=()
+    if [[ $HZ_RELAY == 1 && $first == 1 ]]; then relay_args=(--relay-token); fi
     ip netns exec "$WAN_NS" "$BIN_DIR/hz-coord" bootstrap --db "$db" \
-      --auth-key-expiry 1d --json > "$ART_DIR/key-$name.json" || die "bootstrap $name 失败"
+      --auth-key-expiry 1d --json ${relay_args[@]+"${relay_args[@]}"} > "$ART_DIR/key-$name.json" || die "bootstrap $name 失败"
+    first=0
   done < <(reg_list)
   ip netns exec "$WAN_NS" setsid "$BIN_DIR/hz-coord" serve --db "$db" --listen 0.0.0.0:443 \
     > "$ART_DIR/coord.log" 2>&1 &
   wait_tcp "$WAN_NS" "203.0.113.1:443" "Coordination Server" || return 1
   pass "Coordination Server 已在 $WAN_NS 启动（203.0.113.1:443）"
+}
+
+start_relay() {
+  local first token
+  first=$(reg_list | head -1 | cut -d'|' -f1)
+  token=$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$first"'.json"))["relay_token"])')
+  ip netns exec "$WAN_NS" setsid "$BIN_DIR/hz-relay" serve \
+    --listen "0.0.0.0:$RELAY_PORT" --coord http://203.0.113.1:443 --relay-token "$token" \
+    --tls-self-signed --tls-san 203.0.113.1 --tls-ca-out "$ART_DIR/relay-ca.pem" \
+    > "$ART_DIR/relay.log" 2>&1 &
+  wait_tcp "$WAN_NS" "203.0.113.1:$RELAY_PORT" "Relay" || return 1
+  pass "Relay 已在 $WAN_NS 启动（203.0.113.1:$RELAY_PORT，TLS 自签，CA 已写出）"
 }
 
 start_reflector() {
@@ -382,6 +401,7 @@ cmd_up() {
   create_nodes
   if [[ $HZ_REFLECTOR == 1 ]]; then start_reflector; fi
   if [[ $HZ_COORD == 1 ]]; then start_coord || return 1; fi
+  if [[ $HZ_RELAY == 1 ]]; then start_relay || return 1; fi
   note "拓扑已就绪：场景 $scenario（artifacts: $ART_DIR）"
 }
 

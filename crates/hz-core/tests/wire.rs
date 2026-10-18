@@ -284,8 +284,15 @@ fn relayed_exchange_reaches_peer_and_hides_plaintext_from_relay() {
     let packet = udp_v4_packet(a.v4, b.v4, payload);
 
     let init = engine_a.send_ip_packet(&packet);
-    assert_eq!(init.to_relay.len(), 1, "Relay 对端的首包应产生一个中继数据报");
-    assert!(init.to_network.is_empty(), "开关指向 Relay 时不得走直连 UDP");
+    assert_eq!(
+        init.to_relay.len(),
+        1,
+        "Relay 对端的首包应产生一个中继数据报"
+    );
+    assert!(
+        init.to_network.is_empty(),
+        "开关指向 Relay 时不得走直连 UDP"
+    );
 
     let mut observed: Vec<Vec<u8>> = Vec::new();
     let response = deliver_over_relay(&init, &mut engine_b, &mut observed);
@@ -299,16 +306,18 @@ fn relayed_exchange_reaches_peer_and_hides_plaintext_from_relay() {
     );
 
     let decrypted = deliver_over_relay(&flushed, &mut engine_b, &mut observed);
-    assert_eq!(decrypted.to_tunnel, vec![packet.clone()], "中继链路必须打通");
+    assert_eq!(
+        decrypted.to_tunnel,
+        vec![packet.clone()],
+        "中继链路必须打通"
+    );
     assert!(decrypted.to_relay.is_empty());
 
     // Relay 全程只看到 WireGuard 密文：既不含明文字面量，也比明文载荷长。
     assert!(!observed.is_empty());
     for (round, bytes) in observed.iter().enumerate() {
         assert!(
-            !bytes
-                .windows(payload.len())
-                .any(|window| window == payload),
+            !bytes.windows(payload.len()).any(|window| window == payload),
             "第 {round} 个中继数据报泄漏了明文载荷"
         );
         assert!(

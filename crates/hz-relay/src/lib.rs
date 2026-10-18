@@ -89,8 +89,10 @@ pub async fn serve_relay(config: RelayConfig) -> anyhow::Result<RelayHandle> {
 /// 到 Coordination Server 的懒连接：启动时 coord 未就绪也不阻塞 Relay，
 /// 首次校验时才拨号；拨不通则校验失败（拒绝一切未验证客户端）。
 async fn connect_coord(coord_addr: &str) -> anyhow::Result<Channel> {
-    let endpoint = tonic::transport::Endpoint::from_shared(coord_addr.to_string())
-        .map_err(|error| anyhow::anyhow!("无效的 Coordination Server 地址 {coord_addr}：{error}"))?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(coord_addr.to_string()).map_err(|error| {
+            anyhow::anyhow!("无效的 Coordination Server 地址 {coord_addr}：{error}")
+        })?;
     let endpoint = match endpoint.uri().scheme_str() {
         Some("https") => endpoint.tls_config(tonic::transport::ClientTlsConfig::new())?,
         _ => endpoint,
@@ -152,8 +154,9 @@ fn forward_data(
 
 #[tonic::async_trait]
 impl Relay for RelayServiceImpl {
-    type RelayStreamStream =
-        Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send>>;
+    type RelayStreamStream = Pin<
+        Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send>,
+    >;
 
     async fn relay_stream(
         &self,
@@ -164,7 +167,9 @@ impl Relay for RelayServiceImpl {
             Ok(Ok(Some(frame))) => frame,
             Ok(Ok(None)) => return Err(Status::unauthenticated("流在认证前结束")),
             Ok(Err(error)) => {
-                return Err(Status::unauthenticated(format!("读取 RelayHello 失败：{error}")));
+                return Err(Status::unauthenticated(format!(
+                    "读取 RelayHello 失败：{error}"
+                )));
             }
             Err(_) => return Err(Status::unauthenticated("等待 RelayHello 超时")),
         };
@@ -183,7 +188,9 @@ impl Relay for RelayServiceImpl {
                 challenge_signature: hello.challenge_signature,
             })
             .await
-            .map_err(|error| Status::unavailable(format!("向 Coordination Server 校验失败：{error}")))?
+            .map_err(|error| {
+                Status::unavailable(format!("向 Coordination Server 校验失败：{error}"))
+            })?
             .into_inner();
 
         let (tx, rx) = mpsc::channel::<Result<RelayFrame, Status>>(SESSION_DEPTH);

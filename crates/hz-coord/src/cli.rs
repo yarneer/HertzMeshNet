@@ -78,7 +78,14 @@ pub fn run() -> anyhow::Result<()> {
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run_bootstrap(db, auth_key_expiry, once, tags, relay_token, json)),
+            .block_on(run_bootstrap(
+                db,
+                auth_key_expiry,
+                once,
+                tags,
+                relay_token,
+                json,
+            )),
     }
 }
 

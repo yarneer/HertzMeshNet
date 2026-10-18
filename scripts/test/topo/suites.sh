@@ -18,6 +18,8 @@ peer_field() { # peer_field <node> <field>（取第一个对端）
 }
 
 start_node_daemon() { # start_node_daemon <node> <auth-key>
+  # 可选 HZD_NODE_ENV 数组：额外注入 hzd 的环境变量（relay 场景用它传
+  # HZD_RELAY_ADDR/HZD_RELAY_CA_PATH/HZD_FORCE_RELAY）；未设置时为空，老场景不受影响。
   local name="$1" key="$2" ns hostname
   ns=$(node_ns "$name"); hostname=$(node_hostname "$name")
   mkdir -p "$ART_DIR/state-$name"
@@ -25,7 +27,8 @@ start_node_daemon() { # start_node_daemon <node> <auth-key>
   ip netns exec "$ns" setsid unshare --uts sh -c \
     "echo $hostname > /proc/sys/kernel/hostname; \
      exec env HZD_STATE_DIR=$ART_DIR/state-$name HZD_SOCK_PATH=$ART_DIR/hzd-$name.sock \
-       HZD_COORD_ADDR=http://203.0.113.1:443 HZD_WG_PORT=$HZ_WG_PORT $BIN_DIR/hzd" \
+       HZD_COORD_ADDR=http://203.0.113.1:443 HZD_WG_PORT=$HZ_WG_PORT \
+       ${HZD_NODE_ENV[@]+"${HZD_NODE_ENV[@]}"} $BIN_DIR/hzd" \
     > "$ART_DIR/hz-node-$name.log" 2>&1 &
   local i
   for i in $(seq 1 40); do
@@ -273,3 +276,81 @@ assert_suite_selftest() {
 }
 
 assert_suite_none() { note "场景未声明断言套件（HZ_ASSERT=none）"; return 0; }
+
+# ---------------------------------------------------------------------------
+# 套件 relay：两端都在对称型 NAT 后，数据面经 Relay 互通（FR-9 / issue #7）
+# ---------------------------------------------------------------------------
+assert_suite_relay() {
+  local a b node ns estab probe_out probe_rc
+  a=$(reg_list | awk -F'|' '$2 == "symmetric" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "symmetric" && $1 != "'"$a"'" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 symmetric 节点"; return 1; }
+
+  HZD_NODE_ENV=("HZD_RELAY_ADDR=https://203.0.113.1:$RELAY_PORT" \
+                "HZD_RELAY_CA_PATH=$ART_DIR/relay-ca.pem" \
+                "HZD_FORCE_RELAY=1")
+  note "[$a/$b] 启动 hzd（HZD_FORCE_RELAY=1，对称 NAT 无直连路径）并注册"
+  start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
+
+  note "等待双方的 Network Map 互见"
+  if wait_for_peer "$a" "$b" && wait_for_peer "$b" "$a"; then
+    pass "双方 Network Map 互见（name/ipv4/ipv6/endpoints 齐全）"
+  else
+    fail "Network Map 未在 90s 内互通"
+    return 1
+  fi
+
+  local a4 b4 a6 b6
+  b4=$(peer_field "$a" ipv4); b6=$(peer_field "$a" ipv6)
+  a4=$(peer_field "$b" ipv4); a6=$(peer_field "$b" ipv6)
+  note "$b=${b4} / ${b6}；$a=${a4} / ${a6}"
+
+  note "断言 1：经 Relay 的双向 IPv4 Node Address ping"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+
+  note "断言 2：经 Relay 的双向 ULA IPv6 ping（WG 加密任意 IP，中继不改路径语义）"
+  ping_assert "$a" "$b6" "$a → $b IPv6 经 Relay（$b6）" -6
+  ping_assert "$b" "$a6" "$b → $a IPv6 经 Relay（$a6）" -6
+
+  note "断言 3：路径确实经过 Relay（双方各持一条到 $RELAY_PORT 的 ESTAB，会话各开一次）"
+  for node in "$a" "$b"; do
+    ns=$(node_ns "$node")
+    estab=$(ip netns exec "$ns" sh -c "ss -t -n -p 2>/dev/null | grep hzd | grep -c ':$RELAY_PORT' || true")
+    if (( estab >= 1 )); then
+      pass "$node：hzd 与 Relay 的 TLS 连接存活（ESTAB x${estab}）"
+    else
+      fail "$node：hzd 到 Relay 的 TLS 连接缺失"
+    fi
+  done
+  local opened
+  opened=$(grep -c 'relay session opened' "$ART_DIR/relay.log" || true)
+  if (( opened >= 2 )); then
+    pass "Relay 侧两条会话登记在案（opened x${opened}）"
+  else
+    fail "Relay 会话登记数异常：${opened}（应 >= 2）"
+  fi
+
+  note "断言 4：未注册客户端被 Relay 拒绝（一次性 Machine Key 从 hz-wan 试探）"
+  probe_rc=0
+  probe_out=$(ip netns exec "$WAN_NS" "$BIN_DIR/hz-relay" probe \
+    --addr "https://203.0.113.1:$RELAY_PORT" --ca "$ART_DIR/relay-ca.pem" --node-id intruder) || probe_rc=$?
+  if (( probe_rc != 0 )) && [[ $probe_out == *"被拒绝"* ]]; then
+    pass "未注册身份被拒：$probe_out"
+  else
+    fail "未注册身份应被拒绝（rc=$probe_rc）：$probe_out"
+  fi
+
+  note "断言 5：Relay 日志只见密文帧（载荷带 pattern 的 ping 不在日志出现明文）"
+  local pattern="beefcafe"
+  ip netns exec "$(node_ns "$a")" ping -6 -c 2 -W 3 -p "$pattern" "$b6" > /dev/null 2>&1 || true
+  if grep -q "$pattern" "$ART_DIR/relay.log"; then
+    fail "Relay 日志出现明文载荷痕迹：$(grep "$pattern" "$ART_DIR/relay.log" | head -1)"
+  else
+    pass "Relay 日志无明文载荷（pattern ${pattern} 未出现）"
+  fi
+
+  unset HZD_NODE_ENV
+  (( FAILURES == 0 ))
+}
