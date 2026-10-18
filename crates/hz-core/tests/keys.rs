@@ -55,3 +55,47 @@ fn corrupt_machine_key_file_is_an_error_not_a_silent_rotation() {
         "损坏的密钥文件必须报错，静默重新生成等于轮换 Node 身份"
     );
 }
+
+#[test]
+fn staged_node_rotation_only_lands_on_commit() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let keys = KeyStore::load_or_create(state).unwrap();
+    let before = keys.node_public();
+    let machine_before = keys.machine_public();
+
+    let (secret, staged_public) = keys.stage_node_rotation();
+    assert_ne!(staged_public, before, "轮换必须产生新公钥");
+    assert_eq!(
+        keys.node_public(),
+        before,
+        "stage 不落盘不生效，登录失败时数据面继续用旧密钥"
+    );
+
+    let committed = keys.commit_node_rotation(state, &secret).unwrap();
+    assert_eq!(committed, staged_public);
+    assert_eq!(keys.node_public(), staged_public);
+    assert_eq!(
+        keys.machine_public(),
+        machine_before,
+        "轮换 Node Key 绝不动 Machine Key（ADR-0005）"
+    );
+
+    let reloaded = KeyStore::load_or_create(state).unwrap();
+    assert_eq!(
+        reloaded.node_public(),
+        staged_public,
+        "轮换必须持久化，重启后仍是新密钥"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("node-key.pub"))
+            .unwrap()
+            .trim(),
+        B64.encode(staged_public),
+        "node-key.pub 是推导物，轮换时必须同步覆盖"
+    );
+    assert_eq!(mode_of(&state.join("node-key")), 0o600);
+}

@@ -177,11 +177,13 @@ pub async fn report_endpoints(
 }
 
 /// 交互式登录的第一步：申请一次性登录链接（FR-2）。Node 侧只拿到 URL 与
-/// 过期时间，不接触任何 IdP 概念。
+/// 过期时间，不接触任何 IdP 概念。node_key_pub 由调用方决定：已注册的 Node
+/// 重新登录时应传入轮换后的新公钥，首次登录传当前公钥。
 pub async fn begin_interactive_login(
     state_dir: &Path,
     hostname: &str,
     coord_addr: &str,
+    node_key_pub: [u8; 32],
 ) -> anyhow::Result<StartedLogin> {
     let keys = KeyStore::load_or_create(state_dir)?;
     let channel = connect(coord_addr).await?;
@@ -206,7 +208,7 @@ pub async fn begin_interactive_login(
             hostname: hostname.to_owned(),
             challenge_nonce: nonce,
             challenge_signature: signature.to_vec(),
-            node_key_pub: keys.node_public().to_vec(),
+            node_key_pub: node_key_pub.to_vec(),
         })
         .await
         .map_err(|status| anyhow!("登录失败：{status}"))?

@@ -60,7 +60,7 @@ KANIDM_REDIRECT_2="http://127.0.0.1:${HTTP_PORT_2}/oidc/callback" \
   bash "$DIR/setup.sh" | tee "$WORK_DIR/credentials.json"
 status=${PIPESTATUS[0]}
 if [ "$status" -ne 0 ]; then
-  note "setup.sh 失败（exit $status）"
+  note "setup.sh 失败（exit ${status}）"
   exit "$status"
 fi
 grep -q '^{' "$WORK_DIR/credentials.json" \
@@ -77,13 +77,44 @@ KANIDM_CA="$WORK_DIR/chain.pem" \
 KANIDM_HTTP_PORT_1="$HTTP_PORT_1" \
 KANIDM_HTTP_PORT_2="$HTTP_PORT_2" \
 KANIDM_CREDENTIALS="$WORK_DIR/credentials.json" \
-  cargo test -p hz-coord --test kanidm_login -- --ignored --nocapture
+  cargo test -p hz-coord --test kanidm_login kanidm_interactive_login_gate -- --ignored --nocapture
 status=$?
 
 if [ "$status" -eq 0 ]; then
   note "全部断言通过"
 else
   note "断言失败；Kanidm 日志尾部："
+  docker compose -f "$DIR/docker-compose.yml" logs kanidm 2>&1 | tail -30 || true
+  exit "$status"
+fi
+
+# 第二阶段（#11）：把 alice 移出 hznet_admins，验证下次登录失去 Admin，
+# 同时断言重新登录轮换 Node Key 且身份不变。
+note "移出 hznet_admins 中的 alice（#11 AC4 前置）"
+# setup.sh 的 kanidm() 包装把首个参数当令牌缓存名（idm = idm_admin 的缓存）；
+# kanidm CLI 本身没有 idm 子命令，这里必须直接调 group remove-members。
+docker compose -f "$DIR/docker-compose.yml" exec -T -e "HOME=/cache/idm" -e "KANIDM_CACHE_DIR=/cache/idm" \
+  tools kanidm group remove-members hznet_admins alice 2>&1 | tee "$WORK_DIR/remove-members.log"
+remove_rc=${PIPESTATUS[0]}
+if [ "$remove_rc" -ne 0 ]; then
+  note "移出成员失败（exit ${remove_rc}）"
+  exit "$remove_rc"
+fi
+
+note "跑第二阶段集成测试（Admin 失权 + 重新登录轮换）"
+KANIDM_ISSUER="https://localhost:${HOST_PORT}" \
+KANIDM_CA="$WORK_DIR/chain.pem" \
+KANIDM_HTTP_PORT_1="$HTTP_PORT_1" \
+KANIDM_HTTP_PORT_2="$HTTP_PORT_2" \
+KANIDM_CREDENTIALS="$WORK_DIR/credentials.json" \
+KANIDM_ALICE_REMOVED=1 \
+  cargo test -p hz-coord --test kanidm_login admin_loss_on_relogin_gate -- --ignored --nocapture
+status=$?
+
+if [ "$status" -eq 0 ]; then
+  note "第二阶段断言通过（Admin 失权 + Node Key 轮换）"
+else
+  note "第二阶段断言失败；Kanidm 日志尾部："
   docker compose -f "$DIR/docker-compose.yml" logs kanidm 2>&1 | tail -30 || true
 fi
 exit "$status"

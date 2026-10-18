@@ -377,3 +377,47 @@ async fn migrations_are_idempotent_on_the_same_pool() {
         .await
         .expect("在同一连接池上重复迁移不应报错");
 }
+
+#[tokio::test]
+async fn expired_node_cannot_re_register_via_auth_key() {
+    let server = start_server().await;
+    let auth_key = server
+        .store
+        .create_auth_key(future_unix(3600), false, &[])
+        .await
+        .unwrap();
+    let keys = node_keys();
+    let mut client = connect(server.handle.local_addr).await;
+    register_fresh(&mut client, &keys, "host-exp", &auth_key)
+        .await
+        .expect("首次注册必须成功");
+
+    // 直接过期（等真实 90 天不现实；语义与到期一致）。
+    sqlx::query("UPDATE nodes SET expires_at_unix = ?1")
+        .bind(chrono::Utc::now().timestamp() - 1)
+        .execute(server.store.pool())
+        .await
+        .unwrap();
+
+    let fresh_key = server
+        .store
+        .create_auth_key(future_unix(3600), true, &[])
+        .await
+        .unwrap();
+    let rejected = register_fresh(&mut client, &keys, "host-exp", &fresh_key)
+        .await
+        .expect_err("过期的 Node 不得经 Auth Key 注册续命");
+    assert!(
+        rejected.message().contains("已过期") && rejected.message().contains("重新登录"),
+        "拒绝理由必须指向重新登录，实际：{}",
+        rejected.message()
+    );
+    let consumed: i64 =
+        sqlx::query("SELECT used_at_unix IS NOT NULL AS c FROM auth_keys WHERE key_hash = ?1")
+            .bind(hz_coord::authkey::hash(&fresh_key))
+            .fetch_one(server.store.pool())
+            .await
+            .unwrap()
+            .get("c");
+    assert_eq!(consumed, 0, "注定失败的一次性 Key 不应被消费");
+}
