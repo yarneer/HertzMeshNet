@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # M1 局域网互通门禁：docker 网络上一台 hz-coord + 两台 Linux Node（特权、/dev/net/tun）。
+# 拓扑化（单容器 netns + NAT）版本见 scripts/test/topo/topo.sh，本脚本保留为多容器基线。
 # 通过标准：两个方向都 ping 通对端 IPv4 与 ULA IPv6 Node Address；
 # hz0 只接管 100.96.0.0/16 与 ULA /48（100.100.2.136 不走 hz0）；
 # hzd 只持有唯一一个 UDP socket（打洞与 WireGuard 共用，ADR-0002）。
