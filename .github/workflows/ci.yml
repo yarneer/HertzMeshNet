@@ -22,3 +22,14 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
+
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (macOS)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (macOS)
+        run: cargo test --all
