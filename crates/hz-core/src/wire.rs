@@ -503,15 +503,10 @@ async fn send_to_network(socket: &Arc<UdpSocket>, sends: Vec<NetworkSend>) {
 /// 本机朝 Coordination Server 方向的源 IP + WireGuard 端口，作为上报的 LAN Endpoint。
 /// 用临时 UDP socket connect 目标地址，让内核替我们选出路由源地址。
 pub async fn lan_endpoint(coord_addr: &str, wg_port: u16) -> anyhow::Result<SocketAddr> {
+    let target = coord_probe_target(coord_addr)?;
     let probe = UdpSocket::bind("0.0.0.0:0")
         .await
         .context("bind probe socket failed")?;
-    let target: SocketAddr = coord_addr
-        .rsplit_once("://")
-        .map(|(_, host)| host)
-        .unwrap_or(coord_addr)
-        .parse()
-        .with_context(|| format!("无效的 Coordination Server 地址：{coord_addr}"))?;
     probe
         .connect(target)
         .await
@@ -523,4 +518,39 @@ pub async fn lan_endpoint(coord_addr: &str, wg_port: u16) -> anyhow::Result<Sock
         bail!("无法确定朝向 {target} 的本机地址");
     }
     Ok(SocketAddr::new(local.ip(), wg_port))
+}
+
+/// 解析 Coordination Server 地址（允许带 scheme 与主机名）到探测用 SocketAddr。
+/// DNS 解析只在启动时做一次，阻塞可接受。
+fn coord_probe_target(coord_addr: &str) -> anyhow::Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let host_port = coord_addr
+        .rsplit_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(coord_addr);
+    host_port
+        .to_socket_addrs()
+        .with_context(|| format!("无法解析 Coordination Server 地址：{coord_addr}"))?
+        .next()
+        .context(format!(
+            "Coordination Server 地址未解析出任何结果：{coord_addr}"
+        ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coord_probe_target_strips_scheme_and_accepts_hostnames() {
+        assert_eq!(
+            coord_probe_target("http://127.0.0.1:443").unwrap(),
+            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            coord_probe_target("127.0.0.1:443").unwrap(),
+            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
+        );
+        assert!(coord_probe_target("no-port-here").is_err());
+    }
 }

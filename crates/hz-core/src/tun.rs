@@ -110,7 +110,10 @@ impl Tun {
 
 #[cfg(target_os = "linux")]
 fn run_ip(args: &[&str]) -> anyhow::Result<()> {
-    let output = std::process::Command::new("ip").args(args).output()?;
+    let output = std::process::Command::new("ip")
+        .args(args)
+        .output()
+        .with_context(|| format!("execute ip {} (iproute2 未安装？)", args.join(" ")))?;
     if !output.status.success() {
         bail!(
             "ip {} 失败：{}",

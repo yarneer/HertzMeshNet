@@ -50,14 +50,14 @@ trap 'cleanup dump' EXIT
 # 读取节点 status JSON 里第一个对端的字段（hz status --json 输出 IPC 原始结果）。
 peer_field() {
   local node="$1" field="$2"
-  docker exec "$node" /out/hz status --json 2>/dev/null \
+  docker exec -e HZD_SOCK_PATH=/tmp/hzd.sock "$node" /out/hz status --json 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); p=d["peers"][0]; print(p["'"$field"'"])'
 }
 
 wait_for_peer() {
   local node="$1" other="$2"
   for _ in $(seq 1 $((MAP_WAIT_SECS * 2))); do
-    if docker exec "$node" /out/hz status --json 2>/dev/null | python3 -c '
+    if docker exec -e HZD_SOCK_PATH=/tmp/hzd.sock "$node" /out/hz status --json 2>/dev/null | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -76,12 +76,19 @@ sys.exit(0)
 }
 
 ping_assert() {
-  local node="$1" target="$2" label="$3" flags=("${@:4}")
-  if docker exec "$node" ping "${flags[@]}" -c 3 -W 2 "$target" >/tmp/hz-ping.out 2>&1; then
-    pass "$label（$(grep -c 'bytes from' /tmp/hz-ping.out)/3 应答）"
-  else
-    fail "$label：$(tail -3 /tmp/hz-ping.out | tr '\n' ' ')"
-  fi
+  local node="$1" target="$2" label="$3"
+  local -a flags=()
+  if (( $# > 3 )); then flags=("${@:4}"); fi
+  # 首个方向的第一次 ping 可能落在 WireGuard 冷启动握手的重传窗口内，允许重试。
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if docker exec "$node" ping ${flags[@]+"${flags[@]}"} -c 3 -W 2 "$target" >/tmp/hz-ping.out 2>&1; then
+      pass "${label}（第 ${attempt} 次尝试，$(grep -c 'bytes from' /tmp/hz-ping.out)/3 应答）"
+      return 0
+    fi
+    sleep 3
+  done
+  fail "${label}: $(tail -3 /tmp/hz-ping.out | tr '\n' ' ')"
 }
 
 note "清理旧环境并创建 docker 网络 $NETWORK"
@@ -123,21 +130,28 @@ KEY1=$(docker exec "$COORD" python3 -c 'import json;print(json.load(open("/tmp/k
 KEY2=$(docker exec "$COORD" python3 -c 'import json;print(json.load(open("/tmp/key2.json"))["auth_key"])')
 
 note "两个特权 Node 容器（/dev/net/tun）"
-docker run -d --name "$NODE1" --network "$NETWORK" --privileged --hostname hznode1 \
-  -v "$VOL_BIN:/out" "$IMAGE" bash -c '
-    set -euo pipefail
-    apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping python3 >/dev/null
-    sleep infinity
-  ' >/dev/null 2>&1
-docker run -d --name "$NODE2" --network "$NETWORK" --privileged --hostname hznode2 \
-  -v "$VOL_BIN:/out" "$IMAGE" bash -c '
-    set -euo pipefail
-    apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping python3 >/dev/null
-    sleep infinity
-  ' >/dev/null 2>&1
+for i in 1 2; do
+  name=$(eval "echo \$NODE$i")
+  docker run -d --name "$name" --network "$NETWORK" --privileged --hostname "hznode$i" \
+    -v "$VOL_BIN:/out" "$IMAGE" bash -c '
+      set -euo pipefail
+      apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping python3 >/dev/null
+      # Docker Desktop 容器可能缺 /dev/net/tun；特权容器可直接 mknod 补上
+      [ -c /dev/net/tun ] || { mkdir -p /dev/net && mknod /dev/net/tun c 10 200; }
+      # 容器内核可能整体关闭了 IPv6，ULA 路由需要它
+      sysctl -q net.ipv6.conf.all.disable_ipv6=0 2>/dev/null || true
+      sleep infinity
+    ' >/dev/null 2>&1
+done
 
 start_node() {
   local node="$1" key="$2"
+  # 容器入口在后台 apt 安装 iproute2/ping；装完才能起 hzd（TUN 配置依赖 ip 命令）。
+  for _ in $(seq 1 120); do
+    docker exec "$node" sh -c 'command -v ip >/dev/null && command -v ping >/dev/null' 2>/dev/null && break
+    sleep 1
+  done
+  docker exec "$node" sh -c 'command -v ip >/dev/null' || { fail "$node 的 ip 命令未就绪"; return 1; }
   docker exec -d "$node" bash -c "
     export HZD_STATE_DIR=/tmp/hzd-state HZD_SOCK_PATH=/tmp/hzd.sock \
            HZD_COORD_ADDR=http://$COORD:443 HZD_WG_PORT=51820
@@ -160,13 +174,17 @@ if wait_for_peer "$NODE1" "hznode2" && wait_for_peer "$NODE2" "hznode1"; then
   pass "双方 Network Map 互见（name/ipv4/ipv6/endpoints 齐全）"
 else
   fail "Network Map 未在 ${MAP_WAIT_SECS}s 内互通"
+  for node in "$NODE1" "$NODE2"; do
+    echo "--- $node hz status --json ---"
+    docker exec -e HZD_SOCK_PATH=/tmp/hzd.sock "$node" /out/hz status --json 2>&1 | head -30 || true
+  done
 fi
 
 IPV4_OF_NODE2=$(peer_field "$NODE1" ipv4)
 IPV6_OF_NODE2=$(peer_field "$NODE1" ipv6)
 IPV4_OF_NODE1=$(peer_field "$NODE2" ipv4)
 IPV6_OF_NODE1=$(peer_field "$NODE2" ipv6)
-note "node2=$IPV4_OF_NODE2 / $IPV6_OF_NODE2；node1=$IPV4_OF_NODE1 / $IPV6_OF_NODE1"
+note "node2=${IPV4_OF_NODE2} / ${IPV6_OF_NODE2}; node1=${IPV4_OF_NODE1} / ${IPV6_OF_NODE1}"
 
 # 主机名决定 Node Name 的规范化基名；hz status 的 name 已断言互见，这里直接 ping 地址。
 note "断言 1：双向 IPv4 Node Address ping"
