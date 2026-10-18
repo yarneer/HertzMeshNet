@@ -85,5 +85,34 @@ if [ "$status" -eq 0 ]; then
 else
   note "断言失败；Kanidm 日志尾部："
   docker compose -f "$DIR/docker-compose.yml" logs kanidm 2>&1 | tail -30 || true
+  exit "$status"
+fi
+
+# 第二阶段（#11）：把 alice 移出 hznet_admins，验证下次登录失去 Admin，
+# 同时断言重新登录轮换 Node Key 且身份不变。
+note "移出 hznet_admins 中的 alice（#11 AC4 前置）"
+docker compose -f "$DIR/docker-compose.yml" exec -T -e "HOME=/cache/admin" -e "KANIDM_CACHE_DIR=/cache/admin" \
+  tools kanidm idm group remove-members hznet_admins alice >/dev/null
+remove_rc=$?
+if [ "$remove_rc" -ne 0 ]; then
+  note "移出成员失败（exit $remove_rc）"
+  exit "$remove_rc"
+fi
+
+note "跑第二阶段集成测试（Admin 失权 + 重新登录轮换）"
+KANIDM_ISSUER="https://localhost:${HOST_PORT}" \
+KANIDM_CA="$WORK_DIR/chain.pem" \
+KANIDM_HTTP_PORT_1="$HTTP_PORT_1" \
+KANIDM_HTTP_PORT_2="$HTTP_PORT_2" \
+KANIDM_CREDENTIALS="$WORK_DIR/credentials.json" \
+KANIDM_ALICE_REMOVED=1 \
+  cargo test -p hz-coord --test kanidm_login admin_loss_on_relogin_gate -- --ignored --nocapture
+status=$?
+
+if [ "$status" -eq 0 ]; then
+  note "第二阶段断言通过（Admin 失权 + Node Key 轮换）"
+else
+  note "第二阶段断言失败；Kanidm 日志尾部："
+  docker compose -f "$DIR/docker-compose.yml" logs kanidm 2>&1 | tail -30 || true
 fi
 exit "$status"

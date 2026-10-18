@@ -173,6 +173,15 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // OIDC 与 HTTP 面参数也接受环境变量（容器/脚本部署）。
     let env_value = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    // 亚天级 TTL 的注入通道（有效期测试用 60 秒一类值）；缺省保持 flag 值。
+    if let Some(secs) =
+        env_value("HZ_COORD_LOGIN_NODE_TTL_SECS").and_then(|text| text.parse::<i64>().ok())
+    {
+        if secs <= 0 {
+            anyhow::bail!("HZ_COORD_LOGIN_NODE_TTL_SECS 必须是正整数秒数");
+        }
+        config.login_node_ttl_secs = secs;
+    }
     let issuer = oidc_issuer
         .or_else(|| env_value("HZ_COORD_OIDC_ISSUER"))
         .or_else(|| env_value("KANIDM_ISSUER"));

@@ -334,6 +334,27 @@ impl Coord for CoordServiceImpl {
             .verify(&nonce, &Signature::from_bytes(&signature))
             .map_err(|_| Status::unauthenticated("签名验证失败"))?;
 
+        // Auth Key 注册同时是已注册 Node 的密钥刷新通道；过期的 Node 不得借此
+        // 续命（FR-3：重新登录才是恢复路径）。先于 Auth Key 消费判定，
+        // 一次性 Key 不为注定失败的注册买单。
+        if let Some(existing) = self
+            .store
+            .node_by_machine_key(&challenge.machine_key_pub)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "lookup node for registration failed");
+                Status::internal("注册失败：服务端存储错误")
+            })?
+        {
+            if existing
+                .expires_at_unix
+                .is_some_and(|expires| expires <= crate::store::unix_now())
+            {
+                tracing::warn!(node_id = %existing.id, "auth key registration rejected: node expired");
+                return Err(Status::permission_denied("Node 已过期，请重新登录"));
+            }
+        }
+
         let tags = self
             .store
             .consume_auth_key(&req.auth_key)

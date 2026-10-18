@@ -187,6 +187,16 @@ impl Engine {
         }
     }
 
+    /// 本机 Node Key 轮换（重新登录，FR-3）：替换静态私钥并清空全部对端。
+    /// 旧私钥建立的会话不允许在新密钥下续命；对端由随后的 reconcile 重建。
+    pub fn rotate_own_key(&mut self, secret: StaticSecret) {
+        self.own_secret = secret;
+        let stale: Vec<String> = self.peers.keys().cloned().collect();
+        for id in stale {
+            self.remove_peer(&id);
+        }
+    }
+
     /// TUN 出方向的明文 IP 包：按目的地址找到对端并封装。
     /// 目的地址不属于任何对端时静默丢弃（隧道不承载 HzNet 段以外的流量）。
     pub fn send_ip_packet(&mut self, packet: &[u8]) -> EngineOutput {
@@ -517,6 +527,15 @@ impl SocketEngine {
             .lock()
             .expect("engine poisoned")
             .reconcile(specs);
+    }
+
+    /// 重新登录后的本机 Node Key 轮换：换私钥、清对端，调用方随后重放
+    /// Network Map 对账以重建会话。
+    pub fn rotate_own_key(&self, secret: StaticSecret) {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .rotate_own_key(secret);
     }
 
     pub fn handshake_ages(&self) -> HashMap<String, Option<Duration>> {

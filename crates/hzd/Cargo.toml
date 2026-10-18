@@ -21,3 +21,4 @@ libc.workspace = true
 hz-coord.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
+sqlx.workspace = true

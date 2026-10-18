@@ -2,13 +2,14 @@
 //! 私钥文件是唯一事实源：.pub 文件缺失时从私钥推导补写；已有文件一律复用、绝不重写。
 
 use std::path::Path;
+use std::sync::RwLock;
 
 use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::SigningKey;
 use x25519_dalek::PublicKey as NodePublicKey;
-use x25519_dalek::StaticSecret as NodeStaticSecret;
+pub use x25519_dalek::StaticSecret as NodeStaticSecret;
 
 const MACHINE_KEY_FILE: &str = "machine-key";
 const NODE_KEY_FILE: &str = "node-key";
@@ -17,7 +18,8 @@ const PUBLIC_FILE_MODE: u32 = 0o644;
 
 pub struct KeyStore {
     machine: SigningKey,
-    node: NodeStaticSecret,
+    /// 重新登录会轮换 Node Key（FR-3），持有端共享同一 KeyStore，所以要内部可变。
+    node: RwLock<NodeStaticSecret>,
 }
 
 impl KeyStore {
@@ -48,7 +50,10 @@ impl KeyStore {
             &NodePublicKey::from(&node).to_bytes(),
         )?;
 
-        Ok(Self { machine, node })
+        Ok(Self {
+            machine,
+            node: RwLock::new(node),
+        })
     }
 
     pub fn machine(&self) -> &SigningKey {
@@ -59,12 +64,39 @@ impl KeyStore {
         self.machine.verifying_key().to_bytes()
     }
 
-    pub fn node(&self) -> &NodeStaticSecret {
-        &self.node
+    pub fn node(&self) -> NodeStaticSecret {
+        self.node.read().expect("node key poisoned").clone()
     }
 
     pub fn node_public(&self) -> [u8; 32] {
-        NodePublicKey::from(&self.node).to_bytes()
+        NodePublicKey::from(&*self.node.read().expect("node key poisoned")).to_bytes()
+    }
+
+    /// 轮换第一步：只生成新 Node Key，不动任何状态。登录链接发出前调用，
+    /// 新公钥随 BeginLoginRequest 上行；登录失败就丢弃，数据面仍用旧密钥。
+    pub fn stage_node_rotation(&self) -> (NodeStaticSecret, [u8; 32]) {
+        let secret = NodeStaticSecret::random_from_rng(rand_core::OsRng);
+        let public = NodePublicKey::from(&secret).to_bytes();
+        (secret, public)
+    }
+
+    /// 轮换第二步：登录完成后落盘并生效。私钥走临时文件 + rename；
+    /// .pub 是推导物，轮换时必须覆盖而不是沿用旧文件（load 始终以私钥为准）。
+    pub fn commit_node_rotation(
+        &self,
+        state_dir: &Path,
+        secret: &NodeStaticSecret,
+    ) -> anyhow::Result<[u8; 32]> {
+        let public = NodePublicKey::from(secret).to_bytes();
+        write_file_atomic(
+            &state_dir.join(NODE_KEY_FILE),
+            secret.as_bytes(),
+            PRIVATE_FILE_MODE,
+        )?;
+        write_file_atomic(&state_dir.join("node-key.pub"), &public, PUBLIC_FILE_MODE)?;
+        *self.node.write().expect("node key poisoned") = secret.clone();
+        tracing::info!("node key rotated");
+        Ok(public)
     }
 }
 

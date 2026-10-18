@@ -39,3 +39,38 @@ fn registered_roundtrips_identity_fields() {
     let parsed: NodeStatus = serde_json::from_value(wire).unwrap();
     assert_eq!(parsed, NodeStatus::Registered(info));
 }
+
+#[test]
+fn expired_keeps_identity_and_roundtrips_with_expired_flag() {
+    let info = RegisteredInfo {
+        node_id: "node-11".to_string(),
+        name: "host-exp".to_string(),
+        ipv4: "100.96.0.9".to_string(),
+        ipv6: "fd12:3456:789a::6460:9".to_string(),
+        tags: vec![],
+        owner_user: Some("alice".to_string()),
+        expires_at_unix: Some(1),
+    };
+    let wire = serde_json::to_value(NodeStatus::Expired(info.clone())).unwrap();
+    assert_eq!(
+        wire,
+        json!({
+            "registered": false,
+            "expired": true,
+            "node_id": "node-11",
+            "name": "host-exp",
+            "ipv4": "100.96.0.9",
+            "ipv6": "fd12:3456:789a::6460:9",
+            "tags": [],
+            "owner_user": "alice",
+            "expires_at_unix": 1
+        })
+    );
+    let parsed: NodeStatus = serde_json::from_value(wire).unwrap();
+    assert_eq!(parsed, NodeStatus::Expired(info));
+    assert_eq!(
+        parsed.info().map(|info| info.name.as_str()),
+        Some("host-exp"),
+        "过期态仍持有身份，供 hz status 展示不变的 NodeAddress 与 NodeName"
+    );
+}

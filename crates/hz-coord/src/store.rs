@@ -183,6 +183,8 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
+            // Node Key 变更影响对端（需按新公钥重建会话），必须唤醒推送。
+            self.notify_change();
             existing.node_key_pub = node_key_pub.to_vec();
             tracing::info!(node_id = %existing.id, "re-registered existing node");
             return Ok(existing);
@@ -372,6 +374,8 @@ impl Store {
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
+            // 轮换后的 Node Key、归属与有效期都影响 Network Map 内容。
+            self.notify_change();
             existing.node_key_pub = node_key_pub.to_vec();
             existing.expires_at_unix = Some(expires_at_unix);
             existing.owner_user = Some(

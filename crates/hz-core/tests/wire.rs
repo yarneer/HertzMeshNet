@@ -336,3 +336,47 @@ fn relay_datagram_for_unknown_index_is_dropped_silently() {
     assert!(out.to_tunnel.is_empty());
     assert!(out.to_relay.is_empty());
 }
+
+#[test]
+fn own_key_rotation_drops_sessions_and_rejoins_with_new_key() {
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+
+    let packet = udp_v4_packet(a.v4, b.v4, b"before-rotation");
+    let init = engine_a.send_ip_packet(&packet);
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let decrypted = deliver(&flushed, &mut engine_b, a.udp);
+    assert_eq!(
+        decrypted.to_tunnel,
+        vec![packet.clone()],
+        "轮换前两端必须已经互通"
+    );
+
+    let fresh = NodeStaticSecret::random_from_rng(OsRng);
+    let fresh_public = NodePublicKey::from(&fresh).to_bytes();
+    engine_a.rotate_own_key(fresh);
+    assert_eq!(
+        engine_a.peer_count(),
+        0,
+        "轮换后旧密钥建立的会话必须全部作废"
+    );
+
+    // 对端按新公钥重建（coord 下发的 node_key_pub 变化），本机重放对账。
+    engine_b.configure(PeerSpec {
+        node_key_pub: fresh_public,
+        ..spec_for(&a)
+    });
+    engine_a.reconcile(vec![spec_for(&b)]);
+
+    let after = udp_v4_packet(a.v4, b.v4, b"after-rotation");
+    let init2 = engine_a.send_ip_packet(&after);
+    assert_eq!(init2.to_network.len(), 1, "轮换后首个出站包必须重新握手");
+    let response2 = deliver(&init2, &mut engine_b, a.udp);
+    let flushed2 = deliver(&response2, &mut engine_a, b.udp);
+    let decrypted2 = deliver(&flushed2, &mut engine_b, a.udp);
+    assert_eq!(
+        decrypted2.to_tunnel,
+        vec![after],
+        "新密钥下通信必须恢复，旧密钥会话不再续命"
+    );
+}

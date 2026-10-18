@@ -275,14 +275,23 @@ fn extract_hidden_value(page: &str, name: &str) -> String {
 }
 
 /// Node 侧一次完整的交互式登录：申请链接 → 浏览器完成 → 轮询到注册结果。
+/// relogin=true 复刻 hzd 的重新登录路径（#11/ADR-0005）：先暂存新 Node Key，
+/// 新公钥随 BeginLogin 上行，登录完成后才落盘。
 async fn node_login(
     env: &TestEnv,
     state_dir: &Path,
     hostname: &str,
     username: &str,
+    relogin: bool,
 ) -> LoginOutcome {
     let coord_addr = format!("http://{}", env.handle.local_addr);
-    let started = begin_interactive_login(state_dir, hostname, &coord_addr)
+    let keys = KeyStore::load_or_create(state_dir).unwrap();
+    let staged = relogin.then(|| keys.stage_node_rotation());
+    let node_key_pub = staged
+        .as_ref()
+        .map(|(_, public)| *public)
+        .unwrap_or_else(|| keys.node_public());
+    let started = begin_interactive_login(state_dir, hostname, &coord_addr, node_key_pub)
         .await
         .expect("BeginLogin 应成功");
     drive_browser(
@@ -302,6 +311,11 @@ async fn node_login(
         {
             LoginPoll::Pending => tokio::time::sleep(Duration::from_millis(300)).await,
             LoginPoll::Completed(info) => {
+                if let Some((secret, public)) = staged {
+                    keys.commit_node_rotation(state_dir, &secret)
+                        .expect("Node Key 轮换落盘");
+                    assert_eq!(public, keys.node_public());
+                }
                 persist_like_hzd(state_dir, &info);
                 return LoginOutcome {
                     info,
@@ -381,7 +395,7 @@ async fn kanidm_interactive_login_gate() {
     // AC1：无头服务器 hz up → 另一设备完成登录 → 加入 HzNet 并归属该 User。
     let alice_dir = tempfile::tempdir().unwrap();
     KeyStore::load_or_create(alice_dir.path()).unwrap();
-    let alice = node_login(&env, alice_dir.path(), "node-alice", "alice").await;
+    let alice = node_login(&env, alice_dir.path(), "node-alice", "alice", false).await;
     assert_eq!(alice.info.owner_user.as_deref(), Some("alice"));
     assert_eq!(alice.info.name, "node-alice");
     let expected_expiry = chrono::Utc::now().timestamp() + LOGIN_NODE_TTL_SECS;
@@ -392,7 +406,7 @@ async fn kanidm_interactive_login_gate() {
     assert_eq!(admin_flag(&env, "alice").await, 1, "alice 应被识别为 Admin");
     let bob_dir = tempfile::tempdir().unwrap();
     KeyStore::load_or_create(bob_dir.path()).unwrap();
-    let bob = node_login(&env, bob_dir.path(), "node-bob", "bob").await;
+    let bob = node_login(&env, bob_dir.path(), "node-bob", "bob", false).await;
     assert_eq!(bob.info.owner_user.as_deref(), Some("bob"));
     assert_eq!(
         admin_flag(&env, "bob").await,
@@ -419,9 +433,15 @@ async fn kanidm_interactive_login_gate() {
     let late_dir = tempfile::tempdir().unwrap();
     KeyStore::load_or_create(late_dir.path()).unwrap();
     let late_addr = format!("http://{}", env.short_handle.local_addr);
-    let late = begin_interactive_login(late_dir.path(), "node-late", &late_addr)
-        .await
-        .unwrap();
+    let late_keys = KeyStore::load_or_create(late_dir.path()).unwrap();
+    let late = begin_interactive_login(
+        late_dir.path(),
+        "node-late",
+        &late_addr,
+        late_keys.node_public(),
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
     let error = loop {
         match poll_login_status(late_dir.path(), "node-late", &late_addr, &late.login_id)
@@ -580,4 +600,90 @@ async fn own_oidc_flow(env: &TestEnv, username: &str) -> Value {
         &body[..body.len().min(300)]
     );
     serde_json::from_str(&body).expect("token 端点应答应是 JSON")
+}
+
+/// #11 AC：User 被移出 hznet_admins 后，下次重新登录失去 Admin 权限；
+/// 同时验证重新登录轮换 Node Key 而身份、NodeAddress、NodeName 不变（ADR-0005）。
+/// 前置：run.sh 第一阶段已证明 alice 登录后 is_admin=1，随后执行
+/// `kanidm idm group remove-members hznet_admins alice` 再运行本测试。
+#[tokio::test]
+#[ignore = "需要真实 Kanidm 且 alice 已被移出 hznet_admins：bash scripts/test/kanidm/run.sh 第二阶段"]
+async fn admin_loss_on_relogin_gate() {
+    use sqlx::Row;
+
+    let env = build_env().await.expect("测试环境初始化");
+    assert_eq!(
+        std::env::var("KANIDM_ALICE_REMOVED").as_deref(),
+        Ok("1"),
+        "本测试必须在 alice 被移出 hznet_admins 之后运行"
+    );
+
+    let alice_dir = tempfile::tempdir().unwrap();
+    KeyStore::load_or_create(alice_dir.path()).unwrap();
+    let machine_key_pub = KeyStore::load_or_create(alice_dir.path())
+        .unwrap()
+        .machine_public()
+        .to_vec();
+
+    let node_row = || async {
+        sqlx::query(
+            "SELECT id, name, ipv4, node_key_pub, expires_at_unix FROM nodes WHERE machine_key_pub = ?1",
+        )
+        .bind(&machine_key_pub)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap()
+    };
+
+    let first = node_login(&env, alice_dir.path(), "node-alice", "alice", false).await;
+    assert_eq!(
+        admin_flag(&env, "alice").await,
+        0,
+        "移出 hznet_admins 后的登录必须失去 Admin（FR-11；移出前的 is_admin=1 由第一阶段证明）"
+    );
+    let before = node_row().await;
+
+    let second = node_login(&env, alice_dir.path(), "node-alice", "alice", true).await;
+    assert_eq!(
+        admin_flag(&env, "alice").await,
+        0,
+        "重新登录不得复活 Admin 权限"
+    );
+    assert_eq!(
+        second.info.node_id, first.info.node_id,
+        "重新登录保持 Node 身份"
+    );
+    assert_eq!(second.info.name, first.info.name, "Node Name 不变");
+    assert_eq!(second.info.ipv4, first.info.ipv4, "Node Address 不变");
+    assert_eq!(second.info.owner_user.as_deref(), Some("alice"));
+
+    let after = node_row().await;
+    assert_eq!(row_str(&after, "id"), row_str(&before, "id"));
+    assert_eq!(row_str(&after, "name"), row_str(&before, "name"));
+    assert_eq!(row_str(&after, "ipv4"), row_str(&before, "ipv4"));
+    assert_ne!(
+        after.get::<Vec<u8>, _>("node_key_pub"),
+        before.get::<Vec<u8>, _>("node_key_pub"),
+        "重新登录必须轮换 Node Key"
+    );
+    assert_eq!(
+        after.get::<Vec<u8>, _>("node_key_pub"),
+        KeyStore::load_or_create(alice_dir.path())
+            .unwrap()
+            .node_public()
+            .to_vec(),
+        "coord 库里的 Node Key 必须与本地轮换后的公钥一致"
+    );
+    assert!(
+        after.get::<i64, _>("expires_at_unix") > before.get::<i64, _>("expires_at_unix"),
+        "重新登录必须续期"
+    );
+
+    env.handle.shutdown();
+    env.handle.terminated().await;
+}
+
+fn row_str(row: &sqlx::sqlite::SqliteRow, column: &str) -> String {
+    use sqlx::Row;
+    row.get::<String, _>(column)
 }
