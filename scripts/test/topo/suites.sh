@@ -126,11 +126,11 @@ assert_single_udp_socket() { # assert_single_udp_socket <node...>
   local node ns count
   for node in "$@"; do
     ns=$(node_ns "$node")
-    count=$(ip netns exec "$ns" sh -c "ss -u -a -p 2>/dev/null | grep -c 'hzd' || true")
+    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
     if [[ $count == 1 ]]; then
       pass "$node：hzd 恰好 1 个 UDP socket（WireGuard/打洞/STUN 共用，ADR-0002）"
     else
-      fail "$node：hzd UDP socket 数量为 ${count}（应为 1）"
+      fail "$node：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
     fi
   done
 }
@@ -230,11 +230,11 @@ assert_suite_lan() {
   note "断言 4：hzd 仅持有唯一 UDP socket（WireGuard 与打洞共用，ADR-0002）"
   for node in "$a" "$b"; do
     ns=$(node_ns "$node")
-    count=$(ip netns exec "$ns" sh -c "ss -u -a -p 2>/dev/null | grep -c 'hzd' || true")
+    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
     if [[ $count == 1 ]]; then
       pass "$node：hzd 恰好 1 个 UDP socket"
     else
-      fail "$node：hzd UDP socket 数量为 ${count}（应为 1）"
+      fail "$node：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
     fi
   done
 
