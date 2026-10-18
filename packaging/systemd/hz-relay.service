@@ -1,0 +1,13 @@
+[Unit]
+Description=HzNet Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/hz-relay
+ExecStart=/usr/local/bin/hz-relay serve $HZ_RELAY_ARGS
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

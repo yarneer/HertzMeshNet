@@ -1,0 +1,14 @@
+[Unit]
+Description=HzNet Coordination Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/hz-coord
+ExecStart=/usr/local/bin/hz-coord serve $HZ_COORD_ARGS
+Restart=on-failure
+RestartSec=2
+StateDirectory=hz-coord
+
+[Install]
+WantedBy=multi-user.target

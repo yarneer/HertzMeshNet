@@ -1,0 +1,14 @@
+[Unit]
+Description=HzNet Node 守护进程
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/hzd
+ExecStart=/usr/local/bin/hzd
+Restart=always
+RestartSec=2
+StateDirectory=hzd
+
+[Install]
+WantedBy=multi-user.target
