@@ -75,6 +75,13 @@ async fn restart_on_same_addr(store: &Store, addr: std::net::SocketAddr) -> Serv
 
 #[tokio::test]
 async fn daemon_survives_coord_outage_and_reconnects_after_recovery() {
+    // coord 侧的存储错误只走 tracing；不装 subscriber 时测试只剩 tonic 状态码，
+    // 无法定位是哪条 SQL 失败。
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .try_init();
     let store = Store::open_in_memory(AddressConfig::default())
         .await
         .unwrap();

@@ -128,6 +128,8 @@ impl Store {
     /// 测试用库：临时文件承载（不是 `sqlite::memory:`）。文件库在连接被
     /// 摧毁后重建仍读到同一份数据；内存库则会变成空库——fan-out 任务被
     /// abort 时可能正持有唯一连接，那之后的任何查询都会失败。
+    /// PRAGMA 与 [`Store::open`] 完全一致（WAL + 外键）：测试库必须复现
+    /// 生产库的并发行为，而不是只复现表结构。
     pub async fn open_in_memory(addr: AddressConfig) -> anyhow::Result<Self> {
         let dir = tempfile::tempdir()?;
         let pool = SqlitePoolOptions::new()
@@ -135,7 +137,10 @@ impl Store {
             .connect_with(
                 SqliteConnectOptions::new()
                     .filename(dir.path().join("test.db"))
-                    .create_if_missing(true),
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Normal)
+                    .foreign_keys(true),
             )
             .await?;
         let store = Self::from_pool(pool, addr).await?;
@@ -145,6 +150,15 @@ impl Store {
             changes: store.changes,
             temp: Some(std::sync::Arc::new(dir)),
         })
+    }
+
+    /// 写事务从这里开始：BEGIN IMMEDIATE 在第一条语句前取写锁，锁冲突
+    /// 都是可以等 busy_timeout 的普通 BUSY。DEFERRED 事务先读后写时，
+    /// 若别的事务在读快照之后提交了写入，升级会立刻得到不可等待的
+    /// BUSY_SNAPSHOT（code 5/517，busy handler 不介入）——并发注册与
+    /// Endpoint 上报同帧到达时在慢机器上可稳定复现。
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await
     }
 
     pub async fn from_pool(pool: SqlitePool, addr: AddressConfig) -> anyhow::Result<Self> {
@@ -199,8 +213,7 @@ impl Store {
     pub async fn consume_auth_key(&self, plaintext: &str) -> Result<Vec<String>, AuthKeyError> {
         let key_hash = authkey::hash(plaintext);
         let mut tx = self
-            .pool
-            .begin()
+            .begin_write()
             .await
             .map_err(|e| store_broken(e, AuthKeyError::Invalid))?;
         let row = sqlx::query(
@@ -248,7 +261,7 @@ impl Store {
         user_id: Option<&str>,
         expires_at_unix: Option<i64>,
     ) -> anyhow::Result<NodeRecord> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         if let Some(mut existing) = node_by_machine_key(&mut tx, machine_key_pub).await? {
             sqlx::query("UPDATE nodes SET node_key_pub = ?1 WHERE id = ?2")
@@ -434,7 +447,7 @@ impl Store {
         user_id: &str,
         expires_at_unix: i64,
     ) -> anyhow::Result<NodeRecord> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         if let Some(mut existing) = node_by_machine_key(&mut tx, machine_key_pub).await? {
             sqlx::query(
                 "UPDATE nodes SET node_key_pub = ?1, user_id = ?2, expires_at_unix = ?3 WHERE id = ?4",
@@ -481,7 +494,7 @@ impl Store {
     /// 入库新版本并指向它；版本号由 AUTOINCREMENT 分配。
     /// 唤醒 Map 推送任务重算每个订阅者的过滤视图。
     pub async fn push_policy(&self, content: &str) -> anyhow::Result<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let result =
             sqlx::query("INSERT INTO policy_versions (content, created_at_unix) VALUES (?1, ?2)")
                 .bind(content)
@@ -505,7 +518,7 @@ impl Store {
         if exists.is_none() {
             anyhow::bail!("版本 {version} 不存在");
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         set_current_policy_version(&mut tx, version).await?;
         tx.commit().await?;
         self.notify_change();
