@@ -19,11 +19,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 用 Auth Key 注册本机（FR-1）
+    /// 注册本机（FR-1：带 --auth-key 用 Auth Key；否则走交互式登录 FR-2）
     Up {
-        /// Auth Key 明文（hz-coord bootstrap 签发）
+        /// Auth Key 明文（hz-coord bootstrap 签发）；缺省时走交互式登录
         #[arg(long)]
-        auth_key: String,
+        auth_key: Option<String>,
+        /// Coordination Server 地址（默认读 HZD_COORD_ADDR，再退到内置占位地址）
+        #[arg(long)]
+        coord: Option<String>,
+    },
+    /// 重新交互式登录（已注册的 Node 重新归属到登录的 User，身份不变）
+    Login {
         /// Coordination Server 地址（默认读 HZD_COORD_ADDR，再退到内置占位地址）
         #[arg(long)]
         coord: Option<String>,
@@ -36,6 +42,7 @@ async fn main() -> std::process::ExitCode {
     match cli.command {
         Command::Status { json } => status(json).await,
         Command::Up { auth_key, coord } => up(auth_key, coord).await,
+        Command::Login { coord } => up(None, coord).await,
     }
 }
 
@@ -78,9 +85,12 @@ async fn status(json_output: bool) -> std::process::ExitCode {
     }
 }
 
-async fn up(auth_key: String, coord: Option<String>) -> std::process::ExitCode {
+async fn up(auth_key: Option<String>, coord: Option<String>) -> std::process::ExitCode {
     let socket = paths::socket_path();
-    let mut params = serde_json::json!({ "auth_key": auth_key });
+    let mut params = serde_json::json!({});
+    if let Some(auth_key) = auth_key {
+        params["auth_key"] = serde_json::Value::String(auth_key);
+    }
     if let Some(coord) = coord {
         params["coord_addr"] = serde_json::Value::String(coord);
     } else if std::env::var_os("HZD_COORD_ADDR").is_none() {
@@ -95,22 +105,98 @@ async fn up(auth_key: String, coord: Option<String>) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match response {
-        Response::Ok { result, .. } => match serde_json::from_value::<RegisteredInfo>(result) {
-            Ok(info) => {
-                println!("注册成功");
-                print_identity(&info);
-                std::process::ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("无法解析 hzd 应答：{error}");
-                std::process::ExitCode::FAILURE
-            }
-        },
+    let result = match response {
+        Response::Ok { result, .. } => result,
         Response::Error { error, .. } => {
             // hzd 侧的注册错误已经带"注册失败："上下文链，这里不再重复前缀。
             eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    if result.get("login_url").is_some() {
+        return interactive_login(result).await;
+    }
+    match serde_json::from_value::<RegisteredInfo>(result) {
+        Ok(info) => {
+            println!("注册成功");
+            print_identity(&info);
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("无法解析 hzd 应答：{error}");
             std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// 交互式登录（FR-2）：打印一次性链接，然后等 hzd 轮询到登录结果。
+async fn interactive_login(begin: serde_json::Value) -> std::process::ExitCode {
+    let login_url = begin
+        .get("login_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let expires_unix = begin.get("expires_unix").and_then(|v| v.as_i64());
+    println!("一次性登录链接（仅显示一次，请在任意设备的浏览器中打开并登录）：");
+    println!("{login_url}");
+    match expires_unix.and_then(|unix| chrono::DateTime::from_timestamp(unix, 0)) {
+        Some(time) => println!("有效期至：{}", time.to_rfc3339()),
+        None => println!("链接将在短时间内过期"),
+    }
+    println!("等待登录完成……");
+
+    let socket = paths::socket_path();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("等待登录超时，请重新执行 hz up");
+            return std::process::ExitCode::FAILURE;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let request = Request::new(3, "login_poll", serde_json::json!({}));
+        let response = match ipc::request(&socket, request).await {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("无法连接 hzd：{error:#}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let result = match response {
+            Response::Ok { result, .. } => result,
+            Response::Error { error, .. } => {
+                eprintln!("{error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let state = result.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        match state {
+            "pending" | "idle" => continue,
+            "failed" => {
+                let error = result
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知错误");
+                eprintln!("登录失败：{error}");
+                return std::process::ExitCode::FAILURE;
+            }
+            "completed" => {
+                match result
+                    .get("node")
+                    .and_then(|node| serde_json::from_value::<RegisteredInfo>(node.clone()).ok())
+                {
+                    Some(info) => {
+                        println!("登录成功，已加入 HzNet");
+                        print_identity(&info);
+                        return std::process::ExitCode::SUCCESS;
+                    }
+                    None => {
+                        eprintln!("hzd 返回的完成态缺少 Node 信息");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+            }
+            _ => continue,
         }
     }
 }

@@ -12,6 +12,8 @@ service Coord {
   rpc RegisterWithAuthKey(RegisterAuthKeyRequest) returns (RegisterResponse);
   // 交互式登录，票据 #10 实现。
   rpc BeginInteractiveLogin(BeginLoginRequest) returns (BeginLoginResponse);
+  // 交互式登录结果轮询：Node 侧在浏览器完成登录后取回注册结果。
+  rpc LoginStatus(LoginStatusRequest) returns (LoginStatusResponse);
   // Network Map 下发流：打开即发全量快照并保持打开；推送更新在票据 #6。
   rpc StreamNetworkMap(StreamMapRequest) returns (stream NetworkMapMessage);
 }
@@ -59,11 +61,31 @@ message BeginLoginRequest {
   string hostname = 3;
   bytes challenge_nonce = 4;
   bytes challenge_signature = 5;
+  // Node Key 公钥（x25519）；登录回调落定时绑定到该 Node。
+  bytes node_key_pub = 6;
 }
 
 message BeginLoginResponse {
   string login_url = 1;
   int64 expires_unix = 2;
+}
+
+message LoginStatusRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  // BeginLogin 返回的一次性登录标识（login_url 的最后一段）。
+  string login_id = 6;
+}
+
+message LoginStatusResponse {
+  // false = 浏览器侧尚未完成登录，继续轮询。
+  bool completed = 1;
+  optional NodeInfo node = 2;
+  // 终态错误（链接被重复使用、已过期、IdP 拒绝等），中文可读。
+  optional string error = 3;
 }
 
 message StreamMapRequest {
