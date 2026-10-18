@@ -601,6 +601,13 @@ async fn apply_path_event(
             if use_relay {
                 tracing::info!(node_id = %node_id, "path=relay (direct lost, fall back)");
             } else {
+                // IPv6 直连优先（FR-8）：双方都有 v6 候选时，把发送偏好
+                // 切到 v6——打洞握手两族并发，先回来的可能是 v4。
+                if let Some(peer) = peers.iter().find(|peer| peer.endpoints.node_id == node_id) {
+                    if let Some(v6) = peer.endpoints.v6.first() {
+                        engine.prefer_endpoint(&node_id, *v6);
+                    }
+                }
                 let endpoint = engine
                     .endpoint_candidates(&node_id)
                     .first()

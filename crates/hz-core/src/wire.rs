@@ -650,6 +650,15 @@ impl SocketEngine {
             .set_use_relay(node_id, use_relay);
     }
 
+    /// 把某个地址提升为该对端的最佳 Endpoint（IPv6 直连优先的落点：
+    /// 升级 Direct 时把发送偏好切到 v6 候选）。
+    pub fn prefer_endpoint(&self, node_id: &str, addr: SocketAddr) {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .prefer_endpoint(node_id, addr);
+    }
+
     /// 追加对端候选 Endpoint（打洞信令带来的实时地址）。
     pub fn add_peer_endpoints(&self, node_id: &str, candidates: Vec<SocketAddr>) {
         self.engine
