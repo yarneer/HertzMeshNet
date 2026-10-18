@@ -23,7 +23,7 @@ use hz_core::path::{PathEvent, PathManager, PeerEndpoints};
 use hz_core::policy::{InboundGate, InboundPolicyView};
 use hz_core::punch::{PunchCodec, PunchMessage};
 use hz_core::status::{NodeStatus, RegisteredInfo};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use hz_core::tun::{DEFAULT_V4_CIDR, Tun, TunConfig};
 use hz_core::wire::{PeerReport, PeerSpec, SocketEngine, lan_endpoint};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub mod dns;
+pub mod launchd;
 pub mod ping;
 
 const REGISTRATION_FILE: &str = "registration.json";
@@ -666,8 +667,25 @@ async fn start_dataplane(
         keys.clone(),
         &info.node_id,
     );
+    #[cfg(target_os = "macos")]
+    spawn_egress_watch();
     *daemon.engine.lock().expect("engine poisoned") = Some(engine);
     Ok(())
+}
+
+/// macOS 出口监视的守护进程侧消费：保住监视任务的生命周期并留痕。
+/// 已有长连 socket 的重绑随 #9 的跨平台监视合流。
+#[cfg(target_os = "macos")]
+fn spawn_egress_watch() {
+    tokio::spawn(async move {
+        let mut events = hz_core::netwatch_mac::spawn_watcher();
+        while let Some(event) = events.recv().await {
+            tracing::info!(
+                ?event,
+                "egress changed; sockets created from now on bind the new egress"
+            );
+        }
+    });
 }
 
 /// Relay 传输监督（#7 单连 → #8 断线重连）：连上后挂到引擎；流断开按退避
@@ -1051,7 +1069,7 @@ fn spawn_tun_bridge(
     });
     let own_v4: Option<std::net::Ipv4Addr> = info.ipv4.parse().ok();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut to_tunnel_rx = to_tunnel_rx;
         let (ipv4, ipv6) = match (info.ipv4.parse(), info.ipv6.parse()) {
@@ -1175,7 +1193,7 @@ fn spawn_tun_bridge(
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (cache, gate);
         spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
@@ -1183,7 +1201,7 @@ fn spawn_tun_bridge(
 }
 
 /// 入方向：取包的源地址（对端身份索引的键）。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn class_src(class: &hz_core::policy::PacketClass) -> Option<IpAddr> {
     match class {
         hz_core::policy::PacketClass::Flow { src, .. }
@@ -1193,7 +1211,7 @@ fn class_src(class: &hz_core::policy::PacketClass) -> Option<IpAddr> {
 }
 
 /// 出方向：取包的目的地址（对端索引的键）。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn class_dst(class: &hz_core::policy::PacketClass) -> Option<IpAddr> {
     match class {
         hz_core::policy::PacketClass::Flow { dst, .. } => Some(*dst),
