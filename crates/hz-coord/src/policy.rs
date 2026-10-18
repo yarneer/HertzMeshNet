@@ -31,22 +31,17 @@ pub async fn validate_policy(store: &Store, content: &str) -> Result<PolicyDoc, 
 }
 
 /// 管理操作授权（A3）：调用 rpc 的 Node 必须归属一个 Admin User。
-/// 带 Tag 的 Node 无归属，直接拒绝；#12 的其余管理 rpc 复用本函数。
+/// 操作者解析复用 [`crate::admin::resolve_operator`]（#12 起的统一模型），
+/// 报错文案保持 #13 的字面值（测试断言依赖）。
 pub async fn authorize_admin(store: &Store, record: &NodeRecord) -> Result<(), Status> {
-    let Some(owner) = record.owner_user.as_deref() else {
-        return Err(Status::permission_denied(
-            "带 Tag 的 Node 不归属任何 User，不能执行管理操作",
-        ));
-    };
-    match store.user_is_admin(owner).await {
-        Ok(Some(true)) => Ok(()),
-        Ok(_) => Err(Status::permission_denied(format!(
-            "User {owner} 不是 Admin，无法执行此管理操作"
+    match crate::admin::resolve_operator(store, record).await? {
+        crate::admin::Operator::Admin { .. } => Ok(()),
+        crate::admin::Operator::User { user } => Err(Status::permission_denied(format!(
+            "User {user} 不是 Admin，无法执行此管理操作"
         ))),
-        Err(e) => {
-            tracing::error!(%e, %owner, "lookup admin flag failed");
-            Err(Status::internal("查询 Admin 身份失败"))
-        }
+        crate::admin::Operator::Tagged => Err(Status::permission_denied(
+            "带 Tag 的 Node 不归属任何 User，不能执行管理操作",
+        )),
     }
 }
 

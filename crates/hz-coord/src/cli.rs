@@ -72,6 +72,9 @@ enum Command {
         /// 预绑定 Tag，可多次出现
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// 同时把该名字的 User 落库为 Admin（无需 Kanidm 即可种出第一个 Admin）
+        #[arg(long)]
+        admin: Option<String>,
         /// 同时签发 Relay Token（与 Auth Key 一样仅显示一次，供 hz-relay 使用）
         #[arg(long)]
         relay_token: bool,
@@ -119,6 +122,7 @@ pub fn run() -> anyhow::Result<()> {
             auth_key_expiry,
             once,
             tags,
+            admin,
             relay_token,
             json,
         } => tokio::runtime::Builder::new_multi_thread()
@@ -129,6 +133,7 @@ pub fn run() -> anyhow::Result<()> {
                 auth_key_expiry,
                 once,
                 tags,
+                admin,
                 relay_token,
                 json,
             )),
@@ -255,11 +260,15 @@ async fn run_bootstrap(
     auth_key_expiry: String,
     once: bool,
     tags: Vec<String>,
+    admin: Option<String>,
     issue_relay_token: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let expires_at_unix = parse_expiry(&auth_key_expiry)?;
     let store = Store::open(&db, AddressConfig::default()).await?;
+    if let Some(name) = &admin {
+        store.upsert_user(name, true).await?;
+    }
     let plaintext = store.create_auth_key(expires_at_unix, once, &tags).await?;
     let relay_token = if issue_relay_token {
         Some(store.create_relay_token().await?)
@@ -271,6 +280,9 @@ async fn run_bootstrap(
             "auth_key": plaintext,
             "expires_at_unix": expires_at_unix
         });
+        if let Some(name) = &admin {
+            payload["admin"] = serde_json::Value::String(name.clone());
+        }
         if let Some(token) = relay_token {
             payload["relay_token"] = serde_json::Value::String(token);
         }
@@ -292,6 +304,9 @@ async fn run_bootstrap(
         }
     );
     println!("有效期至：{expires_at}");
+    if let Some(name) = &admin {
+        println!("已把 User {name} 落库为 Admin（可凭其名下 Node 远程管理）");
+    }
     if let Some(token) = relay_token {
         println!("Relay Token（仅此一次显示，请立即保存，供 hz-relay 使用）：");
         println!("{token}");

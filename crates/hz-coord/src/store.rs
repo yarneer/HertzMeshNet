@@ -27,6 +27,48 @@ pub enum AuthKeyError {
     AlreadyUsed,
 }
 
+/// 吊销 Auth Key 的三种结局（决定 rpc 应答语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeAuthKeyOutcome {
+    Revoked,
+    /// Key 在册但本来就已过期/已吊销：幂等成功。
+    AlreadyDead,
+    Missing,
+}
+
+/// `hz node list` 的可见范围：Admin 看全部（含已吊销行，供审计），
+/// 普通 User 只看自己名下且未吊销的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeScope {
+    All,
+    OwnedBy(String),
+}
+
+/// 管理列表的一行：Node 的身份字段 + 吊销标记（不含数据面字段）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedNode {
+    pub node_id: String,
+    pub name: String,
+    pub ipv4: String,
+    pub ipv6: String,
+    pub tags: Vec<String>,
+    pub owner_user: Option<String>,
+    pub expires_at_unix: Option<i64>,
+    pub revoked: bool,
+}
+
+/// 改名的失败（成功返回更新后的记录）。
+#[derive(Debug, thiserror::Error)]
+pub enum RenameError {
+    #[error("目标 Node 不存在")]
+    Missing,
+    #[error("Node Name 已存在：{0}")]
+    NameTaken(String),
+    // anyhow::Error 不是 dyn Error，不能做 source；transparent 直接透传。
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
 /// 注册成功后返回的 Node 记录，字段与 NodeInfo 一一对应。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRecord {
@@ -192,13 +234,28 @@ impl Store {
         single_use: bool,
         tags: &[String],
     ) -> anyhow::Result<String> {
+        Ok(self
+            .create_auth_key_with_id(expires_at_unix, single_use, tags)
+            .await?
+            .0)
+    }
+
+    /// 同 [`Store::create_auth_key`]，但把行的 key id 一并返回
+    /// （AdminRevokeAuthKey 吊销时按 id 定位）。
+    pub async fn create_auth_key_with_id(
+        &self,
+        expires_at_unix: i64,
+        single_use: bool,
+        tags: &[String],
+    ) -> anyhow::Result<(String, String)> {
         let plaintext = authkey::generate_plaintext();
+        let key_id = authkey::random_id();
         let now = unix_now();
         sqlx::query(
             "INSERT INTO auth_keys (id, key_hash, created_at_unix, expires_at_unix, single_use, used_at_unix, tags)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
         )
-        .bind(authkey::random_id())
+        .bind(&key_id)
         .bind(authkey::hash(&plaintext))
         .bind(now)
         .bind(expires_at_unix)
@@ -206,7 +263,31 @@ impl Store {
         .bind(serde_json::to_string(tags)?)
         .execute(&self.pool)
         .await?;
-        Ok(plaintext)
+        Ok((plaintext, key_id))
+    }
+
+    /// 吊销 Auth Key：把过期时刻钉到当下之前（consume 侧即拒绝）。
+    pub async fn revoke_auth_key(&self, key_id: &str) -> anyhow::Result<RevokeAuthKeyOutcome> {
+        let result = sqlx::query(
+            "UPDATE auth_keys SET expires_at_unix = ?1
+             WHERE id = ?2 AND expires_at_unix > ?1",
+        )
+        .bind(unix_now() - 1)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() > 0 {
+            return Ok(RevokeAuthKeyOutcome::Revoked);
+        }
+        let exists = sqlx::query("SELECT 1 FROM auth_keys WHERE id = ?1")
+            .bind(key_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(if exists.is_some() {
+            RevokeAuthKeyOutcome::AlreadyDead
+        } else {
+            RevokeAuthKeyOutcome::Missing
+        })
     }
 
     /// 校验并消费 Auth Key，成功时返回它预绑定的 Tag。
@@ -367,6 +448,103 @@ impl Store {
             self.notify_change();
         }
         Ok(revoked)
+    }
+
+    // ------------------------------------------------------------------
+    // Admin 管理（FR-11 / #12）：列表 / 改名 / 删除。吊销复用 revoke_node。
+    // ------------------------------------------------------------------
+
+    pub async fn list_nodes(&self, scope: &NodeScope) -> anyhow::Result<Vec<ListedNode>> {
+        let base = "SELECT n.id, n.name, n.ipv4, n.ipv6, n.tags, u.name AS owner_user,
+                    n.expires_at_unix, (n.revoked_at_unix IS NOT NULL) AS revoked
+             FROM nodes n LEFT JOIN users u ON u.id = n.user_id";
+        let rows = match scope {
+            NodeScope::All => sqlx::query(base).fetch_all(&self.pool).await?,
+            NodeScope::OwnedBy(owner) => {
+                sqlx::query(&format!(
+                    "{base} WHERE u.name = ?1 AND n.revoked_at_unix IS NULL ORDER BY n.name"
+                ))
+                .bind(owner)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows
+            .iter()
+            .map(|row| ListedNode {
+                node_id: row.get("id"),
+                name: row.get("name"),
+                ipv4: row.get("ipv4"),
+                ipv6: row.get("ipv6"),
+                tags: serde_json::from_str(&row.get::<String, _>("tags")).unwrap_or_default(),
+                owner_user: row.try_get("owner_user").ok().flatten(),
+                expires_at_unix: row.get("expires_at_unix"),
+                revoked: row.get::<i64, _>("revoked") != 0,
+            })
+            .collect())
+    }
+
+    /// 按 node id 查行（含已吊销：管理操作的目标常是刚被吊销的行）。
+    pub async fn node_row_by_id(&self, node_id: &str) -> anyhow::Result<Option<NodeRecord>> {
+        let row = sqlx::query(
+            "SELECT n.id, n.name, n.ipv4, n.ipv6, n.tags, u.name AS owner_user,
+                    n.expires_at_unix, n.node_key_pub, n.udp_endpoints
+             FROM nodes n LEFT JOIN users u ON u.id = n.user_id
+             WHERE n.id = ?1",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| node_record_from_row(&row)).transpose()
+    }
+
+    /// 改名：唯一性在写事务内校验（与注册的去重路径同一张表约束）。
+    /// 显式改名不做 -2 后缀兜底，冲突即拒绝。成功唤醒 Map 推送
+    /// （名字是 NodeInfo 的一部分，对端按差量拿到新名，DNS 随缓存跟新）。
+    pub async fn rename_node(
+        &self,
+        node_id: &str,
+        new_name: &str,
+    ) -> Result<NodeRecord, RenameError> {
+        let mut tx = self.begin_write().await.map_err(anyhow::Error::from)?;
+        let taken = sqlx::query("SELECT 1 FROM nodes WHERE name = ?1 AND id != ?2")
+            .bind(new_name)
+            .bind(node_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if taken.is_some() {
+            return Err(RenameError::NameTaken(new_name.to_string()));
+        }
+        let updated = sqlx::query("UPDATE nodes SET name = ?1 WHERE id = ?2")
+            .bind(new_name)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if updated.rows_affected() == 0 {
+            return Err(RenameError::Missing);
+        }
+        tx.commit().await.map_err(anyhow::Error::from)?;
+        self.notify_change();
+        self.node_row_by_id(node_id)
+            .await
+            .map_err(RenameError::Store)?
+            .ok_or(RenameError::Missing)
+    }
+
+    /// 硬删行（对比吊销：不保留审计记录、Machine Key 随行消失，
+    /// 之后可用新 Auth Key 以全新身份重新注册）。返回是否真的删了。
+    pub async fn delete_node(&self, node_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query("DELETE FROM nodes WHERE id = ?1")
+            .bind(node_id)
+            .execute(&self.pool)
+            .await?;
+        let deleted = result.rows_affected() > 0;
+        if deleted {
+            self.notify_change();
+        }
+        Ok(deleted)
     }
 
     /// Network Map 快照：所有未吊销、未过期的 Node（含 Node Key 与 Endpoint）。

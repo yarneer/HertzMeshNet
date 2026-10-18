@@ -13,9 +13,10 @@ use ed25519_dalek::Signer;
 use hyper_util::rt::TokioIo;
 use hz_proto::coord_client::CoordClient;
 use hz_proto::{
-    BeginLoginRequest, HelloRequest, LoginStatusRequest, PROTOCOL_VERSION, PolicyGetRequest,
-    PolicyPushRequest, PolicyRollbackRequest, RegisterAuthKeyRequest, ReportEndpointsRequest,
-    StreamMapRequest,
+    AdminCreateAuthKeyRequest, AdminRevokeAuthKeyRequest, BeginLoginRequest, DeleteNodeRequest,
+    HelloRequest, ListNodesRequest, LoginStatusRequest, PROTOCOL_VERSION, PolicyGetRequest,
+    PolicyPushRequest, PolicyRollbackRequest, RegisterAuthKeyRequest, RenameNodeRequest,
+    ReportEndpointsRequest, RevokeNodeRequest, StreamMapRequest,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tonic::Streaming;
@@ -409,6 +410,185 @@ pub async fn policy_rollback(
         .map_err(|status| anyhow!("Policy 回滚被拒绝（{status}）"))?
         .into_inner();
     Ok(response.version)
+}
+
+// ---- Admin 远程管理（FR-11 / #12）：与 Policy 同一挑战认证形态。----
+
+/// 签发出的 Auth Key：明文只在内存/调用方输出里出现一次。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedAuthKey {
+    pub plaintext: String,
+    pub key_id: String,
+}
+
+/// 管理列表的一行（服务端 AdminNodeInfo 的对应物）。
+/// Serialize 供 hzd 原样透传给 `hz node list --json`。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ManagedNode {
+    pub node_id: String,
+    pub name: String,
+    pub ipv4: String,
+    pub ipv6: String,
+    pub tags: Vec<String>,
+    pub owner_user: Option<String>,
+    pub expires_at_unix: Option<i64>,
+    pub revoked: bool,
+}
+
+/// 签发 Auth Key（仅 Admin）。
+pub async fn admin_create_auth_key(
+    state_dir: &Path,
+    coord_addr: &str,
+    expires_unix: i64,
+    single_use: bool,
+    tags: &[String],
+) -> anyhow::Result<IssuedAuthKey> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .admin_create_auth_key(AdminCreateAuthKeyRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            expires_unix,
+            single_use,
+            tags: tags.to_vec(),
+        })
+        .await
+        .map_err(|status| anyhow!("Auth Key 签发被拒绝（{status}）"))?
+        .into_inner();
+    Ok(IssuedAuthKey {
+        plaintext: response.auth_key,
+        key_id: response.key_id,
+    })
+}
+
+/// 吊销 Auth Key（仅 Admin）。
+pub async fn admin_revoke_auth_key(
+    state_dir: &Path,
+    coord_addr: &str,
+    key_id: &str,
+) -> anyhow::Result<()> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    client
+        .admin_revoke_auth_key(AdminRevokeAuthKeyRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            key_id: key_id.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("Auth Key 吊销被拒绝（{status}）"))?;
+    Ok(())
+}
+
+/// 列出 Node：Admin 得到全部（含已吊销），普通 User 得到自己名下。
+pub async fn list_nodes(state_dir: &Path, coord_addr: &str) -> anyhow::Result<Vec<ManagedNode>> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .list_nodes(ListNodesRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+        })
+        .await
+        .map_err(|status| anyhow!("列出 Node 被拒绝（{status}）"))?
+        .into_inner();
+    Ok(response
+        .nodes
+        .into_iter()
+        .map(|node| ManagedNode {
+            node_id: node.node_id,
+            name: node.name,
+            ipv4: node.ipv4,
+            ipv6: node.ipv6,
+            tags: node.tags,
+            owner_user: node.owner_user,
+            expires_at_unix: node.expires_at_unix,
+            revoked: node.revoked,
+        })
+        .collect())
+}
+
+/// 改名（Admin 任意；普通 User 仅自己名下）。返回服务端规范化后的新名。
+pub async fn rename_node(
+    state_dir: &Path,
+    coord_addr: &str,
+    node_id: &str,
+    new_name: &str,
+) -> anyhow::Result<String> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .rename_node(RenameNodeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            node_id: node_id.to_owned(),
+            new_name: new_name.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("Node 改名被拒绝（{status}）"))?
+        .into_inner();
+    Ok(response.name)
+}
+
+/// 删除 Node（硬删，Admin 任意；普通 User 仅自己名下）。
+pub async fn delete_node(state_dir: &Path, coord_addr: &str, node_id: &str) -> anyhow::Result<()> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    client
+        .delete_node(DeleteNodeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            node_id: node_id.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("Node 删除被拒绝（{status}）"))?;
+    Ok(())
+}
+
+/// 吊销 Node（仅 Admin）：保留审计行，立即从所有 Network Map 消失。
+pub async fn revoke_node(state_dir: &Path, coord_addr: &str, node_id: &str) -> anyhow::Result<()> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    client
+        .revoke_node(RevokeNodeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            node_id: node_id.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("Node 吊销被拒绝（{status}）"))?;
+    Ok(())
 }
 
 /// 面向 Node 侧长连接服务的 TLS 通道：https 走 TLS（ca_pem 为 Some 时信任
