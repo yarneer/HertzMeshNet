@@ -15,7 +15,7 @@ use hz_proto::coord_client::CoordClient;
 use hz_proto::{HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest, StreamMapRequest};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tonic::Streaming;
-use tonic::transport::{Channel, ClientTlsConfig, Uri};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Uri};
 use tower_service::Service;
 
 use crate::keys::KeyStore;
@@ -112,13 +112,33 @@ pub async fn open_network_map_stream(
 }
 
 async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {
-    let uri: Uri = coord_addr
+    connect_tls_channel(coord_addr, None).await
+}
+
+/// 面向 Node 侧长连接服务的 TLS 通道：https 走 TLS（ca_pem 为 Some 时信任
+/// 该私有 CA），连接器把 socket 绑到物理出口网卡（FR-7 共存），并启用
+/// HTTP/2 keepalive 维持 NAT 后的长连接。coord 与 relay 共用。
+pub(crate) async fn connect_tls_channel(
+    addr: &str,
+    ca_pem: Option<&str>,
+) -> anyhow::Result<Channel> {
+    let uri: Uri = addr
         .parse()
-        .with_context(|| format!("无效的 Coordination Server 地址：{coord_addr}"))?;
+        .with_context(|| format!("无效的服务地址：{addr}"))?;
     let endpoint = tonic::transport::Endpoint::from_shared(uri.to_string())
-        .with_context(|| format!("无效的 Coordination Server 地址：{coord_addr}"))?;
+        .with_context(|| format!("无效的服务地址：{addr}"))?;
+    let endpoint = endpoint
+        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+        .keep_alive_while_idle(true)
+        .connect_timeout(std::time::Duration::from_secs(10));
     let endpoint = match uri.scheme_str() {
-        Some("https") => endpoint.tls_config(ClientTlsConfig::new())?,
+        Some("https") => {
+            let mut tls = ClientTlsConfig::new();
+            if let Some(pem) = ca_pem {
+                tls = tls.ca_certificate(Certificate::from_pem(pem.as_bytes()));
+            }
+            endpoint.tls_config(tls)?
+        }
         _ => endpoint,
     };
     // 自带连接器在 connect(2) 之前把 socket 绑到物理出口网卡（FR-7 共存）；
@@ -128,8 +148,8 @@ async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {
         endpoint.connect_with_connector(PhysicalEgressConnector),
     )
     .await
-    .map_err(|_| anyhow!("连接 {coord_addr} 超时"))?
-    .map_err(|error| anyhow!("连接 {coord_addr} 失败：{error}"))?;
+    .map_err(|_| anyhow!("连接 {addr} 超时"))?
+    .map_err(|error| anyhow!("连接 {addr} 失败：{error}"))?;
     Ok(channel)
 }
 

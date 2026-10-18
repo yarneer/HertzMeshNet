@@ -227,6 +227,12 @@ async fn start_dataplane(
     let endpoint = lan_endpoint(coord_addr, engine.local_addr().port()).await?;
     tracing::info!(%endpoint, "reporting lan endpoint");
 
+    if let Ok(relay_addr) = std::env::var("HZD_RELAY_ADDR") {
+        if !relay_addr.is_empty() {
+            connect_relay_transport(&engine, keys, &info.node_id, &relay_addr).await;
+        }
+    }
+
     spawn_tun_bridge(&engine, info);
     spawn_map_task(
         daemon.state_dir.clone(),
@@ -239,6 +245,34 @@ async fn start_dataplane(
 
     *daemon.engine.lock().expect("engine poisoned") = Some(engine);
     Ok(())
+}
+
+/// 接入 Relay 中继传输（#7）。连接失败只降级（直连路径不受影响），
+/// CA 路径（HZD_RELAY_CA_PATH）指向私有 CA 的 PEM，供自签部署的 Relay 使用。
+async fn connect_relay_transport(
+    engine: &Arc<SocketEngine>,
+    keys: &Arc<KeyStore>,
+    node_id: &str,
+    relay_addr: &str,
+) {
+    let ca_pem = match std::env::var("HZD_RELAY_CA_PATH") {
+        Ok(path) if !path.is_empty() => match std::fs::read_to_string(&path) {
+            Ok(pem) => Some(pem),
+            Err(error) => {
+                tracing::warn!(%path, %error, "read relay CA failed, using system roots");
+                None
+            }
+        },
+        _ => None,
+    };
+    match hz_core::relay_client::connect_relay(keys, node_id, relay_addr, ca_pem.as_deref()).await
+    {
+        Ok(client) => {
+            engine.set_relay(Arc::new(client));
+            tracing::info!(%relay_addr, "relay transport connected");
+        }
+        Err(error) => tracing::warn!(%error, %relay_addr, "relay transport unavailable"),
+    }
 }
 
 /// TUN 读到的包进引擎，引擎解密的包写回 TUN。TUN 不可用时只保留引擎收发。
@@ -427,7 +461,14 @@ fn peer_spec(node: &MapNode) -> Option<PeerSpec> {
         node_key_pub,
         endpoints,
         dst_addrs: vec![ipv4, ipv6],
+        // HZD_FORCE_RELAY=1：全部对端走 Relay（对称型 NAT 等无法直连拓扑的
+        // 确定性策略）。按 Endpoint 优先的路径选择归 #8。
+        use_relay: force_relay(),
     })
+}
+
+fn force_relay() -> bool {
+    std::env::var("HZD_FORCE_RELAY").ok().as_deref() == Some("1")
 }
 
 /// registration.json 的落盘形态：注册身份 + 记下 coord 地址供重启后自动重连；

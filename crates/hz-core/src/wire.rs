@@ -1,7 +1,8 @@
 //! 用户态 WireGuard 引擎（boringtun）。领域结构：PeerTable 以 NodeId 为主键，
-//! 每个 Peer 持有一个 noise::Tunn，加两张派生索引（目标地址→NodeId、
-//! WireGuard 接收索引→NodeId）。UDP socket 由 [`SocketEngine`] 持有并独占，
-//! 与后续打洞（#8）共用；`Engine` 本身不碰网络，可在任意平台做单元测试。
+//! 每个 Peer 持有一个 noise::Tunn 与传输开关（直连 UDP 或 Relay），加两张派生
+//! 索引（目标地址→NodeId、WireGuard 接收索引→NodeId）。UDP socket 由
+//! [`SocketEngine`] 持有并独占，与后续打洞（#8）共用；`Engine` 本身不碰网络，
+//! 可在任意平台做单元测试。
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -13,6 +14,8 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+use crate::relay_client::RelayClient;
 
 /// WireGuard 数据报与 IP 包的统一缓冲上限（UDP 数据报上限 64 KiB）。
 const MAX_DATAGRAM: usize = 65536;
@@ -32,6 +35,9 @@ pub struct PeerSpec {
     pub endpoints: Vec<SocketAddr>,
     /// 该 Node 的 Node Address（v4 与 ULA v6），本机发往这些地址的包都路由给它。
     pub dst_addrs: Vec<IpAddr>,
+    /// 传输开关：true 时发往该对端的 WireGuard 数据报走 Relay（按 node id 寻址），
+    /// false 时走直连 UDP。路径选择策略归 #8，当前由调用方（hzd）决定。
+    pub use_relay: bool,
 }
 
 /// 要发往网络的数据报。primary 失败时按 alternates 顺序重试。
@@ -43,10 +49,19 @@ pub struct NetworkSend {
     pub datagram: Vec<u8>,
 }
 
+/// 要经 Relay 发出的数据报（按 node id 寻址，载荷是 WireGuard 密文）。
+#[derive(Debug, Clone)]
+pub struct RelaySend {
+    pub node_id: String,
+    pub datagram: Vec<u8>,
+}
+
 /// 引擎一次处理产生的输出。
 #[derive(Debug, Default)]
 pub struct EngineOutput {
     pub to_network: Vec<NetworkSend>,
+    /// 经 Relay 发往对端的密文数据报。
+    pub to_relay: Vec<RelaySend>,
     /// 解密出的明文 IP 包，应写进 TUN。
     pub to_tunnel: Vec<Vec<u8>>,
 }
@@ -57,6 +72,7 @@ struct Peer {
     endpoints: Vec<SocketAddr>,
     tunn: Tunn,
     dst_addrs: Vec<IpAddr>,
+    use_relay: bool,
 }
 
 enum Step {
@@ -124,6 +140,7 @@ impl Engine {
             let fresh = std::mem::take(&mut peer.endpoints);
             peer.endpoints = merge_endpoints(fresh, spec.endpoints);
             peer.dst_addrs = spec.dst_addrs;
+            peer.use_relay = spec.use_relay;
         } else {
             let tunn = Tunn::new(
                 self.own_secret.clone(),
@@ -141,6 +158,7 @@ impl Engine {
                     endpoints: spec.endpoints,
                     tunn,
                     dst_addrs: spec.dst_addrs,
+                    use_relay: spec.use_relay,
                 },
             );
             if old.is_some() {
@@ -190,9 +208,7 @@ impl Engine {
             .encapsulate(packet, &mut scratch);
         if let Step::Network(datagram) = step_result(result) {
             self.register_own_index(&node_id, &datagram);
-            if let Some(send) = self.network_send(&node_id, datagram) {
-                out.to_network.push(send);
-            }
+            self.dispatch_network(&node_id, datagram, &mut out);
         }
         out
     }
@@ -277,6 +293,73 @@ impl Engine {
         out
     }
 
+    /// Relay 入方向的一个 WireGuard 数据报。Relay 按流的归属投递（流在认证时
+    /// 已绑定 node id），没有 UDP 那样的源端点：不传源地址（boringtun 不做
+    /// 端点漫游），回包按对端传输开关经 Relay 发回。
+    pub fn handle_relay_datagram(&mut self, datagram: &[u8]) -> EngineOutput {
+        let mut out = EngineOutput::default();
+        let Some(&msg_type) = datagram.first() else {
+            return out;
+        };
+        let mut scratch = vec![0u8; MAX_DATAGRAM];
+
+        if msg_type == MSG_HANDSHAKE_INIT {
+            let mut found = None;
+            for candidate in self.peers.keys().cloned().collect::<Vec<_>>() {
+                let result = self
+                    .peers
+                    .get_mut(&candidate)
+                    .expect("iterating live peers")
+                    .tunn
+                    .decapsulate(None, datagram, &mut scratch);
+                if let TunnResult::WriteToNetwork(bytes) = result {
+                    found = Some((candidate, bytes.to_vec()));
+                    break;
+                }
+            }
+            let Some((node_id, response)) = found else {
+                tracing::debug!("drop relayed handshake initiation from unknown peer");
+                return out;
+            };
+            self.register_own_index(&node_id, &response);
+            self.dispatch_network(&node_id, response, &mut out);
+            return out;
+        }
+
+        let index = datagram
+            .get(4..8)
+            .map(|raw| u32::from_le_bytes(raw.try_into().expect("4 bytes")));
+        let Some(node_id) = index.and_then(|index| self.by_index.get(&index).cloned()) else {
+            tracing::debug!(%msg_type, "drop relayed wireguard datagram for unknown index");
+            return out;
+        };
+        let result = self
+            .peers
+            .get_mut(&node_id)
+            .expect("by_index 与 peers 一致")
+            .tunn
+            .decapsulate(None, datagram, &mut scratch);
+        let mut pending = Some(step_result(result));
+        while let Some(step) = pending.take() {
+            match step {
+                Step::Network(datagram) => {
+                    self.register_own_index(&node_id, &datagram);
+                    self.dispatch_network(&node_id, datagram, &mut out);
+                }
+                Step::Tunnel(packet) => out.to_tunnel.push(packet),
+                Step::Stop => break,
+            }
+            let next = self
+                .peers
+                .get_mut(&node_id)
+                .expect("by_index 与 peers 一致")
+                .tunn
+                .decapsulate(None, &[], &mut scratch);
+            pending = Some(step_result(next));
+        }
+        out
+    }
+
     /// 定时器推进：重握手、重传与保活。hzd 以亚秒级间隔调用。
     pub fn tick(&mut self) -> EngineOutput {
         let mut out = EngineOutput::default();
@@ -290,9 +373,7 @@ impl Engine {
                 .update_timers(&mut scratch);
             if let Step::Network(datagram) = step_result(result) {
                 self.register_own_index(&node_id, &datagram);
-                if let Some(send) = self.network_send(&node_id, datagram) {
-                    out.to_network.push(send);
-                }
+                self.dispatch_network(&node_id, datagram, &mut out);
             }
         }
         out
@@ -346,6 +427,19 @@ impl Engine {
         })
     }
 
+    /// 按对端当前传输开关出向分发：Relay（按 node id）或直连 UDP。
+    fn dispatch_network(&self, node_id: &str, datagram: Vec<u8>, out: &mut EngineOutput) {
+        let uses_relay = self.peers.get(node_id).is_some_and(|peer| peer.use_relay);
+        if uses_relay {
+            out.to_relay.push(RelaySend {
+                node_id: node_id.to_owned(),
+                datagram,
+            });
+        } else if let Some(send) = self.network_send(node_id, datagram) {
+            out.to_network.push(send);
+        }
+    }
+
     /// 我们发出的握手包在 [4..8] 携带自己的本地索引，
     /// 对端后续数据将用它作为接收索引，登记后才能完成入方向分发。
     fn register_own_index(&mut self, node_id: &str, datagram: &[u8]) {
@@ -374,9 +468,12 @@ fn merge_endpoints(mut preferred: Vec<SocketAddr>, fresh: Vec<SocketAddr>) -> Ve
 
 /// 持有唯一 UDP socket 的引擎外壳：socket 归它所有（#8 打洞复用同一 socket），
 /// 入方向循环 + 定时器循环在这里跑，解密出的明文包经 channel 交给 TUN 写任务。
+/// 设置了 Relay 客户端（[`SocketEngine::set_relay`]）时，开关指向 Relay 的对端
+/// 走 TLS 中继收发，直连 UDP 路径不变。
 pub struct SocketEngine {
     engine: Arc<StdMutex<Engine>>,
     socket: Arc<UdpSocket>,
+    relay: Arc<StdMutex<Option<Arc<RelayClient>>>>,
 }
 
 impl SocketEngine {
@@ -395,7 +492,18 @@ impl SocketEngine {
         Ok(Self {
             engine: Arc::new(StdMutex::new(Engine::new(own_secret))),
             socket: Arc::new(socket),
+            relay: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    /// 接入 Relay 传输。须在 [`SocketEngine::run`] 之前调用一次；
+    /// 重复调用以后设置者为准。
+    pub fn set_relay(&self, client: Arc<RelayClient>) {
+        *self.relay.lock().expect("relay poisoned") = Some(client);
+    }
+
+    fn relay_client(&self) -> Option<Arc<RelayClient>> {
+        self.relay.lock().expect("relay poisoned").clone()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -424,20 +532,21 @@ impl SocketEngine {
 
     /// TUN 读到的明文 IP 包从这里进引擎。
     pub async fn send_ip_packet(&self, packet: &[u8]) {
-        let out = self
-            .engine
-            .lock()
-            .expect("engine poisoned")
-            .send_ip_packet(packet);
+        let out = {
+            let mut engine = self.engine.lock().expect("engine poisoned");
+            engine.send_ip_packet(packet)
+        };
         send_to_network(&self.socket, out.to_network).await;
+        send_to_relay(&self.relay, out.to_relay).await;
     }
 
-    /// 常驻循环：UDP 收包 + 定时器。返回即代表 socket 已不可用；
-    /// hzd 停机时直接 abort 本任务。
+    /// 常驻循环：UDP 收包 + 定时器 + （若接入）Relay 收包。
+    /// 返回即代表 socket 已不可用；hzd 停机时直接 abort 本任务。
     pub async fn run(&self, to_tunnel: mpsc::Sender<Vec<u8>>) -> anyhow::Result<()> {
         let ticker = tokio::spawn({
             let engine = self.engine.clone();
             let socket = self.socket.clone();
+            let relay_slot = self.relay.clone();
             let to_tunnel = to_tunnel.clone();
             async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -446,21 +555,42 @@ impl SocketEngine {
                     let out = engine.lock().expect("engine poisoned").tick();
                     forward_to_tunnel(&to_tunnel, out.to_tunnel);
                     send_to_network(&socket, out.to_network).await;
+                    send_to_relay(&relay_slot, out.to_relay).await;
                 }
             }
         });
+
+        if let Some(relay) = self.relay_client() {
+            if let Some(incoming) = relay.take_incoming() {
+                let engine = self.engine.clone();
+                let relay_slot = self.relay.clone();
+                let to_tunnel = to_tunnel.clone();
+                tokio::spawn(async move {
+                    let mut incoming = incoming;
+                    while let Some(datagram) = incoming.recv().await {
+                        let out = {
+                            let mut engine = engine.lock().expect("engine poisoned");
+                            engine.handle_relay_datagram(&datagram)
+                        };
+                        forward_to_tunnel(&to_tunnel, out.to_tunnel);
+                        send_to_relay(&relay_slot, out.to_relay).await;
+                    }
+                    tracing::warn!("relay inbound stream ended, relay receive path stopped");
+                });
+            }
+        }
 
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let result = loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((len, from)) => {
-                    let out = self
-                        .engine
-                        .lock()
-                        .expect("engine poisoned")
-                        .handle_udp(from, &buf[..len]);
+                    let out = {
+                        let mut engine = self.engine.lock().expect("engine poisoned");
+                        engine.handle_udp(from, &buf[..len])
+                    };
                     forward_to_tunnel(&to_tunnel, out.to_tunnel);
                     send_to_network(&self.socket, out.to_network).await;
+                    send_to_relay(&self.relay, out.to_relay).await;
                 }
                 Err(error) => break Err(anyhow::Error::from(error).context("udp recv failed")),
             }
@@ -500,6 +630,23 @@ async fn send_to_network(socket: &Arc<UdpSocket>, sends: Vec<NetworkSend>) {
         if !sent {
             tracing::warn!(node_id = %send.node_id, "all endpoints failed for datagram");
         }
+    }
+}
+
+/// 把 Relay 侧出向数据报交给中继客户端（未接入中继时丢弃并告警）。
+async fn send_to_relay(relay: &StdMutex<Option<Arc<RelayClient>>>, sends: Vec<RelaySend>) {
+    if sends.is_empty() {
+        return;
+    }
+    let Some(relay) = relay.lock().expect("relay poisoned").clone() else {
+        tracing::warn!(
+            count = sends.len(),
+            "relay datagrams produced without a relay client, dropping"
+        );
+        return;
+    };
+    for send in sends {
+        relay.send_datagram(&send.node_id, send.datagram).await;
     }
 }
 

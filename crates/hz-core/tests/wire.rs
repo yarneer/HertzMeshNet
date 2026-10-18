@@ -48,6 +48,14 @@ fn spec_for(peer: &TestNode) -> PeerSpec {
         node_key_pub: peer.public,
         endpoints: vec![peer.udp],
         dst_addrs: vec![IpAddr::V4(peer.v4), IpAddr::V6(peer.v6)],
+        use_relay: false,
+    }
+}
+
+fn relay_spec_for(peer: &TestNode) -> PeerSpec {
+    PeerSpec {
+        use_relay: true,
+        ..spec_for(peer)
     }
 }
 
@@ -186,6 +194,7 @@ fn unanswered_handshake_is_retransmitted_and_still_completes() {
                 alternates: vec![],
                 datagram: retransmit,
             }],
+            to_relay: vec![],
             to_tunnel: vec![],
         },
         &mut engine_b,
@@ -238,4 +247,83 @@ fn handshake_from_wrong_peer_key_never_decodes() {
         }
         assert!(!out.to_network.is_empty(), "A 应继续重试握手");
     }
+}
+
+/// 经内存中继通道交付：模拟 Relay 只按 node id 转发、观测不到明文的最小形态。
+/// 返回中继侧全程观测到的全部密文字节。
+fn deliver_over_relay(
+    out: &EngineOutput,
+    target: &mut Engine,
+    observed: &mut Vec<Vec<u8>>,
+) -> EngineOutput {
+    let mut combined = EngineOutput::default();
+    for send in &out.to_relay {
+        observed.push(send.datagram.clone());
+        let received = target.handle_relay_datagram(&send.datagram);
+        combined.to_tunnel.extend(received.to_tunnel);
+        combined.to_relay.extend(received.to_relay);
+    }
+    combined
+}
+
+fn relay_wired_pair() -> (TestNode, TestNode, Engine, Engine) {
+    let a = test_node("100.96.0.1", "fd12:3456:789a::6460:1", A_UDP);
+    let b = test_node("100.96.0.2", "fd12:3456:789a::6460:2", B_UDP);
+    let mut engine_a = Engine::new(a.secret.clone());
+    let mut engine_b = Engine::new(b.secret.clone());
+    engine_a.configure(relay_spec_for(&b));
+    engine_b.configure(relay_spec_for(&a));
+    (a, b, engine_a, engine_b)
+}
+
+#[test]
+fn relayed_exchange_reaches_peer_and_hides_plaintext_from_relay() {
+    init_logging();
+    let (a, b, mut engine_a, mut engine_b) = relay_wired_pair();
+    let payload = b"hzmesh-relay-secret-payload";
+    let packet = udp_v4_packet(a.v4, b.v4, payload);
+
+    let init = engine_a.send_ip_packet(&packet);
+    assert_eq!(init.to_relay.len(), 1, "Relay 对端的首包应产生一个中继数据报");
+    assert!(init.to_network.is_empty(), "开关指向 Relay 时不得走直连 UDP");
+
+    let mut observed: Vec<Vec<u8>> = Vec::new();
+    let response = deliver_over_relay(&init, &mut engine_b, &mut observed);
+    assert_eq!(response.to_relay.len(), 1, "B 必须恰好回应一个握手响应");
+    assert_eq!(response.to_relay[0].node_id, "node-a");
+
+    let flushed = deliver_over_relay(&response, &mut engine_a, &mut observed);
+    assert!(
+        !flushed.to_relay.is_empty(),
+        "握手完成后 A 必须补发排队的原始包"
+    );
+
+    let decrypted = deliver_over_relay(&flushed, &mut engine_b, &mut observed);
+    assert_eq!(decrypted.to_tunnel, vec![packet.clone()], "中继链路必须打通");
+    assert!(decrypted.to_relay.is_empty());
+
+    // Relay 全程只看到 WireGuard 密文：既不含明文字面量，也比明文载荷长。
+    assert!(!observed.is_empty());
+    for (round, bytes) in observed.iter().enumerate() {
+        assert!(
+            !bytes
+                .windows(payload.len())
+                .any(|window| window == payload),
+            "第 {round} 个中继数据报泄漏了明文载荷"
+        );
+        assert!(
+            bytes.len() > payload.len(),
+            "第 {round} 个中继数据报短于明文载荷，不可能是 WireGuard 密文"
+        );
+    }
+}
+
+#[test]
+fn relay_datagram_for_unknown_index_is_dropped_silently() {
+    let (_a, _b, mut engine_a, _engine_b) = relay_wired_pair();
+    let mut stranger_datagram = vec![MSG_DATA; 64];
+    stranger_datagram[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    let out = engine_a.handle_relay_datagram(&stranger_datagram);
+    assert!(out.to_tunnel.is_empty());
+    assert!(out.to_relay.is_empty());
 }

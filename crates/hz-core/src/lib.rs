@@ -6,6 +6,7 @@ pub mod keys;
 pub mod map;
 pub mod netif;
 pub mod paths;
+pub mod relay_client;
 pub mod status;
 pub mod tun;
 pub mod wire;
