@@ -327,7 +327,6 @@ mod tests {
          10                 192.168.3.1        UGSc                  en0\n\
          127                127.0.0.1          UCS                 lo0\n";
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn route_get_output_yields_the_interface_line() {
         assert_eq!(
@@ -343,7 +342,6 @@ mod tests {
         assert_eq!(parse_route_get_interface("no such line"), None);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn netstat_defaults_keep_virtual_first_and_physical_second() {
         assert_eq!(
