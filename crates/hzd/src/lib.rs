@@ -20,6 +20,7 @@ use hz_core::endpoint::{self, DiscoveredEndpoint};
 use hz_core::ipc::{self, Handler};
 use hz_core::keys::{KeyStore, NodeStaticSecret};
 use hz_core::map::{MapNode, NetworkMapCache};
+use hz_core::netwatch::{self, NetEvent};
 use hz_core::path::{PathEvent, PathManager, PeerEndpoints};
 use hz_core::policy::{InboundGate, InboundPolicyView};
 use hz_core::punch::{PunchCodec, PunchMessage};
@@ -89,6 +90,27 @@ pub struct MapPeer {
     pub endpoint: Option<String>,
 }
 
+/// 物理出口变化代数（FR-8 网络变化恢复）。恢复序列递增它；到 Coordination
+/// Server 与 Relay 的长连接任务在等待期间监视它，变化即主动断线重拨——
+/// 出口切换后旧 TCP 只能靠 keepalive 超时发现（秒到分钟级），等不起。
+/// watch 语义保证递增先于订阅也不会丢：接收方比对的是见过的值。
+#[derive(Clone)]
+struct EgressEpoch(tokio::sync::watch::Sender<u64>);
+
+impl EgressEpoch {
+    fn new() -> Self {
+        Self(tokio::sync::watch::Sender::new(0))
+    }
+
+    fn bump(&self) {
+        self.0.send_modify(|generation| *generation += 1);
+    }
+
+    fn receiver(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+}
+
 struct Daemon {
     state_dir: PathBuf,
     registration: StdMutex<Session>,
@@ -112,6 +134,8 @@ struct Daemon {
     /// 本 Node 已被 Admin 吊销（区别于过期：重新登录救不回来）。
     /// 到期/吊销共享 Expired 会话态，此标记决定 `hz status` 的文案。
     revoked: StdMutex<bool>,
+    /// 物理出口变化代数：长连接任务据此强制重拨（见类型注释）。
+    egress_epoch: EgressEpoch,
 }
 
 impl Daemon {
@@ -191,6 +215,7 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         punch: Arc::new(StdMutex::new(PunchCounters::default())),
         probes: Arc::new(ping::Probes::default()),
         revoked: StdMutex::new(false),
+        egress_epoch: EgressEpoch::new(),
     });
 
     // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
@@ -742,7 +767,13 @@ async fn start_dataplane(
 
     if let Ok(relay_addr) = std::env::var("HZD_RELAY_ADDR") {
         if !relay_addr.is_empty() {
-            spawn_relay_supervisor(&engine, keys, &info.node_id, &relay_addr);
+            spawn_relay_supervisor(
+                &engine,
+                keys,
+                &info.node_id,
+                &relay_addr,
+                daemon.egress_epoch.clone(),
+            );
         }
     }
 
@@ -771,6 +802,7 @@ async fn start_dataplane(
         engine.clone(),
         coord_addr.to_string(),
     );
+    spawn_net_recovery(daemon, engine.clone(), coord_addr);
     spawn_path_task(
         daemon.map_cache.clone(),
         daemon.map_signal.clone(),
@@ -801,14 +833,15 @@ fn spawn_egress_watch() {
         }
     });
 }
-
-/// Relay 传输监督（#7 单连 → #8 断线重连）：连上后挂到引擎；流断开按退避
-/// 重连。CA 路径（HZD_RELAY_CA_PATH）指向私有 CA 的 PEM。
+/// Relay 传输监督（#7 单连 → #8 断线重连 → #9 出口变化强拔）：连上后挂到
+/// 引擎；流断开按退避重连；物理出口变化（egress_epoch）不等 TCP 死亡立刻
+/// 重拨。CA 路径（HZD_RELAY_CA_PATH）指向私有 CA 的 PEM。
 fn spawn_relay_supervisor(
     engine: &Arc<SocketEngine>,
     keys: &Arc<KeyStore>,
     node_id: &str,
     relay_addr: &str,
+    egress_epoch: EgressEpoch,
 ) {
     let ca_pem = match std::env::var("HZD_RELAY_CA_PATH") {
         Ok(path) if !path.is_empty() => match std::fs::read_to_string(&path) {
@@ -827,6 +860,9 @@ fn spawn_relay_supervisor(
     tokio::spawn(async move {
         let mut backoff = BACKOFF_START;
         loop {
+            // 先记下当前代数再连接：连接期间发生的出口变化也不会漏。
+            let mut epoch = egress_epoch.receiver();
+            epoch.borrow_and_update();
             match hz_core::relay_client::connect_relay(
                 &keys,
                 &node_id,
@@ -840,8 +876,19 @@ fn spawn_relay_supervisor(
                     let client = Arc::new(client);
                     engine.set_relay(client.clone());
                     tracing::info!(%relay_addr, "relay transport connected");
-                    client.wait_closed().await;
-                    tracing::warn!(%relay_addr, "relay transport down, reconnecting");
+                    let mut forced = false;
+                    tokio::select! {
+                        _ = client.wait_closed() => {
+                            tracing::warn!(%relay_addr, "relay transport down, reconnecting");
+                        }
+                        _ = epoch.changed() => {
+                            forced = true;
+                            tracing::info!(%relay_addr, "egress changed, forcing relay redial");
+                        }
+                    }
+                    if forced {
+                        continue;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(%error, %relay_addr, "relay transport unavailable");
@@ -873,6 +920,7 @@ fn stun_server_addr() -> Option<SocketAddr> {
 
 /// Endpoint 收集与上报（FR-8）：周期性收集 Lan/STUN/V6，ReportEndpoints 落库，
 /// 结果同时存进共享槽供打洞信令取本机候选；打洞累计计数随上报携带（FR-12）。
+/// 收集动作本身抽成 [`collect_and_report`]，网络变化恢复序列即时复用。
 fn spawn_endpoint_collector(
     state_dir: PathBuf,
     own_slot: Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
@@ -888,28 +936,113 @@ fn spawn_endpoint_collector(
         let mut ticker = tokio::time::interval(ENDPOINT_COLLECT_EVERY);
         loop {
             ticker.tick().await;
-            let stun_mapped = match stun_server {
-                Some(server) => match engine.stun_query(server).await {
-                    Ok(mapped) => {
-                        tracing::info!(%mapped, "stun mapped endpoint discovered");
-                        Some(mapped)
-                    }
-                    Err(error) => {
-                        tracing::warn!(%server, %error, "stun query failed");
-                        None
-                    }
-                },
-                None => None,
-            };
-            let found = endpoint::collect(engine.local_addr().port(), stun_mapped);
-            tracing::info!(endpoints = ?found, "collected endpoints");
-            *own_slot.lock().expect("own endpoints poisoned") = found.clone();
-            let counters = *punch.lock().expect("punch counters poisoned");
-            if let Err(error) =
-                report_endpoints(&state_dir, &found, &coord_addr, Some(counters)).await
-            {
-                tracing::warn!(%error, "endpoint report to coord failed");
+            collect_and_report(
+                &state_dir,
+                &own_slot,
+                &punch,
+                &engine,
+                &coord_addr,
+                stun_server,
+            )
+            .await;
+        }
+    });
+}
+
+/// 收集一轮本机 Endpoint 并上报（周期收集与网络变化恢复共用）：
+/// STUN 查询走引擎共享 socket（重绑后自动落在新出口上），结果连同
+/// Lan/V6 候选写入共享槽并 ReportEndpoints 给 Coordination Server。
+async fn collect_and_report(
+    state_dir: &Path,
+    own_slot: &Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
+    punch: &Arc<StdMutex<PunchCounters>>,
+    engine: &Arc<SocketEngine>,
+    coord_addr: &str,
+    stun_server: Option<SocketAddr>,
+) {
+    let stun_mapped = match stun_server {
+        Some(server) => match engine.stun_query(server).await {
+            Ok(mapped) => {
+                tracing::info!(%mapped, "stun mapped endpoint discovered");
+                Some(mapped)
             }
+            Err(error) => {
+                tracing::warn!(%server, %error, "stun query failed");
+                None
+            }
+        },
+        None => None,
+    };
+    let found = endpoint::collect(engine.local_addr().port(), stun_mapped);
+    tracing::info!(endpoints = ?found, "collected endpoints");
+    *own_slot.lock().expect("own endpoints poisoned") = found.clone();
+    let counters = *punch.lock().expect("punch counters poisoned");
+    if let Err(error) = report_endpoints(state_dir, &found, coord_addr, Some(counters)).await {
+        tracing::warn!(%error, "endpoint report to coord failed");
+    }
+}
+
+/// 网络变化恢复序列（FR-8 本机网络变化后自动恢复）。netwatch 的去抖事件
+/// 到来时重算快照：确有变化（或休眠唤醒）才执行——重绑 UDP socket 到新
+/// 物理出口 → 作废直连记账 → 即时 STUN + ReportEndpoints（对端拿到新公网
+/// 映射）→ 递增出口代数（Map 订阅与 Relay 长连接立刻重拨）→ 唤醒路径任务
+/// 重启打洞。全部动作幂等，事件风暴下重复执行也收敛到同一终态。
+/// 非 Linux 上 netwatch 无事件（#16），本任务随即退出。
+fn spawn_net_recovery(daemon: &Arc<Daemon>, engine: Arc<SocketEngine>, coord_addr: &str) {
+    let state_dir = daemon.state_dir.clone();
+    let own_slot = daemon.own_endpoints.clone();
+    let punch = daemon.punch.clone();
+    let map_signal = daemon.map_signal.clone();
+    let egress_epoch = daemon.egress_epoch.clone();
+    let coord_addr = coord_addr.to_string();
+    tokio::spawn(async move {
+        let mut events = netwatch::spawn();
+        let stun_server = stun_server_addr();
+        let mut handled = netwatch::egress_snapshot();
+        while let Some(event) = events.recv().await {
+            let current = netwatch::egress_snapshot();
+            let wake = matches!(event, NetEvent::ClockJump);
+            if !wake && !netwatch::snapshot_changed(&handled, &current) {
+                tracing::debug!(?event, "net event without egress change, ignoring");
+                continue;
+            }
+            handled = current.clone();
+            tracing::info!(?event, egress = ?current.iface, "network change, recovering");
+            if let Some(egress) = current.iface.clone() {
+                match engine.rebind(&egress).await {
+                    Ok(outcome) => tracing::info!(?outcome, %egress, "udp socket rebound"),
+                    Err(error) => tracing::warn!(%egress, %error, "udp socket rebind failed"),
+                }
+            }
+            engine.reset_direct_rx();
+            // 换网瞬间路由可能尚未收敛：STUN 限次重试，给出口几秒钟。
+            for round in 0..3 {
+                collect_and_report(
+                    &state_dir,
+                    &own_slot,
+                    &punch,
+                    &engine,
+                    &coord_addr,
+                    stun_server,
+                )
+                .await;
+                let stun_reached = stun_server.is_none()
+                    || own_slot
+                        .lock()
+                        .expect("own endpoints poisoned")
+                        .iter()
+                        .any(|found| found.kind == hz_core::endpoint::EndpointKind::Stun);
+                if stun_reached || round == 2 {
+                    break;
+                }
+                tracing::debug!(
+                    round,
+                    "stun not reachable yet, retrying after egress change"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            egress_epoch.bump();
+            map_signal.notify_one();
         }
     });
 }
@@ -1371,16 +1504,19 @@ async fn note_revocation(
 
 /// Network Map 消费任务（FR-6）：启动即用本地缓存配置数据面（Coordination
 /// Server 不可达也照常），然后循环 订阅 → 消费差量/全量 → 断线退避重连。
-/// 每次重连都重新走挑战认证并重报 Endpoint（服务端在流打开时落库）。
+/// 每次重连都重新走挑战认证并重报 Endpoint（服务端在流打开时落库）；Endpoint
+/// 取共享槽里的最新收集结果（出口变化后重拨不会把启动时的旧地址写回去），
+/// 槽为空才退回启动时探测的 LAN Endpoint。
 /// Map 有实际变化时唤醒路径任务（打洞轮次紧跟对端 Endpoint 更新）。
 /// 到期反应（FR-3）：自己出现在 removed 差量、或订阅被服务端以「已过期」
 /// 拒绝时，转入 Expired 并拆掉对端，随后驻留轮询——不退避重连浪费连接，
 /// 重新登录完成后状态翻回 Registered，本任务自动恢复订阅。
+/// 物理出口变化（egress_epoch）不等 TCP 死亡立刻强制重拨（FR-8 恢复）。
 fn spawn_map_task(
     daemon: Arc<Daemon>,
     engine: Arc<SocketEngine>,
     own_node_id: String,
-    endpoint: String,
+    boot_endpoint: String,
     coord_addr: String,
     policy_gate: Arc<InboundGate>,
 ) {
@@ -1388,6 +1524,8 @@ fn spawn_map_task(
     let cache = daemon.map_cache.clone();
     let map_signal = daemon.map_signal.clone();
     let use_relay = daemon.use_relay.clone();
+    let own_slot = daemon.own_endpoints.clone();
+    let egress_epoch = daemon.egress_epoch.clone();
     tokio::spawn(async move {
         let decisions = use_relay.lock().expect("use_relay poisoned").clone();
         apply_cache_to_engine(&cache, &engine, &own_node_id, &decisions);
@@ -1397,19 +1535,31 @@ fn spawn_map_task(
                 tokio::time::sleep(EXPIRED_POLL).await;
                 continue;
             }
-            match open_network_map_stream(&state_dir, vec![endpoint.clone()], &coord_addr).await {
+            // 先记代数再连接：连接期间发生的出口变化不会漏。
+            let mut epoch = egress_epoch.receiver();
+            epoch.borrow_and_update();
+            let mut forced = false;
+            let endpoints = endpoint_strings(&own_slot, &boot_endpoint);
+            match open_network_map_stream(&state_dir, endpoints, &coord_addr).await {
                 Ok(mut stream) => {
                     backoff = BACKOFF_START;
                     tracing::info!(%coord_addr, "network map stream opened");
                     loop {
-                        let message = match stream.message().await {
-                            Ok(Some(message)) => message,
-                            Ok(None) => {
-                                tracing::warn!("network map stream closed by server");
-                                break;
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "network map stream error");
+                        let message = tokio::select! {
+                            message = stream.message() => match message {
+                                Ok(Some(message)) => message,
+                                Ok(None) => {
+                                    tracing::warn!("network map stream closed by server");
+                                    break;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "network map stream error");
+                                    break;
+                                }
+                            },
+                            _ = epoch.changed() => {
+                                forced = true;
+                                tracing::info!("egress changed, forcing map stream redial");
                                 break;
                             }
                         };
@@ -1450,7 +1600,12 @@ fn spawn_map_task(
                             }
                             if removed_own {
                                 daemon.mark_expired(&engine);
-                                note_revocation(&daemon, &state_dir, &endpoint, &coord_addr).await;
+                                let probe_endpoint = endpoint_strings(&own_slot, &boot_endpoint)
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or_default();
+                                note_revocation(&daemon, &state_dir, &probe_endpoint, &coord_addr)
+                                    .await;
                                 break;
                             }
                         }
@@ -1471,12 +1626,29 @@ fn spawn_map_task(
                     }
                 }
             }
-            if !daemon.is_expired() {
+            if !daemon.is_expired() && !forced {
                 tokio::time::sleep(jittered(backoff)).await;
                 backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
             }
         }
     });
+}
+
+/// Map 订阅随流携带的 Endpoint 字符串：共享槽的最新收集结果；空槽（收集
+/// 尚未跑过）退回启动时探测的 LAN Endpoint。服务端在流打开时整体覆盖
+/// 落库，必须给最新值，否则出口变化后的重拨会把旧地址写回去。
+fn endpoint_strings(
+    own_slot: &Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
+    boot_endpoint: &str,
+) -> Vec<String> {
+    let collected = own_slot.lock().expect("own endpoints poisoned").clone();
+    if collected.is_empty() {
+        return vec![boot_endpoint.to_string()];
+    }
+    collected
+        .into_iter()
+        .map(|found| found.addr.to_string())
+        .collect()
 }
 
 /// 用缓存当前快照对账数据面（含自己之外的全部对端）。use_relay 是路径管理

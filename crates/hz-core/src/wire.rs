@@ -13,7 +13,7 @@ use anyhow::{Context, bail};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::relay_client::RelayClient;
 use crate::stun::StunRouter;
@@ -28,6 +28,9 @@ const KEEPALIVE_SECS: u16 = 8;
 /// WireGuard 消息类型字节。
 const MSG_HANDSHAKE_INIT: u8 = 1;
 const MSG_HANDSHAKE_RESPONSE: u8 = 2;
+
+/// Relay 入站泵单次等待上限：半开旧通道不会自己出错，靠周期回看槽位换新。
+const RELAY_PUMP_POLL: Duration = Duration::from_millis(200);
 
 /// 入向数据报的接收索引：定位能解密它的本地对端。握手响应的 [4..8] 是
 /// 响应方的发送索引，回显给我们的接收索引在 [8..12]；其余消息类型
@@ -504,6 +507,15 @@ impl Engine {
         }
     }
 
+    /// 作废全部对端的直连接收记账（网络变化恢复用）：下一次路径推进会把
+    /// 在用 Direct Path 判为失效、退回 Relay 并重启打洞。只清新鲜度，
+    /// 对端密钥与候选 Endpoint（对端没动时仍然有效）一概保留。
+    pub fn reset_direct_rx(&mut self) {
+        for peer in self.peers.values_mut() {
+            peer.direct_rx = None;
+        }
+    }
+
     /// 追加候选 Endpoint（打洞信令带来的对端实时地址），去重、不扰动偏好序。
     pub fn add_peer_endpoints(&mut self, node_id: &str, candidates: Vec<SocketAddr>) {
         if let Some(peer) = self.peers.get_mut(node_id) {
@@ -590,12 +602,31 @@ fn merge_endpoints(mut preferred: Vec<SocketAddr>, fresh: Vec<SocketAddr>) -> Ve
 /// 设置了 Relay 客户端（[`SocketEngine::set_relay`]）时，开关指向 Relay 的对端
 /// 走 TLS 中继收发，直连 UDP 路径不变。Relay 客户端可随时替换（断线重连），
 /// 新的入站流会被自动接管。
+///
+/// socket 存放在 watch 槽位里：网络变化重绑（[`SocketEngine::rebind`]）需要
+/// 重建 socket 时原子换入新值，常驻循环（收包、定时器）在每次收发前取当前
+/// socket，换入后自动跟上，持有旧 socket 的等待随即作废。
 pub struct SocketEngine {
     engine: Arc<StdMutex<Engine>>,
-    socket: Arc<UdpSocket>,
+    socket_tx: watch::Sender<Arc<UdpSocket>>,
+    /// 当前 SO_BINDTODEVICE 目标（内核不提供回读，自行记账用于幂等重绑）。
+    /// macOS 侧只写不读（rebind 随 #16 接入），先豁免死代码告警。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    device: StdMutex<Option<String>>,
     relay: Arc<StdMutex<Option<Arc<RelayClient>>>>,
     stun_router: Arc<StunRouter>,
     punch_in: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
+}
+
+/// 一次重绑的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebindOutcome {
+    /// 绑定目标未变（幂等重入），socket 原样保留。
+    Kept,
+    /// 现有 socket 重新应用了 SO_BINDTODEVICE，端口不变。
+    Rebound,
+    /// 现有 socket 无法改绑，已重建并原子换入（端口可能变化）。
+    Recreated { port: u16 },
 }
 
 impl SocketEngine {
@@ -620,20 +651,87 @@ impl SocketEngine {
         let socket = bind_dual_stack(port)
             .await
             .with_context(|| format!("bind udp :{port} failed"))?;
-        if bind_to_egress {
-            crate::netif::bind_to_physical_egress(&socket);
-        }
+        let device = if bind_to_egress {
+            crate::netif::bind_to_physical_egress(&socket)
+        } else {
+            None
+        };
         let local_addr = socket
             .local_addr()
             .with_context(|| "query udp local addr failed")?;
-        tracing::info!(%local_addr, "wireguard udp socket bound");
+        tracing::info!(%local_addr, ?device, "wireguard udp socket bound");
         Ok(Self {
             engine: Arc::new(StdMutex::new(Engine::new(own_secret))),
-            socket: Arc::new(socket),
+            socket_tx: watch::Sender::new(Arc::new(socket)),
+            device: StdMutex::new(device),
             relay: Arc::new(StdMutex::new(None)),
             stun_router: Arc::new(StunRouter::default()),
             punch_in: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    /// 当前 socket（重建换入后的最新值）。
+    fn socket(&self) -> Arc<UdpSocket> {
+        self.socket_tx.borrow().clone()
+    }
+
+    /// 网络变化后的重绑（FR-7 物理出口变化随之重绑）：目标是把唯一的 UDP
+    /// socket 挪到新的物理出口网卡上，对端密钥与候选一概不动。
+    /// 绑定目标未变时是幂等空操作；变了就先对现有 socket 重新应用
+    /// SO_BINDTODEVICE（socket 绑的是通配地址，网卡换了名子绑定仍合法，
+    /// 端口得以保留）。SO_BINDTODEVICE 会在目标网卡瞬时消失（换 Wi-Fi、
+    /// 驱动重绑、网卡重命名的窗口期）时以 ENODEV 拒绝——旧 socket 的设备
+    /// 绑定已悬空、无法继续发送，这是必须重建 socket 的情形：按原端口重绑
+    /// 一个新 socket（UDP 无 TIME_WAIT，旧 socket 释放后同端口可用；失败则
+    /// 让内核分配新端口）并原子换入槽位。
+    /// 重建后旧 socket 上的等待中的 STUN 事务靠自身 3 秒超时自然清理，
+    /// 新查询自动走新 socket，无需显式通知 StunRouter。
+    pub async fn rebind(&self, egress: &str) -> anyhow::Result<RebindOutcome> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = egress;
+            anyhow::bail!(
+                "socket 重绑目前仅 Linux 实现（SO_BINDTODEVICE）；macOS 的 IP_BOUND_IF 随 #16 接入"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if *self.device.lock().expect("device poisoned") == Some(egress.to_string()) {
+                return Ok(RebindOutcome::Kept);
+            }
+            let socket = self.socket();
+            match socket2::SockRef::from(socket.as_ref()).bind_device(Some(egress.as_bytes())) {
+                Ok(()) => {
+                    *self.device.lock().expect("device poisoned") = Some(egress.to_string());
+                    tracing::info!(%egress, "udp socket rebound to physical egress");
+                    Ok(RebindOutcome::Rebound)
+                }
+                Err(error) => {
+                    tracing::warn!(%egress, %error, "rebind device on live socket failed, recreating");
+                    let port = socket.local_addr()?.port();
+                    let fresh = match bind_dual_stack(port).await {
+                        Ok(fresh) => fresh,
+                        Err(same_port_error) => {
+                            tracing::warn!(%same_port_error, "recreate on same port failed, picking a new one");
+                            bind_dual_stack(0).await.with_context(|| {
+                                format!("recreate udp socket for egress {egress} failed")
+                            })?
+                        }
+                    };
+                    socket2::SockRef::from(&fresh)
+                        .bind_device(Some(egress.as_bytes()))
+                        .with_context(|| format!("bind recreated socket to {egress} failed"))?;
+                    let fresh_port = fresh
+                        .local_addr()
+                        .with_context(|| "query recreated udp local addr failed")?
+                        .port();
+                    self.socket_tx.send_modify(|slot| *slot = Arc::new(fresh));
+                    *self.device.lock().expect("device poisoned") = Some(egress.to_string());
+                    tracing::info!(%egress, port = fresh_port, "udp socket recreated for new egress");
+                    Ok(RebindOutcome::Recreated { port: fresh_port })
+                }
+            }
+        }
     }
 
     /// 接入 Relay 传输。断线重连由装配层的监督任务再次调用本方法完成；
@@ -656,7 +754,7 @@ impl SocketEngine {
     /// 从共享 socket 发起 STUN 查询（FR-8）：响应经收包循环按事务 id 路由
     /// 回调用方，不与引擎抢收。返回的即本 socket 的公网映射 Endpoint。
     pub async fn stun_query(&self, server: SocketAddr) -> anyhow::Result<SocketAddr> {
-        self.stun_router.query(&self.socket, server).await
+        self.stun_router.query(&self.socket(), server).await
     }
 
     /// 朝对端全部候选 Endpoint 发一个握手发起包（打洞）。v6 候选在最前，
@@ -674,15 +772,16 @@ impl SocketEngine {
         if candidates.is_empty() {
             tracing::debug!(node_id, "punch without any candidate endpoint");
         }
+        let socket = self.socket();
         for candidate in candidates {
-            if let Err(error) = self.socket.send_to(&datagram, candidate).await {
+            if let Err(error) = socket.send_to(&datagram, candidate).await {
                 tracing::debug!(node_id, endpoint = %candidate, %error, "punch send failed");
             }
         }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.socket
+        self.socket()
             .local_addr()
             .expect("udp socket always has a local addr")
     }
@@ -759,22 +858,34 @@ impl SocketEngine {
         self.engine.lock().expect("engine poisoned").peer_count()
     }
 
+    /// 作废全部对端的直连接收记账（网络变化恢复用）；等价语义见
+    /// [`Engine::reset_direct_rx`]。
+    pub fn reset_direct_rx(&self) {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .reset_direct_rx();
+    }
+
     /// TUN 读到的明文 IP 包从这里进引擎。
     pub async fn send_ip_packet(&self, packet: &[u8]) {
         let out = {
             let mut engine = self.engine.lock().expect("engine poisoned");
             engine.send_ip_packet(packet)
         };
-        send_to_network(&self.socket, out.to_network).await;
+        let socket = self.socket();
+        send_to_network(&socket, out.to_network).await;
         send_to_relay(&self.relay, out.to_relay).await;
     }
 
     /// 常驻循环：UDP 收包 + 定时器 + （若接入）Relay 收包。
+    /// 收包循环每次迭代取槽位里的当前 socket，并在槽位变化（重绑重建）时
+    /// 立即切换，旧 socket 上的等待随本迭代取消。
     /// 返回即代表 socket 已不可用；hzd 停机时直接 abort 本任务。
     pub async fn run(&self, to_tunnel: mpsc::Sender<Vec<u8>>) -> anyhow::Result<()> {
         let ticker = tokio::spawn({
             let engine = self.engine.clone();
-            let socket = self.socket.clone();
+            let socket_tx = self.socket_tx.clone();
             let relay_slot = self.relay.clone();
             let to_tunnel = to_tunnel.clone();
             async move {
@@ -783,13 +894,18 @@ impl SocketEngine {
                     interval.tick().await;
                     let out = engine.lock().expect("engine poisoned").tick();
                     forward_to_tunnel(&to_tunnel, out.to_tunnel);
+                    let socket = socket_tx.borrow().clone();
                     send_to_network(&socket, out.to_network).await;
                     send_to_relay(&relay_slot, out.to_relay).await;
                 }
             }
         });
 
-        // Relay 入站泵：监听 relay 槽位，断线重连换上新客户端后自动接管新流。
+        // Relay 入站泵：监听 relay 槽位，断线重连/出口强拔换上新客户端后接管
+        // 新流。消费节奏带 200ms 上限：泵可能停在旧客户端的入站通道上等帧，
+        // 而旧通道对应的 TCP 已是半开（出口切换后对端不可达），要等 h2
+        // keepalive 超时（秒级）才关闭——不等它，周期性比对槽位里的客户端
+        // 是否已被替换，替换即刻切换，新通道上排队的帧才不会被扣住。
         // WireGuard 密文进引擎；带打洞前缀的帧原样交给装配层的信令队列。
         tokio::spawn({
             let engine = self.engine.clone();
@@ -801,7 +917,23 @@ impl SocketEngine {
                     let current = relay_slot.lock().expect("relay poisoned").clone();
                     if let Some(relay) = current {
                         if let Some(mut incoming) = relay.take_incoming() {
-                            while let Some(datagram) = incoming.recv().await {
+                            loop {
+                                let next =
+                                    tokio::time::timeout(RELAY_PUMP_POLL, incoming.recv()).await;
+                                let datagram = match next {
+                                    Ok(Some(datagram)) => datagram,
+                                    Ok(None) => break,
+                                    Err(_elapsed) => {
+                                        let installed =
+                                            relay_slot.lock().expect("relay poisoned").clone();
+                                        match installed {
+                                            Some(latest) if Arc::ptr_eq(&latest, &relay) => {
+                                                continue;
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                };
                                 if route_punch_signal(&punch_in, &datagram) {
                                     continue;
                                 }
@@ -819,24 +951,39 @@ impl SocketEngine {
             }
         });
 
+        let mut socket_rx = self.socket_tx.subscribe();
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let result = loop {
-            match self.socket.recv_from(&mut buf).await {
-                Ok((len, from)) => {
-                    let datagram = &buf[..len];
-                    // STUN 响应按事务 id 路由回等待中的查询，不进 WireGuard。
-                    if self.stun_router.dispatch(datagram) {
-                        continue;
+            let socket = socket_rx.borrow_and_update().clone();
+            tokio::select! {
+                changed = socket_rx.changed() => {
+                    if changed.is_err() {
+                        break Err(anyhow::anyhow!("socket slot closed"));
                     }
-                    let out = {
-                        let mut engine = self.engine.lock().expect("engine poisoned");
-                        engine.handle_udp(from, datagram)
-                    };
-                    forward_to_tunnel(&to_tunnel, out.to_tunnel);
-                    send_to_network(&self.socket, out.to_network).await;
-                    send_to_relay(&self.relay, out.to_relay).await;
+                    continue;
                 }
-                Err(error) => break Err(anyhow::Error::from(error).context("udp recv failed")),
+                received = socket.recv_from(&mut buf) => {
+                    match received {
+                        Ok((len, from)) => {
+                            let datagram = &buf[..len];
+                            // STUN 响应按事务 id 路由回等待中的查询，不进 WireGuard。
+                            if self.stun_router.dispatch(datagram) {
+                                continue;
+                            }
+                            let out = {
+                                let mut engine = self.engine.lock().expect("engine poisoned");
+                                engine.handle_udp(from, datagram)
+                            };
+                            forward_to_tunnel(&to_tunnel, out.to_tunnel);
+                            let socket = self.socket();
+                            send_to_network(&socket, out.to_network).await;
+                            send_to_relay(&self.relay, out.to_relay).await;
+                        }
+                        Err(error) => {
+                            break Err(anyhow::Error::from(error).context("udp recv failed"))
+                        }
+                    }
+                }
             }
         };
         ticker.abort();
