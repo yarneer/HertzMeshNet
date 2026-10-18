@@ -1,0 +1,13 @@
+[Unit]
+Description=Kanidm Identity Provider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kanidmd server -c /etc/kanidm/server.toml
+Restart=on-failure
+RestartSec=2
+StateDirectory=kanidm
+
+[Install]
+WantedBy=multi-user.target

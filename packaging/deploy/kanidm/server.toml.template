@@ -1,0 +1,17 @@
+# Kanidm 服务端配置（安装位置 /etc/kanidm/server.toml，由 server-bootstrap.sh
+# 生成）。TLS 由 Kanidm 自行终止（nginx 只做 auth.<域名> 的 SNI 透传），
+# 证书路径与 relay/coord 一样来自 /etc/hznet/tls/（certs.sh 统一安装）。
+bindaddress = "127.0.0.1:8445"
+ldapbindaddress = "127.0.0.1:369"
+tls_chain = "/etc/hznet/tls/auth/fullchain.pem"
+tls_key = "/etc/hznet/tls/auth/privkey.pem"
+domain = "auth.@DOMAIN@"
+origin = "https://auth.@DOMAIN@"
+db_path = "/var/lib/kanidm/kanidm.db"
+role = "WriteReplica"
+
+# Kanidm 自身的每日在线备份（SQLite 快照），恢复见 runbook
+[online_backup]
+path = "/var/backups/kanidm"
+schedule = "00 22 * * *"
+versions = 7

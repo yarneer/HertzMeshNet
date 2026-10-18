@@ -1,0 +1,11 @@
+# HzNet 单机部署的 Prometheus 抓取片段（runbook §7）。
+# coord 默认 127.0.0.1:9100，relay 默认 127.0.0.1:9101；Prometheus 跑在
+# 同一台云主机时直接并入 prometheus.yml 即可，异地抓取请走 SSH 隧道或
+# 反代加认证，不要把 metrics 端口开进安全组。
+scrape_configs:
+  - job_name: hz-coord
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+  - job_name: hz-relay
+    static_configs:
+      - targets: ["127.0.0.1:9101"]
