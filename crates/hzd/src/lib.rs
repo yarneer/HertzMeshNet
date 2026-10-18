@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+pub mod dns;
+
 const REGISTRATION_FILE: &str = "registration.json";
 
 /// 断线重连退避：1s 起步、翻倍、30s 封顶（叠加亚秒抖动）。
@@ -149,6 +151,7 @@ async fn handle_request(
             let mut value = serde_json::to_value(status).map_err(|e| e.to_string())?;
             value["peers"] =
                 serde_json::to_value(peers_view(&daemon)).map_err(|e| e.to_string())?;
+            value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
             Ok(value)
         }
         "up" => {
@@ -344,6 +347,9 @@ async fn start_dataplane(
         endpoint.to_string(),
         coord_addr.to_string(),
     );
+    if let Err(error) = dns::spawn(daemon.map_cache.clone()).await {
+        tracing::warn!(%error, "dns responder unavailable");
+    }
 
     *daemon.engine.lock().expect("engine poisoned") = Some(engine);
     Ok(())
