@@ -167,7 +167,10 @@ mod tests {
     fn default_range_never_yields_reserved_network_or_broadcast() {
         let cfg = AddressConfig::default();
         for ip in alloc_seq(&cfg, 300) {
-            assert_ne!(ip, RESERVED_DNS_V4, "100.96.0.53 保留给本地 DNS 应答，不得分配");
+            assert_ne!(
+                ip, RESERVED_DNS_V4,
+                "100.96.0.53 保留给本地 DNS 应答，不得分配"
+            );
             assert_ne!(ip, Ipv4Addr::new(100, 96, 0, 0), "网络地址不得分配");
             assert_ne!(ip, Ipv4Addr::new(100, 96, 255, 255), "广播地址不得分配");
             assert!(cfg.cidr.contains(ip));
