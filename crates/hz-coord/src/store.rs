@@ -329,6 +329,75 @@ impl Store {
             .await?;
         Ok(row.map(|row| row.get::<String, _>("value")))
     }
+
+    /// 交互式登录的用户落库：名字唯一，重复登录只刷新 Admin 身份（FR-11）。
+    /// 返回 user id。
+    pub async fn upsert_user(&self, name: &str, is_admin: bool) -> anyhow::Result<String> {
+        sqlx::query(
+            "INSERT INTO users (id, name, is_admin) VALUES (?1, ?2, ?3)
+             ON CONFLICT (name) DO UPDATE SET is_admin = excluded.is_admin",
+        )
+        .bind(authkey::random_id())
+        .bind(name)
+        .bind(is_admin as i64)
+        .execute(&self.pool)
+        .await?;
+        let row = sqlx::query("SELECT id FROM users WHERE name = ?1")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await?;
+        tracing::info!(user = name, is_admin, "user upserted via interactive login");
+        Ok(row.get("id"))
+    }
+
+    /// 交互式登录绑定 Node：新 Machine Key 走注册路径（地址与名字同事务分配）；
+    /// 已存在的 Node 保持身份、地址、名字不变，刷新 Node Key、归属与有效期（FR-3）。
+    pub async fn bind_node_to_user(
+        &self,
+        machine_key_pub: &[u8],
+        node_key_pub: &[u8],
+        hostname: &str,
+        user_id: &str,
+        expires_at_unix: i64,
+    ) -> anyhow::Result<NodeRecord> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(mut existing) = node_by_machine_key(&mut tx, machine_key_pub).await? {
+            sqlx::query(
+                "UPDATE nodes SET node_key_pub = ?1, user_id = ?2, expires_at_unix = ?3 WHERE id = ?4",
+            )
+            .bind(node_key_pub)
+            .bind(user_id)
+            .bind(expires_at_unix)
+            .bind(&existing.id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            existing.node_key_pub = node_key_pub.to_vec();
+            existing.expires_at_unix = Some(expires_at_unix);
+            existing.owner_user = Some(
+                sqlx::query("SELECT name FROM users WHERE id = ?1")
+                    .bind(user_id)
+                    .fetch_one(&self.pool)
+                    .await?
+                    .get::<String, _>("name"),
+            );
+            tracing::info!(node_id = %existing.id, "node re-bound by interactive login");
+            return Ok(existing);
+        }
+        drop(tx);
+
+        let record = self
+            .register_node(
+                machine_key_pub,
+                node_key_pub,
+                hostname,
+                &[],
+                Some(user_id),
+                Some(expires_at_unix),
+            )
+            .await?;
+        Ok(record)
+    }
 }
 
 fn store_broken(error: sqlx::Error, fallback: AuthKeyError) -> AuthKeyError {

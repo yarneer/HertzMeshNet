@@ -1,6 +1,5 @@
-//! gRPC 服务：挑战签发与校验、Auth Key 注册、协议版本闸门、Network Map 下发流。
-//! BeginInteractiveLogin 只定义接口（#10 实现）；下发流的登记在 [`crate::map_stream`]。
-
+//! gRPC 服务：挑战签发与校验、Auth Key 注册、交互式登录、协议版本闸门、
+//! Network Map 下发流。下发流的登记在 [`crate::map_stream`]。
 use std::net::{Shutdown, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -10,23 +9,28 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION;
 use hz_proto::coord_server::{Coord, CoordServer};
 use hz_proto::{
-    BeginLoginRequest, BeginLoginResponse, HelloRequest, HelloResponse, NetworkMapMessage,
-    RegisterAuthKeyRequest, RegisterResponse, RelayCheckRequest, RelayCheckResponse,
-    StreamMapRequest,
+    BeginLoginRequest, BeginLoginResponse, HelloRequest, HelloResponse, LoginStatusRequest,
+    LoginStatusResponse, NetworkMapMessage, RegisterAuthKeyRequest, RegisterResponse,
+    RelayCheckRequest, RelayCheckResponse, StreamMapRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 
 use crate::authkey;
-use crate::challenge::{CHALLENGE_TTL, ChallengeCache};
+use crate::challenge::{CHALLENGE_TTL, Challenge, ChallengeCache};
+use crate::http::{HttpHandle, HttpState, serve_http};
+use crate::login::{LOGIN_TTL, LoginRegistry, PollResult};
 use crate::map_stream::{MapHub, MapPushConfig, node_info_from, run_fan_out};
+use crate::oidc::{OidcClient, OidcConfig, new_login_token, new_pkce_verifier};
 use crate::store::Store;
-
 /// 下发流空差量保活间隔（FR-6 长连接）。
 const MAP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// 全量重建间隔：接住到期跨越等没有 notify 信号的写入。
 const MAP_SWEEP: Duration = Duration::from_secs(60);
+
+/// 交互式登录授予的 Node 有效期（FR-3：默认 90 天）。
+pub const LOGIN_NODE_TTL_SECS: i64 = 90 * 86_400;
 
 pub struct ServeConfig {
     /// 同一个 Store 实例（克隆共享变更信号）：serve 侧与调用侧的写入
@@ -36,6 +40,13 @@ pub struct ServeConfig {
     pub tls: Option<ServerTlsConfig>,
     pub map_keepalive: Duration,
     pub map_sweep: Duration,
+    /// 登录回调所在的 HTTP 面监听地址；配置了 OIDC 才有意义。
+    pub http_listen: Option<SocketAddr>,
+    pub oidc: Option<OidcConfig>,
+    /// 一次性登录链接的有效期（默认 5 分钟）。
+    pub login_ttl: Duration,
+    /// 交互式登录授予的 Node 有效期（默认 90 天）。
+    pub login_node_ttl_secs: i64,
 }
 
 impl ServeConfig {
@@ -46,6 +57,10 @@ impl ServeConfig {
             tls: None,
             map_keepalive: MAP_KEEPALIVE,
             map_sweep: MAP_SWEEP,
+            http_listen: None,
+            oidc: None,
+            login_ttl: LOGIN_TTL,
+            login_node_ttl_secs: LOGIN_NODE_TTL_SECS,
         }
     }
 }
@@ -76,7 +91,9 @@ impl LiveConnections {
 pub struct ServeHandle {
     pub local_addr: SocketAddr,
     connections: Arc<LiveConnections>,
+    pub http_addr: Option<SocketAddr>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    http: Option<HttpHandle>,
     join: tokio::task::JoinHandle<()>,
     fan_out: tokio::task::JoinHandle<()>,
 }
@@ -86,20 +103,47 @@ impl ServeHandle {
         self.connections.close_all();
         let _ = self.shutdown.send(true);
         self.fan_out.abort();
+        if let Some(http) = &self.http {
+            http.shutdown();
+        }
     }
 
     pub async fn terminated(self) {
         let _ = self.join.await;
+        if let Some(http) = self.http {
+            let _ = http.terminated().await;
+        }
     }
 }
 
 pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     let store = config.store;
     let hub = Arc::new(MapHub::new());
+
+    let (logins, http_handle) = match (config.oidc, config.http_listen) {
+        (Some(oidc_config), Some(http_listen)) => {
+            let oidc = OidcClient::discover(oidc_config).await?;
+            let logins = Arc::new(LoginRegistry::new());
+            let http_state = Arc::new(HttpState {
+                oidc,
+                logins: logins.clone(),
+                store: store.clone(),
+                login_node_ttl_secs: config.login_node_ttl_secs,
+            });
+            let http = serve_http(http_listen, http_state).await?;
+            (logins, Some(http))
+        }
+        (Some(_), None) => anyhow::bail!("配置了 OIDC 但没有提供 --http-listen，回调无处落地"),
+        _ => (Arc::new(LoginRegistry::new()), None),
+    };
+    let http_addr = http_handle.as_ref().map(|http| http.local_addr);
     let service = CoordServiceImpl {
         store: store.clone(),
         challenges: ChallengeCache::new(),
         map_hub: hub.clone(),
+        logins: logins.clone(),
+        login_ttl: config.login_ttl,
+        http_addr,
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -141,6 +185,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         local_addr,
         connections,
         shutdown: shutdown_tx,
+        http: http_handle,
+        http_addr,
         join,
         fan_out,
     })
@@ -185,6 +231,9 @@ struct CoordServiceImpl {
     store: Store,
     challenges: ChallengeCache,
     map_hub: Arc<MapHub>,
+    logins: Arc<LoginRegistry>,
+    login_ttl: Duration,
+    http_addr: Option<SocketAddr>,
 }
 
 impl CoordServiceImpl {
@@ -195,6 +244,35 @@ impl CoordServiceImpl {
                  {MIN_SUPPORTED_PROTOCOL_VERSION}，请升级 hzd 后重试"
             ))
         })
+    }
+
+    /// 挑战的取走 + 签名校验；Hello 之后的每个需要认证的 rpc 共用。
+    fn take_verified_challenge(
+        challenges: &ChallengeCache,
+        req_machine_key_pub: &[u8],
+        req_hostname: &str,
+        nonce: [u8; 32],
+        signature: [u8; 64],
+    ) -> Result<Challenge, Status> {
+        let challenge = challenges
+            .take(&nonce)
+            .ok_or_else(|| Status::permission_denied("挑战不存在或已过期，请重新发起注册"))?;
+        if challenge.expires <= std::time::Instant::now() {
+            return Err(Status::permission_denied(
+                "挑战不存在或已过期，请重新发起注册",
+            ));
+        }
+        if challenge.machine_key_pub != req_machine_key_pub || challenge.hostname != req_hostname {
+            return Err(Status::unauthenticated(
+                "签名验证失败：挑战与请求的 Machine Key 或主机名不匹配",
+            ));
+        }
+        let verifying_key = VerifyingKey::from_bytes(&challenge.machine_key_pub)
+            .map_err(|_| Status::unauthenticated("签名验证失败：Machine Key 公钥无效"))?;
+        verifying_key
+            .verify(&nonce, &Signature::from_bytes(&signature))
+            .map_err(|_| Status::unauthenticated("签名验证失败"))?;
+        Ok(challenge)
     }
 }
 
@@ -285,9 +363,106 @@ impl Coord for CoordServiceImpl {
 
     async fn begin_interactive_login(
         &self,
-        _request: Request<BeginLoginRequest>,
+        request: Request<BeginLoginRequest>,
     ) -> Result<Response<BeginLoginResponse>, Status> {
-        Err(Status::unimplemented("交互式登录尚未实现"))
+        let req = request.into_inner();
+        if let Some(status) = Self::hello_reject_old_version(req.protocol_version) {
+            return Err(status);
+        }
+        let Some(http_addr) = self.http_addr else {
+            return Err(Status::unimplemented(
+                "此 Coordination Server 未配置交互式登录（OIDC）",
+            ));
+        };
+        let machine_key_pub: [u8; 32] = req
+            .machine_key_pub
+            .try_into()
+            .map_err(|_| Status::invalid_argument("machine_key_pub 必须是 32 字节"))?;
+        let nonce: [u8; 32] = req
+            .challenge_nonce
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_nonce 必须是 32 字节"))?;
+        let signature: [u8; 64] = req
+            .challenge_signature
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_signature 必须是 64 字节"))?;
+        let challenge = Self::take_verified_challenge(
+            &self.challenges,
+            &machine_key_pub,
+            &req.hostname,
+            nonce,
+            signature,
+        )?;
+
+        let started = self.logins.begin(
+            challenge.machine_key_pub,
+            challenge.hostname,
+            req.node_key_pub,
+            new_login_token("n-"),
+            new_pkce_verifier(),
+            self.login_ttl,
+        );
+        let started = started.map_err(Status::failed_precondition)?;
+        let expires_unix =
+            system_time_to_unix(SystemTime::now() + self.login_ttl.max(Duration::ZERO));
+        tracing::info!(
+            login_id = %started.login_id.0,
+            "interactive login began"
+        );
+        Ok(Response::new(BeginLoginResponse {
+            login_url: format!("http://{http_addr}/oidc/start/{}", started.login_id.0),
+            expires_unix,
+        }))
+    }
+
+    async fn login_status(
+        &self,
+        request: Request<LoginStatusRequest>,
+    ) -> Result<Response<LoginStatusResponse>, Status> {
+        let req = request.into_inner();
+        if let Some(status) = Self::hello_reject_old_version(req.protocol_version) {
+            return Err(status);
+        }
+        let machine_key_pub: [u8; 32] = req
+            .machine_key_pub
+            .try_into()
+            .map_err(|_| Status::invalid_argument("machine_key_pub 必须是 32 字节"))?;
+        let nonce: [u8; 32] = req
+            .challenge_nonce
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_nonce 必须是 32 字节"))?;
+        let signature: [u8; 64] = req
+            .challenge_signature
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_signature 必须是 64 字节"))?;
+        Self::take_verified_challenge(
+            &self.challenges,
+            &machine_key_pub,
+            &req.hostname,
+            nonce,
+            signature,
+        )?;
+
+        match self.logins.poll(&req.login_id, &machine_key_pub) {
+            PollResult::Pending => Ok(Response::new(LoginStatusResponse {
+                completed: false,
+                node: None,
+                error: None,
+            })),
+            PollResult::Completed(record) => {
+                tracing::info!(node_id = %record.id, "interactive login delivered to node");
+                Ok(Response::new(LoginStatusResponse {
+                    completed: true,
+                    node: Some(node_info_from(record)),
+                    error: None,
+                }))
+            }
+            PollResult::Failed(reason) => Ok(Response::new(LoginStatusResponse {
+                completed: true,
+                node: None,
+                error: Some(reason),
+            })),
+        }
     }
 
     type StreamNetworkMapStream = Pin<

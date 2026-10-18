@@ -1,0 +1,30 @@
+# 真实 Kanidm 实例的交互式登录集成测试（FR-2 / FR-11，票 #10）。
+# server.toml 与证书由 run.sh 预先写入 kanidm-test-data 卷；tools 提供 kanidm CLI
+# （server 镜像无 shell）。宿主机端口经 KANIDM_HOST_PORT 发布到 loopback。
+services:
+  kanidm:
+    image: docker.io/kanidm/server:1.8.0
+    command: ["kanidmd", "server"]
+    ports:
+      - "127.0.0.1:${KANIDM_HOST_PORT:-18443}:8443"
+    volumes:
+      - kanidm-data:/data
+
+  tools:
+    image: docker.io/kanidm/tools:1.8.0
+    entrypoint: ["sleep", "infinity"]
+    network_mode: service:kanidm
+    volumes:
+      - kanidm-data:/ca:ro
+      - kanidm-cli:/cache
+    environment:
+      KANIDM_URL: https://localhost:8443
+      KANIDM_CA_PATH: /ca/chain.pem
+      KANIDM_CACHE_DIR: /cache
+      HOME: /cache
+
+volumes:
+  kanidm-data:
+    name: kanidm-test-data
+  kanidm-cli:
+    name: kanidm-test-cli

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use hz_core::coord_client::{
-    DEFAULT_COORD_ADDR, local_hostname, open_network_map_stream, register_with_auth_key,
+    DEFAULT_COORD_ADDR, LoginPoll, StartedLogin, begin_interactive_login, local_hostname,
+    open_network_map_stream, poll_login_status, register_with_auth_key,
 };
 use hz_core::ipc::{self, Handler};
 use hz_core::keys::KeyStore;
@@ -29,6 +30,16 @@ const REGISTRATION_FILE: &str = "registration.json";
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
+/// 一次交互式登录在 hzd 内的进度；终态只保留最后一次，重复 up 覆盖。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum LoginProgress {
+    Idle,
+    Pending,
+    Completed,
+    Failed { error: String },
+}
+
 /// `hz status` 展示的一个对端；来源于本地 Network Map 缓存。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MapPeer {
@@ -46,6 +57,7 @@ struct Daemon {
     engine: StdMutex<Option<Arc<SocketEngine>>>,
     /// 最近一次成功使用的 Coordination Server 地址；重启后自动重连用它。
     coord_addr: StdMutex<Option<String>>,
+    login: StdMutex<LoginProgress>,
 }
 
 pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()> {
@@ -77,6 +89,7 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
                 .and_then(|file| file.coord_addr)
                 .filter(|addr| !addr.is_empty()),
         ),
+        login: StdMutex::new(LoginProgress::Idle),
     });
 
     // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
@@ -139,12 +152,6 @@ async fn handle_request(
             Ok(value)
         }
         "up" => {
-            let auth_key = request
-                .params
-                .get("auth_key")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "缺少 auth_key 参数".to_string())?
-                .to_string();
             let coord_addr = request
                 .params
                 .get("coord_addr")
@@ -153,28 +160,123 @@ async fn handle_request(
                 .or_else(|| std::env::var("HZD_COORD_ADDR").ok())
                 .unwrap_or_else(|| DEFAULT_COORD_ADDR.to_string());
 
-            let info = register_with_auth_key(
-                &daemon.state_dir,
-                &auth_key,
-                &local_hostname(),
-                &coord_addr,
-            )
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-            save_registration(&daemon.state_dir, &info, &coord_addr)
-                .map_err(|error| format!("{error:#}"))?;
-            *daemon.registration.lock().expect("registration poisoned") = Some(info.clone());
-            *daemon.coord_addr.lock().expect("coord addr poisoned") = Some(coord_addr.clone());
-            tracing::info!(node_id = %info.node_id, name = %info.name, "node registered");
-
-            if let Err(error) = start_dataplane(&daemon, &keys, &info, &coord_addr).await {
-                // 数据面失败不回滚注册：控制面可用，问题在日志里可见。
-                tracing::error!(%error, "dataplane startup failed after registration");
+            match request.params.get("auth_key").and_then(|v| v.as_str()) {
+                Some(auth_key) => {
+                    let info = register_with_auth_key(
+                        &daemon.state_dir,
+                        auth_key,
+                        &local_hostname(),
+                        &coord_addr,
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"))?;
+                    finish_registration(&daemon, &keys, info, &coord_addr)
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                }
+                None => {
+                    // 无 Auth Key：交互式登录（FR-2）。申请到一次性链接立刻返回给
+                    // CLI 打印，轮询在后台任务里继续。
+                    let started =
+                        begin_interactive_login(&daemon.state_dir, &local_hostname(), &coord_addr)
+                            .await
+                            .map_err(|error| format!("{error:#}"))?;
+                    *daemon.login.lock().expect("login poisoned") = LoginProgress::Pending;
+                    let login_url = started.login_url.clone();
+                    let expires_unix = started.expires_unix;
+                    spawn_login_poller(daemon.clone(), keys.clone(), started, coord_addr);
+                    Ok(serde_json::json!({
+                        "login_url": login_url,
+                        "expires_unix": expires_unix,
+                    }))
+                }
             }
-            serde_json::to_value(info).map_err(|e| e.to_string())
+        }
+        "login_poll" => {
+            let progress = daemon.login.lock().expect("login poisoned").clone();
+            let registration = daemon
+                .registration
+                .lock()
+                .expect("registration poisoned")
+                .clone();
+            let value = serde_json::to_value(&progress).map_err(|e| e.to_string())?;
+            match (&progress, registration) {
+                (LoginProgress::Completed, Some(info)) => {
+                    let mut value = value;
+                    value["node"] = serde_json::to_value(&info).map_err(|e| e.to_string())?;
+                    Ok(value)
+                }
+                _ => Ok(value),
+            }
         }
         _ => Err(format!("unknown method: {}", request.method)),
     }
+}
+
+/// 注册/登录完成后共用的落盘与数据面拉起。
+async fn finish_registration(
+    daemon: &Arc<Daemon>,
+    keys: &Arc<KeyStore>,
+    info: RegisteredInfo,
+    coord_addr: &str,
+) -> Result<Value, String> {
+    save_registration(&daemon.state_dir, &info, coord_addr)
+        .map_err(|error| format!("{error:#}"))?;
+    *daemon.registration.lock().expect("registration poisoned") = Some(info.clone());
+    *daemon.coord_addr.lock().expect("coord addr poisoned") = Some(coord_addr.to_string());
+    tracing::info!(node_id = %info.node_id, name = %info.name, "node registered");
+    if let Err(error) = start_dataplane(daemon, keys, &info, coord_addr).await {
+        // 数据面失败不回滚注册：控制面可用，问题在日志里可见。
+        tracing::error!(%error, "dataplane startup failed after registration");
+    }
+    serde_json::to_value(info).map_err(|e| e.to_string())
+}
+
+/// 每 2 秒轮询一次登录状态，直到终态；总预算 10 分钟。
+/// 落定时刷新注册与数据面；失败原样透出给 login_poll。
+fn spawn_login_poller(
+    daemon: Arc<Daemon>,
+    keys: Arc<KeyStore>,
+    started: StartedLogin,
+    coord_addr: String,
+) {
+    tokio::spawn(async move {
+        let hostname = local_hostname();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                let error = "登录等待超时（10 分钟），请重新执行 hz up".to_string();
+                tracing::error!(%error, "interactive login polling gave up");
+                *daemon.login.lock().expect("login poisoned") = LoginProgress::Failed { error };
+                return;
+            }
+            match poll_login_status(&daemon.state_dir, &hostname, &coord_addr, &started.login_id)
+                .await
+            {
+                Ok(LoginPoll::Pending) => {}
+                Ok(LoginPoll::Completed(info)) => {
+                    if let Err(error) = finish_registration(&daemon, &keys, info, &coord_addr).await
+                    {
+                        *daemon.login.lock().expect("login poisoned") =
+                            LoginProgress::Failed { error };
+                        return;
+                    }
+                    *daemon.login.lock().expect("login poisoned") = LoginProgress::Completed;
+                    return;
+                }
+                Ok(LoginPoll::Failed(error)) => {
+                    tracing::warn!(%error, "interactive login failed");
+                    *daemon.login.lock().expect("login poisoned") = LoginProgress::Failed { error };
+                    return;
+                }
+                Err(error) => {
+                    // 网络抖动等暂时性错误按 Pending 处理，等下一轮。
+                    tracing::warn!(%error, "login status poll error, will retry");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
 }
 
 fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {

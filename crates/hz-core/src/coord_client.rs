@@ -12,7 +12,10 @@ use anyhow::{Context, anyhow};
 use ed25519_dalek::Signer;
 use hyper_util::rt::TokioIo;
 use hz_proto::coord_client::CoordClient;
-use hz_proto::{HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest, StreamMapRequest};
+use hz_proto::{
+    BeginLoginRequest, HelloRequest, LoginStatusRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest,
+    StreamMapRequest,
+};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Uri};
@@ -109,6 +112,122 @@ pub async fn open_network_map_stream(
         .map_err(|status| anyhow!("Network Map 订阅失败：{status}"))?
         .into_inner();
     Ok(stream)
+}
+
+/// 交互式登录的第一步：申请一次性登录链接（FR-2）。Node 侧只拿到 URL 与
+/// 过期时间，不接触任何 IdP 概念。
+pub async fn begin_interactive_login(
+    state_dir: &Path,
+    hostname: &str,
+    coord_addr: &str,
+) -> anyhow::Result<StartedLogin> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+
+    let hello = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: hostname.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("登录失败：Coordination Server 拒绝了 Hello（{status}）"))?
+        .into_inner();
+
+    let nonce = hello.challenge_nonce.clone();
+    let signature = keys.machine().sign(&nonce).to_bytes();
+    let response = client
+        .begin_interactive_login(BeginLoginRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: hostname.to_owned(),
+            challenge_nonce: nonce,
+            challenge_signature: signature.to_vec(),
+            node_key_pub: keys.node_public().to_vec(),
+        })
+        .await
+        .map_err(|status| anyhow!("登录失败：{status}"))?
+        .into_inner();
+    let login_id = response
+        .login_url
+        .rsplit('/')
+        .next()
+        .map(str::to_owned)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("登录失败：服务端返回的登录链接缺少标识"))?;
+    Ok(StartedLogin {
+        login_url: response.login_url,
+        login_id,
+        expires_unix: response.expires_unix,
+    })
+}
+
+pub struct StartedLogin {
+    pub login_url: String,
+    pub login_id: String,
+    pub expires_unix: i64,
+}
+
+/// LoginStatus 轮询一次的结果。
+pub enum LoginPoll {
+    Pending,
+    Completed(RegisteredInfo),
+    Failed(String),
+}
+
+/// 轮询一次登录结果（FR-2）：浏览器完成登录后这里取回注册信息。
+pub async fn poll_login_status(
+    state_dir: &Path,
+    hostname: &str,
+    coord_addr: &str,
+    login_id: &str,
+) -> anyhow::Result<LoginPoll> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+
+    let hello = client
+        .hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: hostname.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("登录状态查询失败：Hello 被拒绝（{status}）"))?
+        .into_inner();
+    let nonce = hello.challenge_nonce;
+    let signature = keys.machine().sign(&nonce).to_bytes();
+    let response = client
+        .login_status(LoginStatusRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: hostname.to_owned(),
+            challenge_nonce: nonce,
+            challenge_signature: signature.to_vec(),
+            login_id: login_id.to_owned(),
+        })
+        .await
+        .map_err(|status| anyhow!("登录状态查询失败：{status}"))?
+        .into_inner();
+    if let Some(error) = response.error {
+        return Ok(LoginPoll::Failed(error));
+    }
+    match (response.completed, response.node) {
+        (true, Some(node)) => Ok(LoginPoll::Completed(RegisteredInfo {
+            node_id: node.node_id,
+            name: node.name,
+            ipv4: node.ipv4,
+            ipv6: node.ipv6,
+            tags: node.tags,
+            owner_user: node.owner_user,
+            expires_at_unix: node.expires_at_unix,
+        })),
+        (true, None) => Ok(LoginPoll::Failed(
+            "服务端返回了完成态但没有 Node 信息".to_string(),
+        )),
+        (false, _) => Ok(LoginPoll::Pending),
+    }
 }
 
 async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {
