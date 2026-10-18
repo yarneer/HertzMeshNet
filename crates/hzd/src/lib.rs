@@ -14,17 +14,22 @@ use hz_core::coord_client::{
 };
 use hz_core::ipc::{self, Handler};
 use hz_core::keys::KeyStore;
+use hz_core::map::{MapNode, NetworkMapCache};
 use hz_core::status::{NodeStatus, RegisteredInfo};
 #[cfg(target_os = "linux")]
 use hz_core::tun::{DEFAULT_V4_CIDR, Tun, TunConfig};
 use hz_core::wire::{PeerSpec, SocketEngine, lan_endpoint};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 const REGISTRATION_FILE: &str = "registration.json";
 
-/// `hz status` 展示的一个对端；来源于最近一次 Network Map。
+/// 断线重连退避：1s 起步、翻倍、30s 封顶（叠加亚秒抖动）。
+const BACKOFF_START: Duration = Duration::from_secs(1);
+const BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// `hz status` 展示的一个对端；来源于本地 Network Map 缓存。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MapPeer {
     pub name: String,
@@ -34,21 +39,13 @@ pub struct MapPeer {
     pub handshake_secs: Option<u64>,
 }
 
-/// Map 快照里保留的对端（含 node_id，供握手时长联查）。
-#[derive(Debug, Clone)]
-struct PeerSnapshot {
-    node_id: String,
-    name: String,
-    ipv4: String,
-    ipv6: String,
-    endpoints: Vec<String>,
-}
-
 struct Daemon {
     state_dir: PathBuf,
     registration: StdMutex<Option<RegisteredInfo>>,
-    peers: Arc<StdMutex<Vec<PeerSnapshot>>>,
+    map_cache: Arc<NetworkMapCache>,
     engine: StdMutex<Option<Arc<SocketEngine>>>,
+    /// 最近一次成功使用的 Coordination Server 地址；重启后自动重连用它。
+    coord_addr: StdMutex<Option<String>>,
 }
 
 pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()> {
@@ -62,22 +59,44 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
     if registration.is_some() {
         tracing::info!("loaded existing registration from disk");
     }
+    let map_cache = match NetworkMapCache::load(&state_dir) {
+        Ok(cache) => Arc::new(cache),
+        Err(error) => {
+            // 缓存损坏不该卡死守护进程：清空重来，Coordination Server 在线时很快补齐。
+            tracing::error!(%error, "load network map cache failed, starting empty");
+            Arc::new(NetworkMapCache::empty(&state_dir))
+        }
+    };
     let daemon = Arc::new(Daemon {
         state_dir,
-        registration: StdMutex::new(registration),
-        peers: Arc::new(StdMutex::new(Vec::new())),
+        registration: StdMutex::new(registration.as_ref().map(|file| file.info.clone())),
+        map_cache,
         engine: StdMutex::new(None),
+        coord_addr: StdMutex::new(
+            registration
+                .and_then(|file| file.coord_addr)
+                .filter(|addr| !addr.is_empty()),
+        ),
     });
 
-    // 开机即已注册：直接拉起数据面（coord 地址此时只能来自环境变量）。
+    // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
     let boot_info = daemon
         .registration
         .lock()
         .expect("registration poisoned")
         .clone();
     if let Some(info) = boot_info {
-        let coord_addr =
-            std::env::var("HZD_COORD_ADDR").unwrap_or_else(|_| DEFAULT_COORD_ADDR.to_string());
+        let coord_addr = daemon
+            .coord_addr
+            .lock()
+            .expect("coord addr poisoned")
+            .clone()
+            .unwrap_or_else(|| std::env::var("HZD_COORD_ADDR").unwrap_or_default());
+        let coord_addr = if coord_addr.is_empty() {
+            DEFAULT_COORD_ADDR.to_string()
+        } else {
+            coord_addr
+        };
         if let Err(error) = start_dataplane(&daemon, &keys, &info, &coord_addr).await {
             tracing::error!(%error, "dataplane startup failed at boot");
         }
@@ -142,8 +161,10 @@ async fn handle_request(
             )
             .await
             .map_err(|error| format!("{error:#}"))?;
-            save_registration(&daemon.state_dir, &info).map_err(|error| format!("{error:#}"))?;
+            save_registration(&daemon.state_dir, &info, &coord_addr)
+                .map_err(|error| format!("{error:#}"))?;
             *daemon.registration.lock().expect("registration poisoned") = Some(info.clone());
+            *daemon.coord_addr.lock().expect("coord addr poisoned") = Some(coord_addr.clone());
             tracing::info!(node_id = %info.node_id, name = %info.name, "node registered");
 
             if let Err(error) = start_dataplane(&daemon, &keys, &info, &coord_addr).await {
@@ -157,7 +178,12 @@ async fn handle_request(
 }
 
 fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {
-    let snapshots = daemon.peers.lock().expect("peers poisoned").clone();
+    let own_node_id = daemon
+        .registration
+        .lock()
+        .expect("registration poisoned")
+        .as_ref()
+        .map(|info| info.node_id.clone());
     let ages = daemon
         .engine
         .lock()
@@ -165,17 +191,20 @@ fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {
         .as_ref()
         .map(|engine| engine.handshake_ages())
         .unwrap_or_default();
-    snapshots
+    daemon
+        .map_cache
+        .snapshot()
         .into_iter()
-        .map(|snapshot| MapPeer {
+        .filter(|node| own_node_id.as_deref() != Some(node.node_id.as_str()))
+        .map(|node| MapPeer {
             handshake_secs: ages
-                .get(&snapshot.node_id)
+                .get(&node.node_id)
                 .and_then(|age| age.map(Duration::from))
                 .map(|age| age.as_secs()),
-            name: snapshot.name,
-            ipv4: snapshot.ipv4,
-            ipv6: snapshot.ipv6,
-            endpoints: snapshot.endpoints,
+            name: node.name,
+            ipv4: node.ipv4,
+            ipv6: node.ipv6,
+            endpoints: node.endpoints,
         })
         .collect()
 }
@@ -199,9 +228,9 @@ async fn start_dataplane(
     tracing::info!(%endpoint, "reporting lan endpoint");
 
     spawn_tun_bridge(&engine, info);
-    spawn_map_subscription(
+    spawn_map_task(
         daemon.state_dir.clone(),
-        daemon.peers.clone(),
+        daemon.map_cache.clone(),
         engine.clone(),
         info.node_id.clone(),
         endpoint.to_string(),
@@ -295,72 +324,96 @@ fn spawn_tunnel_drain(rx: mpsc::Receiver<Vec<u8>>) {
     tokio::spawn(drain_tunnel(rx));
 }
 
-fn spawn_map_subscription(
+/// Network Map 消费任务（FR-6）：启动即用本地缓存配置数据面（Coordination
+/// Server 不可达也照常），然后循环 订阅 → 消费差量/全量 → 断线退避重连。
+/// 每次重连都重新走挑战认证并重报 Endpoint（服务端在流打开时落库）。
+fn spawn_map_task(
     state_dir: PathBuf,
-    peers: Arc<StdMutex<Vec<PeerSnapshot>>>,
+    cache: Arc<NetworkMapCache>,
     engine: Arc<SocketEngine>,
     own_node_id: String,
     endpoint: String,
     coord_addr: String,
 ) {
     tokio::spawn(async move {
-        let mut stream =
-            match open_network_map_stream(&state_dir, vec![endpoint], &coord_addr).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::error!(%error, "network map subscription failed");
-                    return;
-                }
-            };
+        apply_cache_to_engine(&cache, &engine, &own_node_id);
+        let mut backoff = BACKOFF_START;
         loop {
-            match stream.message().await {
-                Ok(Some(message)) => {
-                    let Some(hz_proto::network_map_message::Kind::Full(map)) = message.kind else {
-                        continue;
-                    };
-                    let mut snapshots = Vec::new();
-                    let mut specs = Vec::new();
-                    for node in &map.nodes {
-                        if node.node_id == own_node_id {
-                            continue;
-                        }
-                        match peer_spec(node) {
-                            Some(spec) => {
-                                snapshots.push(PeerSnapshot {
-                                    node_id: node.node_id.clone(),
-                                    name: node.name.clone(),
-                                    ipv4: node.ipv4.clone(),
-                                    ipv6: node.ipv6.clone(),
-                                    endpoints: node.endpoints.clone(),
-                                });
-                                specs.push(spec);
+            match open_network_map_stream(&state_dir, vec![endpoint.clone()], &coord_addr).await {
+                Ok(mut stream) => {
+                    backoff = BACKOFF_START;
+                    tracing::info!(%coord_addr, "network map stream opened");
+                    loop {
+                        let message = match stream.message().await {
+                            Ok(Some(message)) => message,
+                            Ok(None) => {
+                                tracing::warn!("network map stream closed by server");
+                                break;
                             }
-                            None => {
-                                tracing::warn!(
-                                    node_id = %node.node_id,
-                                    "map entry unusable (bad key/address/endpoint), skipped"
+                            Err(error) => {
+                                tracing::warn!(%error, "network map stream error");
+                                break;
+                            }
+                        };
+                        if let Some(kind) = message.kind {
+                            let change = match kind {
+                                hz_proto::network_map_message::Kind::Full(map) => cache
+                                    .apply_full(map.nodes.into_iter().map(MapNode::from).collect()),
+                                hz_proto::network_map_message::Kind::Delta(delta) => cache
+                                    .apply_delta(
+                                        delta
+                                            .added_or_updated
+                                            .into_iter()
+                                            .map(MapNode::from)
+                                            .collect(),
+                                        delta.removed_node_ids,
+                                    ),
+                            };
+                            if !change.is_empty() {
+                                tracing::info!(
+                                    added = change.added_or_updated.len(),
+                                    removed = change.removed_node_ids.len(),
+                                    version = cache.version(),
+                                    "network map updated"
                                 );
+                                apply_cache_to_engine(&cache, &engine, &own_node_id);
                             }
                         }
                     }
-                    tracing::info!(peers = snapshots.len(), "network map applied");
-                    *peers.lock().expect("peers poisoned") = snapshots;
-                    engine.reconcile(specs);
-                }
-                Ok(None) => {
-                    tracing::warn!("network map stream closed by server");
-                    break;
                 }
                 Err(error) => {
-                    tracing::error!(%error, "network map stream error");
-                    break;
+                    tracing::warn!(%error, "network map subscription failed");
                 }
             }
+            tokio::time::sleep(jittered(backoff)).await;
+            backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
         }
     });
 }
 
-fn peer_spec(node: &hz_proto::NodeInfo) -> Option<PeerSpec> {
+/// 用缓存当前快照对账数据面（含自己之外的全部对端）。
+fn apply_cache_to_engine(cache: &NetworkMapCache, engine: &SocketEngine, own_node_id: &str) {
+    let specs = cache
+        .snapshot()
+        .into_iter()
+        .filter(|node| node.node_id != own_node_id)
+        .filter_map(|node| peer_spec(&node))
+        .collect::<Vec<_>>();
+    engine.reconcile(specs);
+}
+
+/// 退避加抖动：附加 0 到一半退避时长的随机量（取自系统时钟亚秒，避免引入
+/// 新依赖），避免大量 Node 同步重连打爆服务端。
+fn jittered(backoff: Duration) -> Duration {
+    let subsec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis() as u64)
+        .unwrap_or(0);
+    let spread = backoff.as_millis() as u64 / 2 + 1;
+    backoff + Duration::from_millis(subsec % spread)
+}
+
+fn peer_spec(node: &MapNode) -> Option<PeerSpec> {
     let node_key_pub: [u8; 32] = node.node_key_pub.clone().try_into().ok()?;
     let ipv4: IpAddr = node.ipv4.parse().ok()?;
     let ipv6: IpAddr = node.ipv6.parse().ok()?;
@@ -377,7 +430,17 @@ fn peer_spec(node: &hz_proto::NodeInfo) -> Option<PeerSpec> {
     })
 }
 
-fn load_registration(state_dir: &Path) -> anyhow::Result<Option<RegisteredInfo>> {
+/// registration.json 的落盘形态：注册身份 + 记下 coord 地址供重启后自动重连；
+/// 老文件没有 coord_addr 字段也能装载。
+#[derive(Debug, Serialize, Deserialize)]
+struct RegistrationFile {
+    #[serde(flatten)]
+    info: RegisteredInfo,
+    #[serde(default)]
+    coord_addr: Option<String>,
+}
+
+fn load_registration(state_dir: &Path) -> anyhow::Result<Option<RegistrationFile>> {
     let path = state_dir.join(REGISTRATION_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -391,7 +454,11 @@ fn load_registration(state_dir: &Path) -> anyhow::Result<Option<RegisteredInfo>>
         .map_err(|error| anyhow::anyhow!("{path:?} 内容损坏：{error}"))
 }
 
-fn save_registration(state_dir: &Path, info: &RegisteredInfo) -> anyhow::Result<()> {
+fn save_registration(
+    state_dir: &Path,
+    info: &RegisteredInfo,
+    coord_addr: &str,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let path = state_dir.join(REGISTRATION_FILE);
     let tmp = path.with_extension("tmp");
@@ -404,7 +471,13 @@ fn save_registration(state_dir: &Path, info: &RegisteredInfo) -> anyhow::Result<
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(serde_json::to_string_pretty(info)?.as_bytes())?;
+        file.write_all(
+            serde_json::to_string_pretty(&RegistrationFile {
+                info: info.clone(),
+                coord_addr: Some(coord_addr.to_string()),
+            })?
+            .as_bytes(),
+        )?;
     }
     std::fs::rename(&tmp, &path)?;
     Ok(())

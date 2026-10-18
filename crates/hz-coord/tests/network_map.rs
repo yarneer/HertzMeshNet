@@ -1,5 +1,6 @@
 //! Network Map 下发的服务端契约（真实 tonic over loopback + 内存 SQLite）：
-//! 挑战认证、Endpoint 落库、全量快照内容、未注册/坏签名拒绝、周期性重发。
+//! 挑战认证、Endpoint 落库、全量快照、增量推送（注册/Endpoint/吊销/到期清扫）、
+//! 断线后重启再连收新全量。
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -13,9 +14,11 @@ use hz_proto::coord_client::CoordClient;
 use hz_proto::network_map_message::Kind;
 use hz_proto::{HelloRequest, PROTOCOL_VERSION, RegisterAuthKeyRequest, StreamMapRequest};
 use rand_core::OsRng;
-use tonic::Status;
 use tonic::transport::Channel;
+use tonic::{Response, Status};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+
+const LONG: Duration = Duration::from_secs(3600);
 
 struct NodeKeys {
     machine: SigningKey,
@@ -30,16 +33,38 @@ fn node_keys() -> NodeKeys {
     }
 }
 
-async fn start_server(map_refresh: Duration) -> (ServeHandle, Store, SocketAddr) {
+fn config(store: &Store, keepalive: Duration, sweep: Duration) -> ServeConfig {
+    let mut config = ServeConfig::new(store.clone(), "127.0.0.1:0".parse().unwrap());
+    config.map_keepalive = keepalive;
+    config.map_sweep = sweep;
+    config
+}
+
+async fn start_server(keepalive: Duration, sweep: Duration) -> (ServeHandle, Store, SocketAddr) {
     let store = Store::open_in_memory(AddressConfig::default())
         .await
         .unwrap();
-    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut config = ServeConfig::new(store.pool().clone(), listen);
-    config.map_refresh = map_refresh;
-    let handle = serve(config).await.unwrap();
+    let handle = serve(config(&store, keepalive, sweep)).await.unwrap();
     let addr = handle.local_addr;
     (handle, store, addr)
+}
+
+/// 服务停掉后在同一地址重启；TIME_WAIT 期内 bind 可能失败，重试几秒。
+async fn restart_on_same_addr(
+    store: &Store,
+    addr: SocketAddr,
+    keepalive: Duration,
+    sweep: Duration,
+) -> ServeHandle {
+    for _ in 0..100 {
+        let mut serve_config = config(store, keepalive, sweep);
+        serve_config.listen = addr;
+        if let Ok(handle) = serve(serve_config).await {
+            return handle;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("无法在 {addr} 上重启 coord serve");
 }
 
 async fn connect(addr: SocketAddr) -> CoordClient<Channel> {
@@ -81,12 +106,14 @@ async fn register(
         .unwrap()
 }
 
+type MapStream = tonic::codec::Streaming<hz_proto::NetworkMapMessage>;
+
 async fn open_map(
     client: &mut CoordClient<Channel>,
     keys: &NodeKeys,
     endpoints: Vec<String>,
     signature_override: Option<[u8; 64]>,
-) -> Result<tonic::Response<tonic::codec::Streaming<hz_proto::NetworkMapMessage>>, Status> {
+) -> Result<MapStream, Status> {
     let hello = client
         .hello(HelloRequest {
             protocol_version: PROTOCOL_VERSION,
@@ -108,15 +135,38 @@ async fn open_map(
             endpoints,
         })
         .await
+        .map(Response::into_inner)
+}
+
+/// 限时等下一条消息；delta/keepalive 混流时按谓词过滤。
+async fn next_message(stream: &mut MapStream, timeout: Duration) -> hz_proto::NetworkMapMessage {
+    tokio::time::timeout(timeout, stream.message())
+        .await
+        .unwrap_or_else(|_| panic!("{timeout:?} 内未收到下一条 Map 消息"))
+        .unwrap()
+        .unwrap()
+}
+
+async fn next_delta(stream: &mut MapStream, timeout: Duration) -> hz_proto::MapDelta {
+    loop {
+        match next_message(stream, timeout).await.kind.unwrap() {
+            Kind::Full(_) => continue,
+            Kind::Delta(delta) => return delta,
+        }
+    }
+}
+
+async fn auth_key(store: &Store) -> String {
+    store
+        .create_auth_key(chrono::Utc::now().timestamp() + 3600, false, &[])
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
 async fn map_stream_authenticates_upserts_endpoints_and_delivers_full_snapshot() {
-    let (handle, store, addr) = start_server(Duration::from_secs(3600)).await;
-    let auth_key = store
-        .create_auth_key(chrono::Utc::now().timestamp() + 3600, false, &[])
-        .await
-        .unwrap();
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let auth_key = auth_key(&store).await;
 
     let node_a = node_keys();
     let node_b = node_keys();
@@ -131,14 +181,9 @@ async fn map_stream_authenticates_upserts_endpoints_and_delivers_full_snapshot()
         None,
     )
     .await
-    .unwrap()
-    .into_inner();
+    .unwrap();
 
-    let message = tokio::time::timeout(Duration::from_secs(5), stream.message())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let message = next_message(&mut stream, Duration::from_secs(5)).await;
     let Kind::Full(map) = message.kind.unwrap() else {
         panic!("打开流后第一条必须是全量 Network Map");
     };
@@ -181,28 +226,23 @@ async fn map_stream_authenticates_upserts_endpoints_and_delivers_full_snapshot()
 }
 
 #[tokio::test]
-async fn map_stream_is_periodically_resent_as_keepalive() {
-    let (handle, store, addr) = start_server(Duration::from_millis(200)).await;
+async fn map_stream_sends_empty_delta_as_keepalive() {
+    let (handle, store, addr) = start_server(Duration::from_millis(200), LONG).await;
     let mut client = connect(addr).await;
 
     let node = node_keys();
-    let auth_key = store
-        .create_auth_key(chrono::Utc::now().timestamp() + 3600, false, &[])
-        .await
-        .unwrap();
+    let auth_key = auth_key(&store).await;
     let _info = register(&mut client, &node, "keeper", &auth_key).await;
 
-    let mut stream = open_map(&mut client, &node, vec![], None)
-        .await
-        .unwrap()
-        .into_inner();
+    let mut stream = open_map(&mut client, &node, vec![], None).await.unwrap();
+    let first = next_message(&mut stream, Duration::from_secs(5)).await;
+    assert!(matches!(first.kind, Some(Kind::Full(_))), "首条仍是全量");
     for expected in 1..=2 {
-        let message = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .unwrap_or_else(|_| panic!("第 {expected} 份快照应在 5 秒内到达（周期性重发）"))
-            .unwrap()
-            .unwrap();
-        assert!(matches!(message.kind, Some(Kind::Full(_))));
+        let delta = next_delta(&mut stream, Duration::from_secs(5)).await;
+        assert!(
+            delta.added_or_updated.is_empty() && delta.removed_node_ids.is_empty(),
+            "第 {expected} 份保活应是空差量：{delta:?}"
+        );
     }
 
     handle.shutdown();
@@ -211,7 +251,7 @@ async fn map_stream_is_periodically_resent_as_keepalive() {
 
 #[tokio::test]
 async fn map_stream_rejects_bad_signature_and_unregistered_keys() {
-    let (handle, store, addr) = start_server(Duration::from_secs(3600)).await;
+    let (handle, store, addr) = start_server(LONG, LONG).await;
     let mut client = connect(addr).await;
 
     let stranger = node_keys();
@@ -221,16 +261,229 @@ async fn map_stream_rejects_bad_signature_and_unregistered_keys() {
     assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status}");
 
     let node = node_keys();
-    let auth_key = store
-        .create_auth_key(chrono::Utc::now().timestamp() + 3600, false, &[])
-        .await
-        .unwrap();
+    let auth_key = auth_key(&store).await;
     let _info = register(&mut client, &node, "signed-node", &auth_key).await;
     let bad_signature = SigningKey::generate(&mut OsRng).sign(b"nonce").to_bytes();
     let status = open_map(&mut client, &node, vec![], Some(bad_signature))
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status}");
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+#[tokio::test]
+async fn new_node_registration_pushes_delta_and_lands_in_client_cache() {
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let auth_key = auth_key(&store).await;
+    let node_a = node_keys();
+    let mut client = connect(addr).await;
+    let info_a = register(&mut client, &node_a, "node-a", &auth_key).await;
+
+    let mut stream = open_map(
+        &mut client,
+        &node_a,
+        vec!["10.0.0.1:51820".to_string()],
+        None,
+    )
+    .await
+    .unwrap();
+    let full = next_message(&mut stream, Duration::from_secs(5)).await;
+    let Kind::Full(map) = full.kind.unwrap() else {
+        panic!("首条必须是全量");
+    };
+    assert_eq!(
+        map.nodes.len(),
+        1,
+        "A 单独在线时快照只有 A：{:?}",
+        map.nodes
+    );
+
+    let node_b = node_keys();
+    let info_b = register(&mut client, &node_b, "node-b", &auth_key).await;
+
+    let delta = next_delta(&mut stream, Duration::from_secs(2)).await;
+    let added_names: HashSet<String> = delta
+        .added_or_updated
+        .iter()
+        .map(|n| n.name.clone())
+        .collect();
+    assert_eq!(
+        added_names,
+        HashSet::from(["node-b".to_string()]),
+        "B 注册后 2 秒内应推来只含 B 的差量：{delta:?}"
+    );
+    assert!(delta.removed_node_ids.is_empty());
+    let added_b = delta
+        .added_or_updated
+        .iter()
+        .find(|n| n.node_id == info_b.node_id)
+        .unwrap();
+    assert_eq!(added_b.ipv4, info_b.ipv4);
+    assert_eq!(added_b.node_key_pub.len(), 32);
+
+    // 消息照 hzd 的方式喂进客户端缓存，从公共快照断言。
+    let dir = tempfile::tempdir().unwrap();
+    let cache = hz_core::map::NetworkMapCache::load(dir.path()).unwrap();
+    cache.apply_full(map.nodes.into_iter().map(Into::into).collect());
+    cache.apply_delta(
+        delta.added_or_updated.into_iter().map(Into::into).collect(),
+        delta.removed_node_ids,
+    );
+    let snapshot_names: HashSet<String> = cache.snapshot().iter().map(|n| n.name.clone()).collect();
+    assert_eq!(
+        snapshot_names,
+        HashSet::from([info_a.name.clone(), info_b.name.clone(),]),
+        "缓存快照必须同时含 A 与 B"
+    );
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+#[tokio::test]
+async fn revoked_node_is_pushed_as_removed_and_absent_from_new_full_maps() {
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let auth_key = auth_key(&store).await;
+    let node_a = node_keys();
+    let node_b = node_keys();
+    let mut client = connect(addr).await;
+    let _info_a = register(&mut client, &node_a, "node-a", &auth_key).await;
+    let info_b = register(&mut client, &node_b, "node-b", &auth_key).await;
+
+    let mut stream = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let _ = next_message(&mut stream, Duration::from_secs(5)).await;
+
+    assert!(store.revoke_node(&info_b.node_id).await.unwrap());
+    assert!(
+        !store.revoke_node(&info_b.node_id).await.unwrap(),
+        "重复吊销是空操作"
+    );
+
+    let delta = next_delta(&mut stream, Duration::from_secs(2)).await;
+    assert_eq!(
+        delta.removed_node_ids,
+        vec![info_b.node_id.clone()],
+        "吊销后应推来 removed_node_ids=[B]：{delta:?}"
+    );
+    assert!(delta.added_or_updated.is_empty());
+
+    let mut fresh = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let message = next_message(&mut fresh, Duration::from_secs(5)).await;
+    let Kind::Full(map) = message.kind.unwrap() else {
+        panic!("重连后首条必须是全量");
+    };
+    let names: HashSet<String> = map.nodes.iter().map(|n| n.name.clone()).collect();
+    assert_eq!(
+        names,
+        HashSet::from(["node-a".to_string()]),
+        "吊销后全量快照不得再含 B：{names:?}"
+    );
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+#[tokio::test]
+async fn expired_node_is_swept_out_of_the_map() {
+    let (handle, store, addr) = start_server(LONG, Duration::from_millis(200)).await;
+    let auth_key = auth_key(&store).await;
+    let node_a = node_keys();
+    let node_b = node_keys();
+    let mut client = connect(addr).await;
+    let _info_a = register(&mut client, &node_a, "node-a", &auth_key).await;
+    let info_b = register(&mut client, &node_b, "node-b", &auth_key).await;
+
+    let mut stream = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let _ = next_message(&mut stream, Duration::from_secs(5)).await;
+
+    // 绕过 notify 的直写（模拟在线期间到期跨越）：只有周期清扫能接住。
+    sqlx::query("UPDATE nodes SET expires_at_unix = ?1 WHERE id = ?2")
+        .bind(hz_coord::store::unix_now() - 1)
+        .bind(&info_b.node_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let delta = next_delta(&mut stream, Duration::from_secs(5)).await;
+    assert_eq!(
+        delta.removed_node_ids,
+        vec![info_b.node_id.clone()],
+        "到期被清扫后应推来 removed=[B]：{delta:?}"
+    );
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+#[tokio::test]
+async fn endpoint_change_is_pushed_as_delta() {
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let auth_key = auth_key(&store).await;
+    let node_a = node_keys();
+    let node_b = node_keys();
+    let mut client = connect(addr).await;
+    let _info_a = register(&mut client, &node_a, "node-a", &auth_key).await;
+    let info_b = register(&mut client, &node_b, "node-b", &auth_key).await;
+
+    let mut stream = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let _ = next_message(&mut stream, Duration::from_secs(5)).await;
+
+    store
+        .update_udp_endpoints(&info_b.node_id, &["10.9.8.7:42421".to_string()])
+        .await
+        .unwrap();
+
+    let delta = next_delta(&mut stream, Duration::from_secs(2)).await;
+    let updated = delta
+        .added_or_updated
+        .iter()
+        .find(|n| n.node_id == info_b.node_id)
+        .unwrap_or_else(|| panic!("Endpoint 变化应作为 added_or_updated 推送：{delta:?}"));
+    assert_eq!(
+        updated.endpoints,
+        vec!["10.9.8.7:42421".to_string()],
+        "差量必须携带新 Endpoint"
+    );
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+#[tokio::test]
+async fn coord_outage_closes_streams_and_restart_delivers_fresh_full_map() {
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let auth_key = auth_key(&store).await;
+    let node_a = node_keys();
+    let mut client = connect(addr).await;
+    let info_a = register(&mut client, &node_a, "node-a", &auth_key).await;
+
+    let mut stream = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let _ = next_message(&mut stream, Duration::from_secs(5)).await;
+
+    handle.shutdown();
+    handle.terminated().await;
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), stream.message()).await;
+    assert!(
+        matches!(ended, Ok(Ok(None)) | Ok(Err(_))),
+        "服务停止后流必须结束：{ended:?}"
+    );
+
+    let handle = restart_on_same_addr(&store, addr, LONG, LONG).await;
+    let mut client = connect(addr).await;
+    let mut stream = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let message = next_message(&mut stream, Duration::from_secs(5)).await;
+    let Kind::Full(map) = message.kind.unwrap() else {
+        panic!("重启重连后首条必须是新全量");
+    };
+    let names: HashSet<String> = map.nodes.iter().map(|n| n.name.clone()).collect();
+    assert_eq!(
+        names,
+        HashSet::from([info_a.name.clone()]),
+        "重启后的全量必须来自同一份持久化存储：{names:?}"
+    );
 
     handle.shutdown();
     handle.terminated().await;

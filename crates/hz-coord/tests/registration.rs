@@ -38,7 +38,7 @@ async fn start_server() -> TestServer {
         .await
         .unwrap();
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let handle = serve(ServeConfig::new(store.pool().clone(), listen))
+    let handle = serve(ServeConfig::new(store.clone(), listen))
         .await
         .unwrap();
     TestServer { handle, store }

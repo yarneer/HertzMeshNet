@@ -1039,6 +1039,7 @@ dependencies = [
  "ed25519-dalek",
  "hz-core",
  "hz-proto",
+ "libc",
  "rand_core",
  "rcgen",
  "serde_json",

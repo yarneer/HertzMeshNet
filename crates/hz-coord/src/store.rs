@@ -43,6 +43,9 @@ pub struct NodeRecord {
 pub struct Store {
     pool: SqlitePool,
     addr: AddressConfig,
+    /// 影响 Network Map 的变更信号；注册/Endpoint/吊销路径提交后递增，
+    /// 推送任务在其上等待并计算差量。
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Store {
@@ -72,7 +75,21 @@ impl Store {
 
     pub async fn from_pool(pool: SqlitePool, addr: AddressConfig) -> anyhow::Result<Self> {
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool, addr })
+        let (changes, _) = tokio::sync::watch::channel(0);
+        Ok(Self {
+            pool,
+            addr,
+            changes,
+        })
+    }
+
+    /// 订阅 Network Map 相关变更；每次变化 version 递增。
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn notify_change(&self) {
+        self.changes.send_modify(|version| *version += 1);
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -169,7 +186,6 @@ impl Store {
             tracing::info!(node_id = %existing.id, "re-registered existing node");
             return Ok(existing);
         }
-
         let taken_v4: HashSet<Ipv4Addr> = sqlx::query("SELECT ipv4 FROM nodes")
             .fetch_all(&mut *tx)
             .await?
@@ -209,6 +225,7 @@ impl Store {
         .await?;
 
         tx.commit().await?;
+        self.notify_change();
         let owner_user = match user_id {
             Some(uid) => sqlx::query("SELECT name FROM users WHERE id = ?1")
                 .bind(uid)
@@ -241,7 +258,25 @@ impl Store {
             .bind(node_id)
             .execute(&self.pool)
             .await?;
+        self.notify_change();
         Ok(())
+    }
+
+    /// 吊销 Node：之后不再出现在任何 Network Map 里；已在推送流上的对端
+    /// 会收到 removed 差量。重复吊销是空操作。返回是否发生了状态迁移。
+    pub async fn revoke_node(&self, node_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE nodes SET revoked_at_unix = ?1 WHERE id = ?2 AND revoked_at_unix IS NULL",
+        )
+        .bind(unix_now())
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        let revoked = result.rows_affected() > 0;
+        if revoked {
+            self.notify_change();
+        }
+        Ok(revoked)
     }
 
     /// Network Map 快照：所有未吊销、未过期的 Node（含 Node Key 与 Endpoint）。

@@ -1,8 +1,9 @@
-//! gRPC 服务：挑战签发与校验、Auth Key 注册、协议版本闸门、Network Map 快照流。
-//! BeginInteractiveLogin 只定义接口（#10 实现）；Map 增量推送与断线重连在 #6。
+//! gRPC 服务：挑战签发与校验、Auth Key 注册、协议版本闸门、Network Map 下发流。
+//! BeginInteractiveLogin 只定义接口（#10 实现）；下发流的登记在 [`crate::map_stream`]。
 
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -10,51 +11,79 @@ use hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION;
 use hz_proto::coord_server::{Coord, CoordServer};
 use hz_proto::{
     BeginLoginRequest, BeginLoginResponse, HelloRequest, HelloResponse, NetworkMapMessage,
-    NodeInfo, RegisterAuthKeyRequest, RegisterResponse, StreamMapRequest,
+    RegisterAuthKeyRequest, RegisterResponse, StreamMapRequest,
 };
-use sqlx::SqlitePool;
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 
-use crate::addr::AddressConfig;
 use crate::challenge::{CHALLENGE_TTL, ChallengeCache};
-use crate::store::{NodeRecord, Store};
+use crate::map_stream::{MapHub, MapPushConfig, node_info_from, run_fan_out};
+use crate::store::Store;
 
-/// Network Map 快照重发间隔。既是保活，也让对端看到迟注册的 Node；
-/// 事件式推送（MapDelta）在 #6 实现。
-const MAP_REFRESH: Duration = Duration::from_secs(30);
+/// 下发流空差量保活间隔（FR-6 长连接）。
+const MAP_KEEPALIVE: Duration = Duration::from_secs(30);
+/// 全量重建间隔：接住到期跨越等没有 notify 信号的写入。
+const MAP_SWEEP: Duration = Duration::from_secs(60);
 
 pub struct ServeConfig {
-    pub pool: SqlitePool,
-    pub addr: AddressConfig,
+    /// 同一个 Store 实例（克隆共享变更信号）：serve 侧与调用侧的写入
+    /// 都要能唤醒 Map 推送任务。
+    pub store: Store,
     pub listen: SocketAddr,
     pub tls: Option<ServerTlsConfig>,
-    pub map_refresh: Duration,
+    pub map_keepalive: Duration,
+    pub map_sweep: Duration,
 }
 
 impl ServeConfig {
-    pub fn new(pool: SqlitePool, listen: SocketAddr) -> Self {
+    pub fn new(store: Store, listen: SocketAddr) -> Self {
         Self {
-            pool,
-            addr: AddressConfig::default(),
+            store,
             listen,
             tls: None,
-            map_refresh: MAP_REFRESH,
+            map_keepalive: MAP_KEEPALIVE,
+            map_sweep: MAP_SWEEP,
+        }
+    }
+}
+
+/// 已建连接的登记表：shutdown 时对每条连接直接 RST/FIN。
+/// 光停 listener 杀不掉已建立的 gRPC 长连接，Map 流会一直挂着。
+#[derive(Default)]
+struct LiveConnections(StdMutex<Vec<std::net::TcpStream>>);
+
+impl LiveConnections {
+    fn track(&self, stream: &tokio::net::TcpStream) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // dup 出独立描述符；tonic 继续持有原流，关闭动作只作用在副本上。
+        let duplicate = unsafe { libc::dup(stream.as_raw_fd()) };
+        if duplicate >= 0 {
+            let raw = unsafe { std::net::TcpStream::from_raw_fd(duplicate) };
+            self.0.lock().expect("live connections poisoned").push(raw);
+        }
+    }
+
+    fn close_all(&self) {
+        for stream in self.0.lock().expect("live connections poisoned").drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
         }
     }
 }
 
 pub struct ServeHandle {
     pub local_addr: SocketAddr,
+    connections: Arc<LiveConnections>,
     shutdown: tokio::sync::watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    fan_out: tokio::task::JoinHandle<()>,
 }
 
 impl ServeHandle {
     pub fn shutdown(&self) {
+        self.connections.close_all();
         let _ = self.shutdown.send(true);
+        self.fan_out.abort();
     }
 
     pub async fn terminated(self) {
@@ -63,26 +92,39 @@ impl ServeHandle {
 }
 
 pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
-    let map_refresh = config.map_refresh;
-    let store = Store::from_pool(config.pool, config.addr).await?;
+    let store = config.store;
+    let hub = Arc::new(MapHub::new());
     let service = CoordServiceImpl {
-        store,
+        store: store.clone(),
         challenges: ChallengeCache::new(),
-        map_refresh,
+        map_hub: hub.clone(),
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let fan_out = tokio::spawn(run_fan_out(
+        store,
+        hub,
+        MapPushConfig {
+            keepalive_every: config.map_keepalive,
+            sweep_every: config.map_sweep,
+        },
+    ));
 
     let mut server = tonic::transport::Server::builder();
     if let Some(tls) = config.tls {
         server = server.tls_config(tls)?;
     }
     let router = server.add_service(CoordServer::new(service));
+    let connections = Arc::new(LiveConnections::default());
+    let tracked = {
+        let connections = connections.clone();
+        TcpListenerStreamMapped::new(listener, connections)
+    };
     let join = tokio::spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         tokio::select! {
-            result = router.serve_with_incoming(incoming) => {
+            result = router.serve_with_incoming(tracked) => {
                 if let Err(error) = result {
                     tracing::error!(%error, "coord grpc server exited with error");
                 }
@@ -95,15 +137,52 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     tracing::info!(%local_addr, "coord grpc server listening");
     Ok(ServeHandle {
         local_addr,
+        connections,
         shutdown: shutdown_tx,
         join,
+        fan_out,
     })
+}
+
+/// 每条已接受的连接登记进 LiveConnections 后原样交给 tonic。
+struct TcpListenerStreamMapped {
+    listener: tokio::net::TcpListener,
+    connections: Arc<LiveConnections>,
+}
+
+impl TcpListenerStreamMapped {
+    fn new(listener: tokio::net::TcpListener, connections: Arc<LiveConnections>) -> Self {
+        Self {
+            listener,
+            connections,
+        }
+    }
+}
+
+impl tokio_stream::Stream for TcpListenerStreamMapped {
+    type Item = std::io::Result<tokio::net::TcpStream>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // TcpListener 是 Unpin 的，这里可以直接拿可变引用。
+        let this = self.get_mut();
+        match this.listener.poll_accept(cx) {
+            std::task::Poll::Ready(Ok((stream, _))) => {
+                this.connections.track(&stream);
+                std::task::Poll::Ready(Some(Ok(stream)))
+            }
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Some(Err(error))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 struct CoordServiceImpl {
     store: Store,
     challenges: ChallengeCache,
-    map_refresh: Duration,
+    map_hub: Arc<MapHub>,
 }
 
 impl CoordServiceImpl {
@@ -114,20 +193,6 @@ impl CoordServiceImpl {
                  {MIN_SUPPORTED_PROTOCOL_VERSION}，请升级 hzd 后重试"
             ))
         })
-    }
-}
-
-fn node_info_from(record: NodeRecord) -> NodeInfo {
-    NodeInfo {
-        node_id: record.id,
-        name: record.name,
-        ipv4: record.ipv4.to_string(),
-        ipv6: record.ipv6.to_string(),
-        tags: record.tags,
-        owner_user: record.owner_user,
-        expires_at_unix: record.expires_at_unix,
-        node_key_pub: record.node_key_pub,
-        endpoints: record.udp_endpoints,
     }
 }
 
@@ -295,34 +360,9 @@ impl Coord for CoordServiceImpl {
             tracing::info!(node_id = %record.id, ?endpoints, "node endpoints updated");
         }
 
-        // 打开发一份全量快照，然后周期性重发快照兼作保活；流保持打开。
-        // 接收端断开时 send 失败，任务随之结束。
-        let (tx, rx) = mpsc::channel(4);
-        let store = self.store.clone();
-        let refresh = self.map_refresh;
-        tokio::spawn(async move {
-            loop {
-                let nodes = match store.network_map().await {
-                    Ok(nodes) => nodes,
-                    Err(error) => {
-                        tracing::error!(%error, "build network map failed");
-                        break;
-                    }
-                };
-                let message = NetworkMapMessage {
-                    kind: Some(hz_proto::network_map_message::Kind::Full(
-                        hz_proto::NetworkMap {
-                            nodes: nodes.into_iter().map(node_info_from).collect(),
-                        },
-                    )),
-                };
-                if tx.send(Ok(message)).await.is_err() {
-                    tracing::debug!("map stream receiver dropped");
-                    break;
-                }
-                tokio::time::sleep(refresh).await;
-            }
-        });
+        // 打开即登记进推送枢纽；首条全量快照与后续差量都由 fan-out 任务按序投递，
+        // 接收端断开时投递失败、登记随之移除。
+        let rx = self.map_hub.register(record.id.clone());
         tracing::info!(node_id = %record.id, "network map stream opened");
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }

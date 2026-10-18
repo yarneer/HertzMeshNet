@@ -28,7 +28,7 @@ async fn daemon_subscribes_to_map_and_lists_peers_after_up() {
         .await
         .unwrap();
     let handle = serve(ServeConfig::new(
-        store.pool().clone(),
+        store.clone(),
         "127.0.0.1:0".parse().unwrap(),
     ))
     .await

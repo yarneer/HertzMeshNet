@@ -41,7 +41,7 @@ async fn registration_succeeds_over_tls_with_trusted_ca() {
         .await
         .unwrap();
 
-    let mut config = ServeConfig::new(store.pool().clone(), "127.0.0.1:0".parse().unwrap());
+    let mut config = ServeConfig::new(store.clone(), "127.0.0.1:0".parse().unwrap());
     config.tls = Some(
         ServerTlsConfig::new()
             .identity(Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes())),

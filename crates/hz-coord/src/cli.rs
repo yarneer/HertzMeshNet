@@ -88,7 +88,7 @@ async fn run_serve(
         .parse()
         .map_err(|e| anyhow::anyhow!("无效的监听地址 {listen}：{e}"))?;
     let store = Store::open(&db, AddressConfig::default()).await?;
-    let mut config = ServeConfig::new(store.pool().clone(), listen);
+    let mut config = ServeConfig::new(store, listen);
     if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
         let cert = std::fs::read(&cert_path)?;
         let key = std::fs::read(&key_path)?;

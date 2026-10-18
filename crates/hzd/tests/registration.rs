@@ -34,7 +34,7 @@ async fn hz_up_registers_and_survives_restart() {
         .await
         .unwrap();
     let coord = serve(ServeConfig::new(
-        store.pool().clone(),
+        store.clone(),
         "127.0.0.1:0".parse().unwrap(),
     ))
     .await
