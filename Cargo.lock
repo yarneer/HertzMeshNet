@@ -1073,6 +1073,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower-service",
  "tracing",
@@ -1095,6 +1096,23 @@ dependencies = [
 [[package]]
 name = "hz-relay"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ed25519-dalek",
+ "hz-coord",
+ "hz-core",
+ "hz-proto",
+ "rand_core",
+ "rcgen",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "x25519-dalek",
+]
 
 [[package]]
 name = "hzd"

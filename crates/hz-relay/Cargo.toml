@@ -3,3 +3,23 @@ name = "hz-relay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+hz-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+rcgen.workspace = true
+x25519-dalek.workspace = true
+tokio.workspace = true
+tokio-stream = "0.1"
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+hz-coord.workspace = true
+hz-core.workspace = true
+tempfile.workspace = true
