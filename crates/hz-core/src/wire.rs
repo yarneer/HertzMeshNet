@@ -538,12 +538,14 @@ pub struct SocketEngine {
 
 impl SocketEngine {
     /// port 为 0 时由内核分配。实例携带实际绑定地址。
+    /// socket 优先按 IPv6 双栈绑定（v4-mapped 兼容 v4，IPv6 Direct Path 需要
+    /// 同一 socket 收发两个族），内核不支持时退回纯 v4。
     /// socket 绑定到物理出口网卡（FR-7 共存），默认路由被第三方 TUN 类
     /// 网络工具接管时外层收发仍走物理网卡。
     pub async fn bind(own_secret: StaticSecret, port: u16) -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", port))
+        let socket = bind_dual_stack(port)
             .await
-            .with_context(|| format!("bind udp 0.0.0.0:{port} failed"))?;
+            .with_context(|| format!("bind udp :{port} failed"))?;
         crate::netif::bind_to_physical_egress(&socket);
         let local_addr = socket
             .local_addr()
@@ -741,6 +743,35 @@ impl SocketEngine {
         ticker.abort();
         result
     }
+}
+
+/// 单 socket 双栈绑定：先试 [::] 关闭 v6only（v4-mapped 收 v4），失败再退
+/// 纯 v4。打洞与 WireGuard 共用这一个 socket（ADR-0002），IPv6 直连也必须
+/// 落在它上面。
+async fn bind_dual_stack(port: u16) -> anyhow::Result<UdpSocket> {
+    match socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) {
+        Ok(v6) => {
+            if let Err(error) = v6.set_only_v6(false) {
+                tracing::warn!(%error, "disable IPV6_V6ONLY failed, falling back to v4");
+            } else {
+                v6.set_nonblocking(true)?;
+                let addr: std::net::SocketAddr =
+                    format!("[::]:{port}").parse().expect("valid socket addr");
+                if v6.bind(&socket2::SockAddr::from(addr)).is_ok() {
+                    return Ok(UdpSocket::from_std(v6.into())?);
+                }
+                tracing::warn!("bind [::]:{port} failed, falling back to v4 only");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "ipv6 socket unavailable, falling back to v4 only");
+        }
+    }
+    Ok(UdpSocket::bind(("0.0.0.0", port)).await?)
 }
 
 fn forward_to_tunnel(to_tunnel: &mpsc::Sender<Vec<u8>>, packets: Vec<Vec<u8>>) {
