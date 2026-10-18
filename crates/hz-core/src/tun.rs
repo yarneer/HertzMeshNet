@@ -60,6 +60,54 @@ fn ip_args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
+/// 在 hz0 上追加/移除一个辅助 /32 地址（如保留的本地 DNS 应答地址）的
+/// `ip` 命令参数；纯函数，可在无 root 主机上单测。
+pub fn secondary_addr_args(addr: &Ipv4Addr, add: bool) -> Vec<String> {
+    let action = if add { "add" } else { "del" };
+    ip_args(&["addr", action, &format!("{addr}/32"), "dev", DEVICE_NAME])
+}
+
+/// 给 hz0 追加辅助地址。地址已存在（EEXIST）视为成功——重复启动幂等。
+#[cfg(target_os = "linux")]
+pub fn add_secondary_addr(addr: &Ipv4Addr) -> anyhow::Result<()> {
+    let args = secondary_addr_args(addr, true);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_ip(&refs) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("File exists") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 从 hz0 移除辅助地址。地址本来不存在也视为成功——清理路径幂等。
+#[cfg(target_os = "linux")]
+pub fn remove_secondary_addr(addr: &Ipv4Addr) -> anyhow::Result<()> {
+    let args = secondary_addr_args(addr, false);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_ip(&refs) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .to_string()
+                .contains("Cannot assign requested address") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 非 Linux 平台 hz0 尚未落地（#16），辅助地址同样不可用。
+#[cfg(not(target_os = "linux"))]
+pub fn add_secondary_addr(_addr: &Ipv4Addr) -> anyhow::Result<()> {
+    bail!("hz0 辅助地址目前仅支持 Linux；macOS 支持在后续票据实现")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn remove_secondary_addr(_addr: &Ipv4Addr) -> anyhow::Result<()> {
+    bail!("hz0 辅助地址目前仅支持 Linux；macOS 支持在后续票据实现")
+}
+
 /// ULA /48 前缀 = 本机 ULA 地址的前三组。
 fn ula_prefix48(addr: Ipv6Addr) -> String {
     let segments = addr.segments();
@@ -166,5 +214,17 @@ mod tests {
         };
         let joined: Vec<String> = route_args(&cfg).iter().map(|a| a.join(" ")).collect();
         assert!(joined.contains(&"route add 10.200.0.0/16 dev hz0".to_string()));
+    }
+
+    #[test]
+    fn secondary_addr_is_point_to_point_on_hz0() {
+        assert_eq!(
+            secondary_addr_args(&Ipv4Addr::new(100, 96, 0, 53), true).join(" "),
+            "addr add 100.96.0.53/32 dev hz0"
+        );
+        assert_eq!(
+            secondary_addr_args(&Ipv4Addr::new(100, 96, 0, 53), false).join(" "),
+            "addr del 100.96.0.53/32 dev hz0"
+        );
     }
 }

@@ -1105,6 +1105,7 @@ dependencies = [
  "hz-coord",
  "hz-core",
  "hz-proto",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

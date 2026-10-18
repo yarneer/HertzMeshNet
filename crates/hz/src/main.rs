@@ -63,6 +63,9 @@ async fn status(json_output: bool) -> std::process::ExitCode {
             Ok(NodeStatus::Registered(info)) => {
                 println!("已加入 HzNet");
                 print_identity(&info);
+                if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
+                    println!("网内域名后缀：{suffix}");
+                }
                 print_peers(&result);
                 std::process::ExitCode::SUCCESS
             }
