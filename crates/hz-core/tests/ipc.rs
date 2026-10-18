@@ -74,7 +74,15 @@ async fn oversized_line_is_rejected_instead_of_buffered() {
     let mut response = String::new();
     use tokio::io::AsyncReadExt;
     let mut raw = Vec::new();
-    reader.read_to_end(&mut raw).await.unwrap();
+    // 对端因超限断开后，Linux 会给未排干的连接回 ECONNRESET 而非 EOF，
+    // 收下断开前已到达的字节即可，读错误本身也是预期行为。
+    loop {
+        let mut buf = [0u8; 8192];
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+        }
+    }
     server.abort();
     response.push_str(&String::from_utf8_lossy(&raw));
     assert!(
