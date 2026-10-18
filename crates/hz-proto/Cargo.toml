@@ -3,3 +3,12 @@ name = "hz-proto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protox.workspace = true

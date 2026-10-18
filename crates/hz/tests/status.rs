@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hz_core::ipc;
@@ -30,7 +29,7 @@ async fn status_shows_unregistered_against_a_live_daemon_socket() {
         async move {
             ipc::serve(
                 &socket,
-                Arc::new(|_request: ipc::Request| {
+                ipc::handler(|_request: ipc::Request| async {
                     serde_json::to_value(NodeStatus::Unregistered).map_err(|e| e.to_string())
                 }),
             )

@@ -16,16 +16,29 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 hz-core = { path = "crates/hz-core" }
+hz-coord = { path = "crates/hz-coord" }
+hz-proto = { path = "crates/hz-proto" }
 anyhow = "1"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+hostname = "0.4"
+prost = "0.14"
+protox = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }

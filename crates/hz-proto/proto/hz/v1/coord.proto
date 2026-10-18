@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package hz.v1;
+
+// Node 注册与 Network Map 下发的控制面契约。
+// Machine Key 用 ed25519 签挑战；Node Key 是 x25519 数据面公钥。
+
+service Coord {
+  // 获取挑战值。protocol_version 过旧会被拒绝并附升级提示。
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  // 用 Auth Key + 挑战签名完成注册（FR-1）。
+  rpc RegisterWithAuthKey(RegisterAuthKeyRequest) returns (RegisterResponse);
+  // 交互式登录，票据 #10 实现。
+  rpc BeginInteractiveLogin(BeginLoginRequest) returns (BeginLoginResponse);
+  // Network Map 下发流，票据 #6 实现。
+  rpc StreamNetworkMap(StreamMapRequest) returns (stream NetworkMapMessage);
+}
+
+message HelloRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+}
+
+message HelloResponse {
+  bytes challenge_nonce = 1;
+  int64 challenge_expires_unix = 2;
+  string server_version = 3;
+}
+
+message RegisterAuthKeyRequest {
+  bytes challenge_nonce = 1;
+  bytes challenge_signature = 2;
+  string auth_key = 3;
+  bytes node_key_pub = 4;
+}
+
+message RegisterResponse {
+  NodeInfo node = 1;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string name = 2;
+  string ipv4 = 3;
+  string ipv6 = 4;
+  repeated string tags = 5;
+  optional string owner_user = 6;
+  optional int64 expires_at_unix = 7;
+}
+
+message BeginLoginRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+}
+
+message BeginLoginResponse {
+  string login_url = 1;
+  int64 expires_unix = 2;
+}
+
+message StreamMapRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+}
+
+message NetworkMapMessage {
+  oneof kind {
+    NetworkMap full = 1;
+    MapDelta delta = 2;
+  }
+}
+
+message NetworkMap {
+  repeated NodeInfo nodes = 1;
+}
+
+message MapDelta {
+  repeated NodeInfo added_or_updated = 1;
+  repeated string removed_node_ids = 2;
+}

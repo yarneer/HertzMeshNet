@@ -1,8 +1,7 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
-use hz_core::ipc::{self, Request, Response};
+use hz_core::ipc::{self, Request, Response, handler};
 use hz_core::status::NodeStatus;
 use serde_json::json;
 
@@ -25,7 +24,7 @@ async fn status_request_returns_unregistered_payload() {
         async move {
             ipc::serve(
                 &socket,
-                Arc::new(|request: ipc::Request| {
+                handler(|request: ipc::Request| async move {
                     assert_eq!(request.method, "status");
                     serde_json::to_value(NodeStatus::Unregistered).map_err(|e| e.to_string())
                 }),
@@ -47,4 +46,39 @@ async fn status_request_returns_unregistered_payload() {
         }
         Response::Error { error, .. } => panic!("unexpected error response: {error}"),
     }
+}
+
+#[tokio::test]
+async fn oversized_line_is_rejected_instead_of_buffered() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            ipc::serve(
+                &socket,
+                handler(|_request: ipc::Request| async { Ok(json!({})) }),
+            )
+            .await
+        }
+    });
+    wait_for_socket(&socket).await;
+
+    let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    use tokio::io::AsyncWriteExt;
+    let (mut reader, mut writer) = stream.into_split();
+    // 2 MiB 无换行输入：必须在 1 MiB 上限处报错断开，而不是继续吞内存。
+    // 服务端断开后写端可能拿到 broken pipe，属预期。
+    let _ = writer.write_all(&vec![b'a'; 2 * 1024 * 1024]).await;
+
+    let mut response = String::new();
+    use tokio::io::AsyncReadExt;
+    let mut raw = Vec::new();
+    reader.read_to_end(&mut raw).await.unwrap();
+    server.abort();
+    response.push_str(&String::from_utf8_lossy(&raw));
+    assert!(
+        !response.contains("\"result\""),
+        "超限请求不应得到正常响应，实际：{response}"
+    );
 }
