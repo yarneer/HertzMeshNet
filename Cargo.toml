@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hz-proto",
+    "crates/hz-core",
+    "crates/hz-coord",
+    "crates/hz-relay",
+    "crates/hzd",
+    "crates/hz",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+hz-core = { path = "crates/hz-core" }
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
