@@ -14,6 +14,7 @@ use crate::authkey;
 use crate::name::NodeName;
 
 const META_ULA_PREFIX: &str = "ula_prefix";
+const META_RELAY_TOKEN_HASH: &str = "relay_token_hash";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthKeyError {
@@ -303,6 +304,30 @@ impl Store {
         let record = node_by_machine_key(&mut tx, machine_key_pub).await?;
         tx.commit().await?;
         Ok(record)
+    }
+
+    /// 签发 Relay Token：明文只在这里产生并返回一次，库里只落 sha256。
+    /// 重复签发整体替换旧令牌。
+    pub async fn create_relay_token(&self) -> anyhow::Result<String> {
+        let plaintext = authkey::generate_relay_token();
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(META_RELAY_TOKEN_HASH)
+        .bind(authkey::hash(&plaintext))
+        .execute(&self.pool)
+        .await?;
+        Ok(plaintext)
+    }
+
+    /// 当前有效的 Relay Token 哈希；未签发过为 None。
+    pub async fn relay_token_hash(&self) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM meta WHERE key = ?1")
+            .bind(META_RELAY_TOKEN_HASH)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.get::<String, _>("value")))
     }
 }
 

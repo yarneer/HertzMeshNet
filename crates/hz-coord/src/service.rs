@@ -11,12 +11,14 @@ use hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION;
 use hz_proto::coord_server::{Coord, CoordServer};
 use hz_proto::{
     BeginLoginRequest, BeginLoginResponse, HelloRequest, HelloResponse, NetworkMapMessage,
-    RegisterAuthKeyRequest, RegisterResponse, StreamMapRequest,
+    RegisterAuthKeyRequest, RegisterResponse, RelayCheckRequest, RelayCheckResponse,
+    StreamMapRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 
+use crate::authkey;
 use crate::challenge::{CHALLENGE_TTL, ChallengeCache};
 use crate::map_stream::{MapHub, MapPushConfig, node_info_from, run_fan_out};
 use crate::store::Store;
@@ -366,6 +368,95 @@ impl Coord for CoordServiceImpl {
         tracing::info!(node_id = %record.id, "network map stream opened");
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+
+    /// Relay 代理的 Node 身份校验（FR-9）。relay token 与 Machine-Key 挑战签名
+    /// 都是边界输入：任何一项不符都拒绝，不区分具体原因细节以防探测。
+    async fn relay_check_node(
+        &self,
+        request: Request<RelayCheckRequest>,
+    ) -> Result<Response<RelayCheckResponse>, Status> {
+        let req = request.into_inner();
+
+        let expected = self.store.relay_token_hash().await.map_err(|error| {
+            tracing::error!(%error, "lookup relay token hash failed");
+            Status::internal("查询 Relay Token 失败")
+        })?;
+        let token_matches = expected.is_some_and(|hash| {
+            constant_time_eq(authkey::hash(&req.relay_token).as_bytes(), hash.as_bytes())
+        });
+        if !token_matches {
+            tracing::warn!("relay check rejected: invalid relay token");
+            return Ok(Response::new(RelayCheckResponse {
+                valid: false,
+                reason: "Relay Token 无效".to_string(),
+            }));
+        }
+
+        let machine_key_pub: [u8; 32] = match req.machine_key_pub.try_into() {
+            Ok(key) => key,
+            Err(_) => {
+                return Ok(rejected("Machine Key 公钥格式无效"));
+            }
+        };
+        let signature: [u8; 64] = match req.challenge_signature.try_into() {
+            Ok(sig) => sig,
+            Err(_) => return Ok(rejected("挑战签名格式无效")),
+        };
+
+        let Some(record) = self.store.node_by_machine_key(&machine_key_pub).await.map_err(
+            |error| {
+                tracing::error!(%error, "lookup node for relay check failed");
+                Status::internal("查询 Node 失败")
+            },
+        )?
+        else {
+            return Ok(rejected("Node 未注册或已吊销"));
+        };
+        if record.id != req.node_id {
+            return Ok(rejected("node_id 与 Machine Key 不匹配"));
+        }
+        if record
+            .expires_at_unix
+            .is_some_and(|expires| expires <= crate::store::unix_now())
+        {
+            return Ok(rejected("Node 已过期"));
+        }
+
+        let verifying_key = VerifyingKey::from_bytes(&machine_key_pub)
+            .map_err(|_| Status::unauthenticated("签名验证失败：Machine Key 公钥无效"))?;
+        let nonce: [u8; 32] = req
+            .challenge_nonce
+            .try_into()
+            .map_err(|_| Status::invalid_argument("challenge_nonce 必须是 32 字节"))?;
+        if verifying_key
+            .verify(&nonce, &Signature::from_bytes(&signature))
+            .is_err()
+        {
+            return Ok(rejected("签名验证失败"));
+        }
+
+        tracing::info!(node_id = %record.id, "relay check passed");
+        Ok(Response::new(RelayCheckResponse {
+            valid: true,
+            reason: String::new(),
+        }))
+    }
+}
+
+fn rejected(reason: &str) -> Response<RelayCheckResponse> {
+    tracing::warn!(reason, "relay check rejected");
+    Response::new(RelayCheckResponse {
+        valid: false,
+        reason: reason.to_string(),
+    })
+}
+
+/// Relay Token 与库中哈希的定长（sha256 hex，64 字节）比较，不短路。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// 校验并规范化 Endpoint 上报；空列表合法（Node 还没拿到地址）。
@@ -401,5 +492,12 @@ mod tests {
         assert_eq!(parse_endpoints(&[]).unwrap(), Vec::<String>::new());
         assert!(parse_endpoints(&["not-an-endpoint".to_string()]).is_err());
         assert!(parse_endpoints(&["192.168.1.2".to_string()]).is_err());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_length_equal_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

@@ -7,12 +7,20 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 const PREFIX: &str = "hznet.";
+const RELAY_PREFIX: &str = "hzrelay.";
 const KEY_RANDOM_BYTES: usize = 32;
 
 pub fn generate_plaintext() -> String {
     let mut bytes = [0u8; KEY_RANDOM_BYTES];
     OsRng.fill_bytes(&mut bytes);
     format!("{PREFIX}{}", B64URL.encode(bytes))
+}
+
+/// Relay 呈给 Coordination Server 的长启用期共享令牌；库里同样只存 sha256。
+pub fn generate_relay_token() -> String {
+    let mut bytes = [0u8; KEY_RANDOM_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    format!("{RELAY_PREFIX}{}", B64URL.encode(bytes))
 }
 
 pub fn hash(plaintext: &str) -> String {
@@ -49,5 +57,13 @@ mod tests {
         assert_eq!(key.len(), "hznet.".len() + 43); // base64url(32B) 无填充 = 43 字符
         assert_eq!(hash(&key), hash(&key));
         assert_ne!(hash(&key), hash("hznet.different"));
+    }
+
+    #[test]
+    fn relay_token_shape_is_distinct_from_auth_keys() {
+        let token = generate_relay_token();
+        assert!(token.starts_with("hzrelay."));
+        assert_eq!(token.len(), "hzrelay.".len() + 43);
+        assert_ne!(hash(&token), hash(&generate_relay_token()));
     }
 }

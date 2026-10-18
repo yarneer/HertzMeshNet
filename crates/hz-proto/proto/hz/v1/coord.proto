@@ -14,6 +14,9 @@ service Coord {
   rpc BeginInteractiveLogin(BeginLoginRequest) returns (BeginLoginResponse);
   // Network Map 下发流：打开即发全量快照并保持打开；推送更新在票据 #6。
   rpc StreamNetworkMap(StreamMapRequest) returns (stream NetworkMapMessage);
+  // Relay 代理的 Node 身份校验（FR-9）：Relay 呈上 bootstrap 签发的 relay token
+  // 与 Node 的 Machine-Key 挑战签名，Coordination Server 代为验证。
+  rpc RelayCheckNode(RelayCheckRequest) returns (RelayCheckResponse);
 }
 
 message HelloRequest {
@@ -90,4 +93,17 @@ message NetworkMap {
 message MapDelta {
   repeated NodeInfo added_or_updated = 1;
   repeated string removed_node_ids = 2;
+}
+
+message RelayCheckRequest {
+  string relay_token = 1;
+  string node_id = 2;
+  bytes machine_key_pub = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+}
+
+message RelayCheckResponse {
+  bool valid = 1;
+  string reason = 2;
 }

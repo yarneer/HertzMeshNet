@@ -47,6 +47,9 @@ enum Command {
         /// 预绑定 Tag，可多次出现
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// 同时签发 Relay Token（与 Auth Key 一样仅显示一次，供 hz-relay 使用）
+        #[arg(long)]
+        relay_token: bool,
         /// 只输出一行 JSON（脚本友好），不含人类可读说明
         #[arg(long)]
         json: bool,
@@ -70,11 +73,12 @@ pub fn run() -> anyhow::Result<()> {
             auth_key_expiry,
             once,
             tags,
+            relay_token,
             json,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run_bootstrap(db, auth_key_expiry, once, tags, json)),
+            .block_on(run_bootstrap(db, auth_key_expiry, once, tags, relay_token, json)),
     }
 }
 
@@ -107,16 +111,26 @@ async fn run_bootstrap(
     auth_key_expiry: String,
     once: bool,
     tags: Vec<String>,
+    issue_relay_token: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let expires_at_unix = parse_expiry(&auth_key_expiry)?;
     let store = Store::open(&db, AddressConfig::default()).await?;
     let plaintext = store.create_auth_key(expires_at_unix, once, &tags).await?;
+    let relay_token = if issue_relay_token {
+        Some(store.create_relay_token().await?)
+    } else {
+        None
+    };
     if json {
-        println!(
-            "{}",
-            serde_json::json!({"auth_key": plaintext, "expires_at_unix": expires_at_unix})
-        );
+        let mut payload = serde_json::json!({
+            "auth_key": plaintext,
+            "expires_at_unix": expires_at_unix
+        });
+        if let Some(token) = relay_token {
+            payload["relay_token"] = serde_json::Value::String(token);
+        }
+        println!("{payload}");
         return Ok(());
     }
     let expires_at = chrono::DateTime::from_timestamp(expires_at_unix, 0)
@@ -134,6 +148,10 @@ async fn run_bootstrap(
         }
     );
     println!("有效期至：{expires_at}");
+    if let Some(token) = relay_token {
+        println!("Relay Token（仅此一次显示，请立即保存，供 hz-relay 使用）：");
+        println!("{token}");
+    }
     Ok(())
 }
 

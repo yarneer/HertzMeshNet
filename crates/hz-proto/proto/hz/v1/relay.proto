@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package hz.v1;
+
+// Relay 数据面契约（FR-9）：TLS 之上的双向流，按 Node id 寻址转发
+// Node-Key 加密的 WireGuard 数据报。Relay 看不到明文；身份校验由它代理给
+// Coordination Server（见 coord.proto 的 RelayCheckNode）。
+
+service Relay {
+  // 双向流。首帧必须是 RelayHello；校验失败收到一帧 RelayError 后流结束，
+  // 校验通过后只接受 RelayData，入站也只有 RelayData / RelayError。
+  rpc RelayStream(stream RelayFrame) returns (stream RelayFrame);
+}
+
+message RelayFrame {
+  oneof kind {
+    RelayHello hello = 1;
+    RelayData data = 2;
+    RelayError error = 3;
+  }
+}
+
+// 与 Coordination Server 相同的 Machine-Key 挑战语义：nonce 由 Node 自取、
+// Machine Key 签名，Relay 原样转交 Coordination Server 验证。
+message RelayHello {
+  string node_id = 1;
+  bytes node_key_pub = 2;
+  bytes machine_key_pub = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+}
+
+message RelayData {
+  string dst_node_id = 1;
+  bytes payload = 2;
+}
+
+message RelayError {
+  string code = 1;
+  string message = 2;
+}
