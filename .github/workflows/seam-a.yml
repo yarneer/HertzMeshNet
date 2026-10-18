@@ -1,0 +1,65 @@
+name: Seam A (NAT 拓扑)
+
+on:
+  push:
+    branches: [dev, main, "ticket/**"]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+jobs:
+  seam-a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 缓存 cargo registry
+        uses: actions/cache@v4
+        with:
+          path: /tmp/hz-topo-cargo
+          key: hz-topo-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: hz-topo-cargo-
+
+      - name: 构建 topo 镜像
+        run: docker build -t hertzmesh-topo:ci -f scripts/test/Dockerfile.topo scripts/test
+
+      - name: 构建产品二进制
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh build
+
+      - name: NAT 行为自检（selftest）
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh selftest
+
+      - name: Seam A 场景 lan
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run lan
+
+      - name: Seam A 场景 lan-proxysim
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run lan-proxysim
+
+      - name: 保留各 namespace 日志与现场
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hz-topo-artifacts
+          path: /tmp/hz-topo-artifacts
+          if-no-files-found: ignore

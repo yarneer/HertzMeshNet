@@ -1,0 +1,8 @@
+# Seam A NAT 测试拓扑镜像（issue #5）：特权容器内以 netns + nftables 复现 NAT 场景。
+FROM rust:1-bookworm
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      iproute2 nftables iputils-ping python3 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
