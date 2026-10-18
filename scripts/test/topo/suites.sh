@@ -18,7 +18,7 @@ peer_field() { # peer_field <node> <field>（取第一个对端）
 }
 
 start_node_daemon() { # start_node_daemon <node> <auth-key>
-  # 可选 HZD_NODE_ENV 数组：额外注入 hzd 的环境变量（relay 场景用它传
+  # 可选 HZD_NODE_EXTRA：额外注入 hzd 的环境变量串（relay 场景用它传
   # HZD_RELAY_ADDR/HZD_RELAY_CA_PATH/HZD_FORCE_RELAY）；未设置时为空，老场景不受影响。
   local name="$1" key="$2" ns hostname
   ns=$(node_ns "$name"); hostname=$(node_hostname "$name")
@@ -28,7 +28,7 @@ start_node_daemon() { # start_node_daemon <node> <auth-key>
     "echo $hostname > /proc/sys/kernel/hostname; \
      exec env HZD_STATE_DIR=$ART_DIR/state-$name HZD_SOCK_PATH=$ART_DIR/hzd-$name.sock \
        HZD_COORD_ADDR=http://203.0.113.1:443 HZD_WG_PORT=$HZ_WG_PORT \
-       ${HZD_NODE_ENV[@]+"${HZD_NODE_ENV[@]}"} $BIN_DIR/hzd" \
+       ${HZD_NODE_EXTRA:-} $BIN_DIR/hzd" \
     > "$ART_DIR/hz-node-$name.log" 2>&1 &
   local i
   for i in $(seq 1 40); do
@@ -286,9 +286,7 @@ assert_suite_relay() {
   b=$(reg_list | awk -F'|' '$2 == "symmetric" && $1 != "'"$a"'" { print $1; exit }')
   [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 symmetric 节点"; return 1; }
 
-  HZD_NODE_ENV=("HZD_RELAY_ADDR=https://203.0.113.1:$RELAY_PORT" \
-                "HZD_RELAY_CA_PATH=$ART_DIR/relay-ca.pem" \
-                "HZD_FORCE_RELAY=1")
+  HZD_NODE_EXTRA="HZD_RELAY_ADDR=https://203.0.113.1:$RELAY_PORT HZD_RELAY_CA_PATH=$ART_DIR/relay-ca.pem HZD_FORCE_RELAY=1"
   note "[$a/$b] 启动 hzd（HZD_FORCE_RELAY=1，对称 NAT 无直连路径）并注册"
   start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
   start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
@@ -351,6 +349,6 @@ assert_suite_relay() {
     pass "Relay 日志无明文载荷（pattern ${pattern} 未出现）"
   fi
 
-  unset HZD_NODE_ENV
+  unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
 }
