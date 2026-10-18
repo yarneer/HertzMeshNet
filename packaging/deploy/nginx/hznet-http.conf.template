@@ -1,0 +1,52 @@
+# HzNet HTTP 面（安装位置 /etc/nginx/sites-available/hznet）。
+# 80 端口只做 ACME HTTP-01 验证与跳转；coord 的 TLS 终止在 127.0.0.1:8443
+# （由 /etc/nginx/streams-enabled/hznet.conf 的 SNI 分流送进来）。
+#
+# hz-coord 两个本地监听：gRPC 明文 h2（127.0.0.1:50051，grpc_pass 直转）与
+# HTTP 明文（127.0.0.1:8080，/install.sh、/dl/、/oidc/、/healthz）。
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name coord.@DOMAIN@ relay.@DOMAIN@ auth.@DOMAIN@;
+
+    # acme.sh webroot（certs.sh 用）；^~ 防止被下面的跳转吃掉
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type text/plain;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    # listen 形式的 http2 兼容 Debian bookworm 的 nginx 1.22（`http2 on;`
+    # 需要 1.25.1+）
+    listen 127.0.0.1:8443 ssl http2;
+    server_name coord.@DOMAIN@;
+
+    ssl_certificate /etc/hznet/tls/coord/fullchain.pem;
+    ssl_certificate_key /etc/hznet/tls/coord/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # gRPC 面：路径前缀即 proto 的 package+service（hz.v1.Coord）。
+    # TLS 已在 nginx 终止，向上游走明文 h2（grpc://）。
+    location /hz.v1.Coord/ {
+        grpc_pass grpc://127.0.0.1:50051;
+        # Network Map 长连接按数据续期；客户端 20 秒一次 h2 PING 保活
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+    }
+
+    # HTTP 面：/install.sh、/dl/<os>-<arch>/<bin>、/oidc/start|callback、/healthz
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s;
+    }
+}

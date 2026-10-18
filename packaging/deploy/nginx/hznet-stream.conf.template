@@ -1,0 +1,26 @@
+# HzNet 公网 TCP 443 的 SNI 分流（ADR-0004：三个子域名共用 443）。
+# 安装位置 /etc/nginx/streams-enabled/hznet.conf，需要 nginx stream 模块
+# （Debian/Ubuntu：libnginx-mod-stream）与 nginx.conf 里的 stream{} include。
+#
+# 分流目标：
+#   coord.@DOMAIN@ → 127.0.0.1:8443  nginx https vhost 终止 TLS 后分流
+#                                    gRPC（h2c → hz-coord :50051）与 HTTP 面（:8080）
+#   relay.@DOMAIN@ → 127.0.0.1:8444  hz-relay 自行终止 TLS（证书含该子域名）
+#   auth.@DOMAIN@  → 127.0.0.1:8445  Kanidm 自行终止 TLS（Kanidm 要求自带 TLS）
+map $ssl_preread_server_name $hznet_sni_backend {
+    coord.@DOMAIN@    127.0.0.1:8443;
+    relay.@DOMAIN@    127.0.0.1:8444;
+    auth.@DOMAIN@     127.0.0.1:8445;
+    default           127.0.0.1:8443;
+}
+
+server {
+    listen 443;
+    listen [::]:443;
+    ssl_preread on;
+    proxy_pass $hznet_sni_backend;
+    proxy_connect_timeout 5s;
+    # Node 与 Coordination Server 之间是 gRPC 双向长连接（FR-6），Relay 流同样
+    # 长连；客户端每 20 秒发 h2 PING 保活，1 小时的空闲上限远高于保活间隔。
+    proxy_timeout 1h;
+}
