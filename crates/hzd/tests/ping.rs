@@ -25,7 +25,11 @@ struct Side {
 
 async fn side(v4: Ipv4Addr, v6: &str) -> Side {
     let secret = NodeStaticSecret::random_from_rng(OsRng);
-    let engine = SocketEngine::bind(secret.clone(), 0).await.unwrap();
+    // 对端 Endpoint 在回环上，SO_BINDTODEVICE 到物理出口会挡掉收发：
+    // 与 HZD_BIND_EGRESS=0 的开发路径一致，跳过出口绑定。
+    let engine = SocketEngine::bind_with(secret.clone(), 0, false)
+        .await
+        .unwrap();
     Side {
         engine: Arc::new(engine),
         secret,

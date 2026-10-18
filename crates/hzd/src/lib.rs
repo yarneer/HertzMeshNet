@@ -621,7 +621,13 @@ async fn start_dataplane(
         .ok()
         .and_then(|text| text.parse().ok())
         .unwrap_or(0);
-    let engine = Arc::new(SocketEngine::bind(keys.node(), port).await?);
+    // HZD_BIND_EGRESS=0：开发/测试拓扑的对端在回环上，无法从物理出口网卡
+    // 到达（SO_BINDTODEVICE 挡掉 127.0.0.1 收发），显式要求下才跳过绑定。
+    let bind_to_egress = std::env::var("HZD_BIND_EGRESS").ok().as_deref() != Some("0");
+    if !bind_to_egress {
+        tracing::warn!("egress binding disabled by HZD_BIND_EGRESS=0");
+    }
+    let engine = Arc::new(SocketEngine::bind_with(keys.node(), port, bind_to_egress).await?);
     let endpoint = lan_endpoint(coord_addr, engine.local_addr().port()).await?;
     tracing::info!(%endpoint, "reporting lan endpoint");
 

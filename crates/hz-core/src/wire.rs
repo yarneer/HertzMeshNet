@@ -605,10 +605,24 @@ impl SocketEngine {
     /// socket 绑定到物理出口网卡（FR-7 共存），默认路由被第三方 TUN 类
     /// 网络工具接管时外层收发仍走物理网卡。
     pub async fn bind(own_secret: StaticSecret, port: u16) -> anyhow::Result<Self> {
+        Self::bind_with(own_secret, port, true).await
+    }
+
+    /// [`SocketEngine::bind`] 的出口绑定开关版。bind_to_egress=false 时
+    /// socket 不绑物理出口网卡：回环测试拓扑与本地开发的对端无法从物理
+    /// 网卡到达（SO_BINDTODEVICE 会挡掉 127.0.0.1 收发）；生产路径必须
+    /// 保持 true（FR-7 与第三方 TUN 类网络工具共存）。
+    pub async fn bind_with(
+        own_secret: StaticSecret,
+        port: u16,
+        bind_to_egress: bool,
+    ) -> anyhow::Result<Self> {
         let socket = bind_dual_stack(port)
             .await
             .with_context(|| format!("bind udp :{port} failed"))?;
-        crate::netif::bind_to_physical_egress(&socket);
+        if bind_to_egress {
+            crate::netif::bind_to_physical_egress(&socket);
+        }
         let local_addr = socket
             .local_addr()
             .with_context(|| "query udp local addr failed")?;
