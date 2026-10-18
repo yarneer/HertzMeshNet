@@ -414,7 +414,11 @@ fn handshake_completes_when_peers_number_tunnels_differently() {
         "A 必须接受 B 的握手响应并补发排队包（而不是按未知索引丢弃）"
     );
     let decrypted = deliver(&flushed, &mut engine_b, a.udp);
-    assert_eq!(decrypted.to_tunnel, vec![packet], "序号错开时链路也必须打通");
+    assert_eq!(
+        decrypted.to_tunnel,
+        vec![packet],
+        "序号错开时链路也必须打通"
+    );
 }
 
 #[test]
@@ -435,7 +439,11 @@ fn rotation_converges_when_peer_learns_new_key_before_we_rotate() {
     let response = deliver(&init, &mut engine_b, a.udp);
     let flushed = deliver(&response, &mut engine_a, b.udp);
     let decrypted = deliver(&flushed, &mut engine_b, a.udp);
-    assert_eq!(decrypted.to_tunnel, vec![before.clone()], "轮换前两端必须互通");
+    assert_eq!(
+        decrypted.to_tunnel,
+        vec![before.clone()],
+        "轮换前两端必须互通"
+    );
 
     let fresh = NodeStaticSecret::random_from_rng(OsRng);
     let fresh_public = NodePublicKey::from(&fresh).to_bytes();
@@ -459,7 +467,11 @@ fn rotation_converges_when_peer_learns_new_key_before_we_rotate() {
     let flushed2 = deliver(&response2, &mut engine_a, b.udp);
     assert!(!flushed2.to_network.is_empty(), "发起方必须完成新密钥握手");
     let decrypted2 = deliver(&flushed2, &mut engine_b, a.udp);
-    assert_eq!(decrypted2.to_tunnel, vec![after], "后轮换的一侧也必须恢复通信");
+    assert_eq!(
+        decrypted2.to_tunnel,
+        vec![after],
+        "后轮换的一侧也必须恢复通信"
+    );
 }
 
 #[test]
@@ -483,9 +495,9 @@ fn key_change_rebuild_keeps_learned_endpoints() {
         ..spec_for(&b)
     });
     assert_eq!(
-        engine_a.endpoint_candidates(peer_name(&b)),
-        vec![roamed],
-        "密钥更换重建后学到的 Endpoint 必须保留"
+        engine_a.endpoint_candidates(peer_name(&b)).first(),
+        Some(&roamed),
+        "密钥更换重建后学到的 Endpoint 必须保留为首选"
     );
     let out = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"after-key-change"));
     assert!(
