@@ -153,7 +153,8 @@ start_daemon() { # start_daemon <node>
   docker_exec sh -c "ip netns exec hz-node-$1 setsid unshare --uts sh -c \
     'echo $1 > /proc/sys/kernel/hostname; \
      exec env HZD_STATE_DIR=$ART/state-$1 HZD_SOCK_PATH=$ART/hzd-$1.sock \
-       HZD_COORD_ADDR=http://$GATEWAY:$COORD_GRPC HZD_WG_PORT=51820 /out/hzd' \
+       HZD_COORD_ADDR=http://$GATEWAY:$COORD_GRPC HZD_WG_PORT=51820 \
+       RUST_LOG=${HZD_TEST_LOG:-info} /out/hzd' \
     > $ART/hz-node-$1.log 2>&1 < /dev/null &"
   local i
   for i in $(seq 1 40); do
@@ -276,6 +277,8 @@ NOW=$(date +%s)
 [ "$EXPIRY_AFTER" -gt "$NOW" ] && pass "重新登录已续期（expires=$EXPIRY_AFTER > now=${NOW}）" || fail "未续期"
 
 wait_status n2 "'n1' in [p['name'] for p in (d.get('peers') or [])]" "n2：重新登录后 Map 应重新包含 n1" || true
+# n1 重新订阅后要先拿到全量 Map 并重建对端，再给路径建立（重连退避上限 30s）留足窗口。
+wait_status n1 "'n2' in [p['name'] for p in (d.get('peers') or [])]" "n1：重新登录后 Map 应重新包含 n2" || true
 node_ping n1 "$N2_IPV4" >/dev/null 2>&1 && pass "重新登录后 n1 → n2 通信恢复" || fail "重新登录后 n1 → n2 仍不通"
 
 note "结果：PASS=$PASS FAIL=${FAIL}（TTL=${TTL_SECS}s；产物 ${WORK_DIR}）"
