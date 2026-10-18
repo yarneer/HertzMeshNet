@@ -339,19 +339,29 @@ fn relay_datagram_for_unknown_index_is_dropped_silently() {
 }
 
 #[test]
-fn punch_handshake_emits_fresh_initiation_even_with_live_session() {
-    let (_a, _b, mut engine_a, mut _engine_b) = wired_pair();
+fn punch_handshake_yields_init_but_never_resets_in_flight_exchange() {
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+    // 先走完整握手拿到稳定会话（Relay 场景的常态），再验证打洞行为。
+    let packet = udp_v4_packet(a.v4, b.v4, b"session-first");
+    let init = engine_a.send_ip_packet(&packet);
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let _ = deliver(&flushed, &mut engine_b, a.udp);
+
     let datagram = engine_a
-        .punch_handshake(peer_name(&_b))
-        .expect("在册对端必须能生成打洞握手包");
+        .punch_handshake(peer_name(&b))
+        .expect("会话存续且无进行中握手时，打洞必须能发出握手发起包");
     assert_eq!(datagram[0], MSG_HANDSHAKE_INIT);
-    // 会话存续时普通首包不会重新握手，打洞路径必须绕过该限制。
-    let packet = udp_v4_packet(_a.v4, _b.v4, b"keep-session");
-    let _ = engine_a.send_ip_packet(&packet);
-    let again = engine_a.punch_handshake(peer_name(&_b)).unwrap();
-    assert_eq!(again[0], MSG_HANDSHAKE_INIT);
-    assert_ne!(datagram, again, "两次打洞必须是不同的握手实例");
+    // 打洞占用握手槽位后立即再打洞必须让位：返回 None 而不是强制重置，
+    // 否则正在进行的握手交换（如 Relay 侧）会被反复打断、永远无法完成。
+    assert!(engine_a.punch_handshake(peer_name(&b)).is_none());
+    // 打洞产生的发起包仍是合法 WireGuard 报文，对端能应答。
+    let out = engine_a.handle_udp(b.udp, &datagram);
+    let _ = out;
     assert!(engine_a.punch_handshake("stranger").is_none());
+    let response = engine_b.handle_udp(a.udp, &datagram);
+    assert_eq!(response.to_network.len(), 1, "对端必须回应打洞握手");
+    assert_eq!(response.to_network[0].datagram[0], MSG_HANDSHAKE_RESPONSE);
 }
 
 #[test]

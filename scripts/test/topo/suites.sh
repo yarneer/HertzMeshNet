@@ -419,8 +419,9 @@ pick_two() { # pick_two <attachment>：按 attachment 取两个节点名
 
 assert_suite_direct() {
   local a b b4 b6 a4 a6
-  read -r a b <<<"$(pick_two fullcone)"
-  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 fullcone 节点"; return 1; }
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
 
   start_pair_with_relay "$a" "$b" || return 1
   wait_pair_mutual_view "$a" "$b" || return 1
@@ -443,12 +444,13 @@ assert_suite_direct() {
   wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 60 || return 1
   local wan_a ext_a wan_b ext_b
   wan_a="203.0.113.1$(nat_num_of fullcone)"
-  wan_b="$wan_a"
+  wan_b="203.0.113.1$(nat_num_of portrestricted)"
   ext_a=$(reg_field "$a" 5); ext_b=$(reg_field "$b" 5)
-  grep -q "mapped=$wan_a:$ext_a " "$ART_DIR/hz-node-$a.log" \
+  # 日志行带 ANSI 颜色码，直接匹配 "值+空格"（字段值后即消息文本）。
+  grep -q "$wan_a:$ext_a$" "$ART_DIR/hz-node-$a.log" \
     && pass "$a：STUN Endpoint = $wan_a:$ext_a（静态映射端口）" \
     || fail "$a：STUN Endpoint 与静态映射不符（期望 $wan_a:$ext_a）：$(grep 'stun mapped' "$ART_DIR/hz-node-$a.log" | tail -1)"
-  grep -q "mapped=$wan_b:$ext_b " "$ART_DIR/hz-node-$b.log" \
+  grep -q "$wan_b:$ext_b$" "$ART_DIR/hz-node-$b.log" \
     && pass "$b：STUN Endpoint = $wan_b:$ext_b（静态映射端口）" \
     || fail "$b：STUN Endpoint 与静态映射不符（期望 $wan_b:$ext_b）：$(grep 'stun mapped' "$ART_DIR/hz-node-$b.log" | tail -1)"
 
@@ -542,8 +544,9 @@ assert_suite_symsym() {
 # ---------------------------------------------------------------------------
 assert_suite_v6pair() {
   local a b b4 b6 a4 a6 a_ns b_ns
-  read -r a b <<<"$(pick_two fullcone)"
-  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 fullcone 节点"; return 1; }
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
   a_ns=$(node_ns "$a"); b_ns=$(node_ns "$b")
 
   note "前置：双方 eth0 各有 2001:db8::/32 全球单播地址且互通"
@@ -570,8 +573,8 @@ assert_suite_v6pair() {
   ping_assert "$b" "$a6" "$b → $a IPv6（$a6）" -6
 
   note "断言 2：双方选择 IPv6 Direct Path（日志 path=direct 的 endpoint 落在 2001:db8::/32）"
-  wait_for_log "$ART_DIR/hz-node-$a.log" "2001:db8.*path=direct" "$a 以 IPv6 直连" 90 || return 1
-  wait_for_log "$ART_DIR/hz-node-$b.log" "2001:db8.*path=direct" "$b 以 IPv6 直连" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct.*2001:db8" "$a 以 IPv6 直连" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct.*2001:db8" "$b 以 IPv6 直连" 90 || return 1
 
   note "断言 3：v4 STUN Endpoint 仍被发现（IPv6 优先不排斥 v4 候选）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 60 || return 1
@@ -588,8 +591,9 @@ assert_suite_v6pair() {
 # ---------------------------------------------------------------------------
 assert_suite_blockfallback() {
   local a b b4 a4 natnum before_a before_b after_a after_b
-  read -r a b <<<"$(pick_two fullcone)"
-  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 fullcone 节点"; return 1; }
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
 
   start_pair_with_relay "$a" "$b" || return 1
   wait_pair_mutual_view "$a" "$b" || return 1
@@ -599,7 +603,7 @@ assert_suite_blockfallback() {
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
 
   note "人为阻断：在 $b 的 NAT 上丢弃双向 WG 端口流量（Relay 的 TCP 不受影响）"
-  natnum=$(nat_num_of fullcone)
+  natnum=$(nat_num_of "$(reg_field "$b" 2)")
   ip netns exec "hz-nat$natnum" nft insert rule ip "hz-nat$natnum" filterin udp dport "$HZ_WG_PORT" drop
   ip netns exec "hz-nat$natnum" nft insert rule ip "hz-nat$natnum" filterin udp sport "$HZ_WG_PORT" drop
   pass "已在 hz-nat$natnum 的 forward 链首插入 udp port $HZ_WG_PORT 双向 drop"
@@ -633,8 +637,9 @@ assert_suite_blockfallback() {
 # ---------------------------------------------------------------------------
 assert_suite_proxysim() {
   local a b b4 a4 ns stun_line expected
-  read -r a b <<<"$(pick_two fullcone)"
-  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 fullcone 节点"; return 1; }
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个（两种锥形 NAT）"; return 1; }
   ns=$(node_ns "$a")
 
   # 黑洞先于 hzd 安装：此后的一切观测（STUN、直连）都在接管默认路由的

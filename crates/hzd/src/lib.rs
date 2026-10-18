@@ -700,8 +700,9 @@ async fn handle_punch_frame(
                 }
             }
             PunchMessage::Ack { chosen } => {
+                // Ack 只确认对端已朝我们的候选出洞；不再额外触发握手，
+                // 避免反复强制重置 boringtun 的进行中握手（ Relay 会话会被饿死）。
                 tracing::info!(node_id = %peer.endpoints.node_id, %chosen, "punch ack received");
-                engine.send_punch(&peer.endpoints.node_id).await;
             }
         }
         return;
@@ -929,11 +930,8 @@ fn peer_spec(node: &MapNode, use_relay: &HashMap<String, bool>) -> Option<PeerSp
         endpoints,
         dst_addrs: vec![ipv4, ipv6],
         // 默认走 Relay（FR-8 连通优先），路径管理打洞成功后切直连；
-        // HZD_FORCE_RELAY=1 钉死 Relay（拓扑测试的确定性逃生口）。
-        use_relay: use_relay
-            .get(&node.node_id)
-            .copied()
-            .unwrap_or_else(force_relay),
+        // HZD_FORCE_RELAY=1 在事件应用处把一切直连决定压回 Relay。
+        use_relay: use_relay.get(&node.node_id).copied().unwrap_or(true),
     })
 }
 

@@ -13,6 +13,9 @@
 #   HZ_WG_PORT   Node UDP 端口（兼作锥形 NAT 的静态映射端口）
 #   HZ_WAN_V6    1 则给 wan 平面与各 Node 配全球单播 IPv6（2001:db8::/32，
 #                纯路由无 NAT），供 IPv6 Direct Path 场景用；默认 0，老场景不受影响
+#   HZ_ISOLATE_LANPEERS 1 则把 NAT 内侧的 Node 桥端口设为 isolated：同类型 NAT
+#                的多个 Node 不能经内桥 L2 直达（等价于各自独立的 NAT 设备），
+#                直连只能走真正的 NAT 穿越；默认 0，老场景不受影响
 set -uo pipefail
 
 TOPO_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -56,7 +59,7 @@ load_scenario() {
   local name="$1"
   local file="$TOPO_DIR/scenarios/$name.env"
   [[ -f $file ]] || die "场景不存在：$file"
-  HZ_NODES=""; HZ_ASSERT="none"; HZ_COORD=0; HZ_RELAY=0; HZ_REFLECTOR=0; HZ_PROXY_SIM=0; HZ_WG_PORT=51820; HZ_WAN_V6=0
+  HZ_NODES=""; HZ_ASSERT="none"; HZ_COORD=0; HZ_RELAY=0; HZ_REFLECTOR=0; HZ_PROXY_SIM=0; HZ_WG_PORT=51820; HZ_WAN_V6=0; HZ_ISOLATE_LANPEERS=0
   # shellcheck disable=SC1090
   source "$file"
   [[ -n $HZ_NODES ]] || die "场景 $name 未声明 HZ_NODES"
@@ -289,6 +292,9 @@ create_nodes() {
       ip link set hz-v-tmp netns "$ns"
       ip link set "$peer" netns "hz-nat$num"
       ip -n "hz-nat$num" link set "$peer" master hz-br-in up
+      if [[ $HZ_ISOLATE_LANPEERS == 1 ]]; then
+        ip netns exec "hz-nat$num" bridge link set dev "$peer" isolated on
+      fi
     fi
     ip -n "$ns" link set hz-v-tmp name eth0
     ip -n "$ns" addr add "$ipaddr/24" dev eth0

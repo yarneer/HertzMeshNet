@@ -420,13 +420,15 @@ impl Engine {
             .collect()
     }
 
-    /// 强制生成一个新的握手发起包（打洞包）：从共享 socket 发往对端候选，
-    /// 同时打开双方 NAT 映射。对端不在册或生成失败返回 None。
+    /// 生成一个握手发起包（打洞包）：从共享 socket 发往对端候选，
+    /// 同时打开双方 NAT 映射。不强制重发——进行中的握手（例如 Relay 侧正在
+    /// 完成的那个）不能被反复重置，否则对称 NAT 场景下 Relay 会话永远建立
+    /// 不起来。对端不在册、或握手进行中返回 None。
     pub fn punch_handshake(&mut self, node_id: &str) -> Option<Vec<u8>> {
         let mut scratch = vec![0u8; MAX_DATAGRAM];
         let datagram = {
             let peer = self.peers.get_mut(node_id)?;
-            match peer.tunn.format_handshake_initiation(&mut scratch, true) {
+            match peer.tunn.format_handshake_initiation(&mut scratch, false) {
                 TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
                 _ => return None,
             }

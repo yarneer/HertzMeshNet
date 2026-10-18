@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 /// 必须大于引擎的保活间隔（8s），否则空闲直连会被误判为失效。
 pub const DIRECT_RX_FRESH: Duration = Duration::from_secs(10);
 
-/// 打洞重试起步间隔与上限：Relayed 状态下按此节奏重试升级。
-const RETRY_START: Duration = Duration::from_secs(2);
+/// 打洞重试起步间隔与上限：Relayed 状态下按此节奏重试升级。起步值给
+/// Relay 侧握手留出完成时间——过密的强制握手会反复重置进行中的会话。
+const RETRY_START: Duration = Duration::from_secs(3);
 const RETRY_CAP: Duration = Duration::from_secs(30);
 
 /// Network Map 里一个对端的候选 Endpoint，按来源分组。
@@ -223,13 +224,13 @@ mod tests {
         assert!(!manager.is_direct(id));
         // 退避期内的推进不再重试；窗口过后才再次发信令。
         let during_backoff = manager.tick(
-            start + DIRECT_RX_FRESH + Duration::from_secs(2),
+            start + DIRECT_RX_FRESH + Duration::from_secs(1),
             &[endpoints(id)],
             &ages(id, Some(60)),
         );
         assert!(during_backoff.is_empty());
         let after_backoff = manager.tick(
-            start + DIRECT_RX_FRESH + Duration::from_secs(3),
+            start + DIRECT_RX_FRESH + RETRY_START + Duration::from_secs(1),
             &[endpoints(id)],
             &ages(id, Some(60)),
         );
