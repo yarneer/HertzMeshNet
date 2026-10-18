@@ -9,5 +9,6 @@ pub mod login;
 pub mod map_stream;
 pub mod name;
 pub mod oidc;
+pub mod policy;
 pub mod service;
 pub mod store;

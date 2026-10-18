@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hz-core.workspace = true
 hz-proto.workspace = true
 anyhow.workspace = true
 axum.workspace = true
@@ -19,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = "0.1"
@@ -27,7 +29,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-hz-core.workspace = true
 rcgen.workspace = true
-tempfile.workspace = true
 x25519-dalek.workspace = true

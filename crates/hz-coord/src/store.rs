@@ -15,6 +15,7 @@ use crate::name::NodeName;
 
 const META_ULA_PREFIX: &str = "ula_prefix";
 const META_RELAY_TOKEN_HASH: &str = "relay_token_hash";
+const META_POLICY_CURRENT_VERSION: &str = "policy_current_version";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthKeyError {
@@ -103,6 +104,9 @@ pub struct Store {
     /// 影响 Network Map 的变更信号；注册/Endpoint/吊销路径提交后递增，
     /// 推送任务在其上等待并计算差量。
     changes: tokio::sync::watch::Sender<u64>,
+    /// 测试临时目录（[`Store::open_in_memory`]）；随最后一个克隆存活。
+    #[allow(dead_code)]
+    temp: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 
 impl Store {
@@ -121,13 +125,26 @@ impl Store {
         Self::from_pool(pool, addr).await
     }
 
-    /// 内存库给测试用：连接池必须收敛到 1 条连接，否则每条连接各见一个空库。
+    /// 测试用库：临时文件承载（不是 `sqlite::memory:`）。文件库在连接被
+    /// 摧毁后重建仍读到同一份数据；内存库则会变成空库——fan-out 任务被
+    /// abort 时可能正持有唯一连接，那之后的任何查询都会失败。
     pub async fn open_in_memory(addr: AddressConfig) -> anyhow::Result<Self> {
+        let dir = tempfile::tempdir()?;
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+            .max_connections(5)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(dir.path().join("test.db"))
+                    .create_if_missing(true),
+            )
             .await?;
-        Self::from_pool(pool, addr).await
+        let store = Self::from_pool(pool, addr).await?;
+        Ok(Self {
+            pool: store.pool,
+            addr: store.addr,
+            changes: store.changes,
+            temp: Some(std::sync::Arc::new(dir)),
+        })
     }
 
     pub async fn from_pool(pool: SqlitePool, addr: AddressConfig) -> anyhow::Result<Self> {
@@ -137,6 +154,7 @@ impl Store {
             pool,
             addr,
             changes,
+            temp: None,
         })
     }
 
@@ -454,6 +472,129 @@ impl Store {
             .await?;
         Ok(record)
     }
+
+    // ------------------------------------------------------------------
+    // Policy（FR-10）：版本历史 + 当前版本指针。写入路径只管存，
+    // 校验（语法 + 引用存在性）在服务层落库前完成。
+    // ------------------------------------------------------------------
+
+    /// 入库新版本并指向它；版本号由 AUTOINCREMENT 分配。
+    /// 唤醒 Map 推送任务重算每个订阅者的过滤视图。
+    pub async fn push_policy(&self, content: &str) -> anyhow::Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let result =
+            sqlx::query("INSERT INTO policy_versions (content, created_at_unix) VALUES (?1, ?2)")
+                .bind(content)
+                .bind(unix_now())
+                .execute(&mut *tx)
+                .await?;
+        let version = result.last_insert_rowid();
+        set_current_policy_version(&mut tx, version).await?;
+        tx.commit().await?;
+        self.notify_change();
+        tracing::info!(version, "policy version stored");
+        Ok(version)
+    }
+
+    /// 指向一个已存在的版本；内容不变（回滚不产生新版本）。
+    pub async fn rollback_policy(&self, version: i64) -> anyhow::Result<()> {
+        let exists = sqlx::query("SELECT 1 FROM policy_versions WHERE version = ?1")
+            .bind(version)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            anyhow::bail!("版本 {version} 不存在");
+        }
+        let mut tx = self.pool.begin().await?;
+        set_current_policy_version(&mut tx, version).await?;
+        tx.commit().await?;
+        self.notify_change();
+        tracing::info!(version, "policy rolled back");
+        Ok(())
+    }
+
+    /// 当前 Policy 原文与版本号；从未推送过为 None。
+    pub async fn current_policy(&self) -> anyhow::Result<Option<(i64, String)>> {
+        let Some(version) = self.current_policy_version().await? else {
+            return Ok(None);
+        };
+        let content = self
+            .policy_version_content(version)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("meta 指向的 Policy 版本 {version} 缺失"))?;
+        Ok(Some((version, content)))
+    }
+
+    /// 全部历史版本（含当前），按版本号倒序。
+    pub async fn policy_history(&self) -> anyhow::Result<Vec<PolicyVersionRow>> {
+        let rows = sqlx::query(
+            "SELECT version, created_at_unix FROM policy_versions ORDER BY version DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| PolicyVersionRow {
+                version: row.get("version"),
+                created_at_unix: row.get("created_at_unix"),
+            })
+            .collect())
+    }
+
+    pub async fn policy_version_content(&self, version: i64) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query("SELECT content FROM policy_versions WHERE version = ?1")
+            .bind(version)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.get("content")))
+    }
+
+    async fn current_policy_version(&self) -> anyhow::Result<Option<i64>> {
+        let row = sqlx::query("SELECT value FROM meta WHERE key = ?1")
+            .bind(META_POLICY_CURRENT_VERSION)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|row| row.get::<String, _>("value").parse().ok()))
+    }
+
+    /// users 表里的全部 User 名（Policy 引用存在性校验用）。
+    pub async fn user_names(&self) -> anyhow::Result<HashSet<String>> {
+        let rows = sqlx::query("SELECT name FROM users")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|row| row.get("name")).collect())
+    }
+
+    /// 按名字查 Admin 身份；User 不存在为 None。
+    pub async fn user_is_admin(&self, name: &str) -> anyhow::Result<Option<bool>> {
+        let row = sqlx::query("SELECT is_admin FROM users WHERE name = ?1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.get::<i64, _>("is_admin") != 0))
+    }
+}
+
+async fn set_current_policy_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    version: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(META_POLICY_CURRENT_VERSION)
+    .bind(version.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// 历史版本条目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVersionRow {
+    pub version: i64,
+    pub created_at_unix: i64,
 }
 
 fn store_broken(error: sqlx::Error, fallback: AuthKeyError) -> AuthKeyError {

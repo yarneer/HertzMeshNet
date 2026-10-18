@@ -3,6 +3,7 @@ use hz_core::coord_client::DEFAULT_COORD_ADDR;
 use hz_core::ipc::{self, Request, Response};
 use hz_core::paths;
 use hz_core::status::{NodeStatus, RegisteredInfo};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "hz", version, about = "HzNet 命令行工具")]
@@ -34,6 +35,27 @@ enum Command {
         #[arg(long)]
         coord: Option<String>,
     },
+    /// Policy 管理（FR-10：push 整份替换 / get 查看 / rollback 回滚）
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// 推送一份 TOML Policy（整份替换，校验失败整份拒绝）
+    Push {
+        /// TOML Policy 文件路径
+        file: PathBuf,
+    },
+    /// 查看当前 Policy 与历史版本
+    Get,
+    /// 回滚到指定历史版本
+    Rollback {
+        /// 目标版本号（hz policy get 的历史列表里查）
+        version: i64,
+    },
 }
 
 #[tokio::main]
@@ -43,7 +65,88 @@ async fn main() -> std::process::ExitCode {
         Command::Status { json } => status(json).await,
         Command::Up { auth_key, coord } => up(auth_key, coord).await,
         Command::Login { coord } => up(None, coord).await,
+        Command::Policy { command } => policy(command).await,
     }
+}
+
+/// Policy 子命令：统一经本地 hzd 转发（挑战认证用本 Node 的 Machine Key）。
+async fn policy(command: PolicyCommand) -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = match &command {
+        PolicyCommand::Push { file } => {
+            let content = match std::fs::read_to_string(file) {
+                Ok(content) => content,
+                Err(error) => {
+                    eprintln!("读取 Policy 文件失败：{}：{error}", file.display());
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            Request::new(4, "policy_push", serde_json::json!({ "content": content }))
+        }
+        PolicyCommand::Get => Request::new(5, "policy_get", serde_json::json!({})),
+        PolicyCommand::Rollback { version } => Request::new(
+            6,
+            "policy_rollback",
+            serde_json::json!({ "version": version }),
+        ),
+    };
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = match response {
+        Response::Ok { result, .. } => result,
+        Response::Error { error, .. } => {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match &command {
+        PolicyCommand::Push { .. } => {
+            println!(
+                "推送成功，当前版本：{}",
+                result["version"].as_i64().unwrap_or(0)
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        PolicyCommand::Rollback { version } => {
+            println!("已回滚到版本 {version}");
+            std::process::ExitCode::SUCCESS
+        }
+        PolicyCommand::Get => print_policy(&result),
+    }
+}
+
+fn print_policy(result: &serde_json::Value) -> std::process::ExitCode {
+    let version = result["version"].as_i64().unwrap_or(0);
+    if version == 0 {
+        println!("尚无 Policy（全部 Node 全互通；推送第一份 Policy 后开始过滤）");
+        return std::process::ExitCode::SUCCESS;
+    }
+    println!("当前 Policy（版本 {version}）：");
+    println!("{}", result["content"].as_str().unwrap_or_default());
+    println!("历史版本：");
+    let mut history = result["history"].as_array().cloned().unwrap_or_default();
+    history.sort_by_key(|entry| entry["version"].as_i64().unwrap_or(0));
+    for entry in history.iter().rev() {
+        let entry_version = entry["version"].as_i64().unwrap_or(0);
+        let created = entry["created_at_unix"]
+            .as_i64()
+            .and_then(|unix| chrono::DateTime::from_timestamp(unix, 0))
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "?".to_string());
+        let marker = if entry_version == version {
+            "（当前）"
+        } else {
+            ""
+        };
+        println!("  {entry_version}  {created}{marker}");
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 async fn status(json_output: bool) -> std::process::ExitCode {
