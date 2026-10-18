@@ -93,7 +93,7 @@ pub fn run() -> anyhow::Result<()> {
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run_serve(
+            .block_on(run_serve(ServeArgs {
                 db,
                 listen,
                 tls_cert,
@@ -105,7 +105,7 @@ pub fn run() -> anyhow::Result<()> {
                 oidc_redirect_uri,
                 oidc_ca,
                 login_node_ttl_days,
-            )),
+            })),
         Command::Bootstrap {
             db,
             auth_key_expiry,
@@ -119,7 +119,8 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
-async fn run_serve(
+/// serve 子命令的参数集合；run_serve 只接收这一个参数。
+struct ServeArgs {
     db: PathBuf,
     listen: String,
     tls_cert: Option<PathBuf>,
@@ -131,7 +132,22 @@ async fn run_serve(
     oidc_redirect_uri: Option<String>,
     oidc_ca: Option<PathBuf>,
     login_node_ttl_days: i64,
-) -> anyhow::Result<()> {
+}
+
+async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+    let ServeArgs {
+        db,
+        listen,
+        tls_cert,
+        tls_key,
+        http_listen,
+        oidc_issuer,
+        oidc_client_id,
+        oidc_client_secret,
+        oidc_redirect_uri,
+        oidc_ca,
+        login_node_ttl_days,
+    } = args;
     let listen: std::net::SocketAddr = listen
         .parse()
         .map_err(|e| anyhow::anyhow!("无效的监听地址 {listen}：{e}"))?;
@@ -163,8 +179,7 @@ async fn run_serve(
             .ok_or_else(|| anyhow::anyhow!("配置了 OIDC 但缺少 --http-listen"))?
             .parse()
             .map_err(|e| anyhow::anyhow!("无效的 HTTP 监听地址：{e}"))?;
-        let ca_cert =
-            oidc_ca.or_else(|| env_value("HZ_COORD_OIDC_CA").map(|path| PathBuf::from(path)));
+        let ca_cert = oidc_ca.or_else(|| env_value("HZ_COORD_OIDC_CA").map(PathBuf::from));
         let issuer: reqwest::Url = issuer
             .as_deref()
             .unwrap()

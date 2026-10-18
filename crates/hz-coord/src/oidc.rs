@@ -110,9 +110,15 @@ impl OidcClient {
         }
         let http = builder.build()?;
 
-        let mut discovery_url = config.issuer.clone();
-        discovery_url.set_path("/.well-known/openid-configuration");
-        discovery_url.set_query(None);
+        // Kanidm 的发现文档挂在每个资源服务器名下
+        // （{issuer}/oauth2/openid/<client>/.well-known/...），所以这里用字符串
+        // 拼接保留 issuer 自带的路径，而不是整体替换。
+        let discovery_url: Url = format!(
+            "{}/.well-known/openid-configuration",
+            config.issuer.as_str().trim_end_matches('/')
+        )
+        .parse()
+        .map_err(|error| anyhow!("OIDC 发现文档地址不合法：{error}"))?;
         let discovery: Discovery = http
             .get(discovery_url)
             .send()
