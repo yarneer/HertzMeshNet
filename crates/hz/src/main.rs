@@ -40,10 +40,68 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Auth Key 管理（FR-11：签发与吊销，需要 Admin）
+    Authkey {
+        #[command(subcommand)]
+        command: AuthkeyCommand,
+    },
+    /// Node 管理（FR-11：列表 / 改名 / 删除 / 吊销）
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
     /// 探测一个对端：显示往返时延与当前路径（FR-12）
     Ping {
         /// 对端 Node Name 或 node id
         node: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthkeyCommand {
+    /// 签发一把 Auth Key（需要 Admin；明文仅显示一次）
+    Create {
+        /// 过期时间：Nd（如 7d、30d）或 RFC3339 时刻
+        #[arg(long)]
+        expiry: String,
+        /// 一次性 Key（用一次即作废）
+        #[arg(long)]
+        once: bool,
+        /// 预绑定 Tag，可多次出现
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// 吊销一把 Auth Key（需要 Admin；之后不可再用于注册）
+    Revoke {
+        /// 签发时返回的 key id
+        key_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// 列出 Node（Admin 看全部含已吊销；普通 User 只看自己名下）
+    List {
+        /// 输出 hzd 应答的原始 JSON（脚本用）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 改名（Admin 任意 Node；普通 User 仅自己名下；新名须唯一）
+    Rename {
+        /// 目标 node id（hz node list 可查）
+        node_id: String,
+        /// 新 Node Name（自动按命名规则规范化）
+        new_name: String,
+    },
+    /// 删除 Node（硬删；Admin 任意，普通 User 仅自己名下）
+    Delete {
+        /// 目标 node id
+        node_id: String,
+    },
+    /// 吊销 Node（需要 Admin；立即从所有 Network Map 消失且无法通信）
+    Revoke {
+        /// 目标 node id
+        node_id: String,
     },
 }
 
@@ -71,6 +129,8 @@ async fn main() -> std::process::ExitCode {
         Command::Up { auth_key, coord } => up(auth_key, coord).await,
         Command::Login { coord } => up(None, coord).await,
         Command::Policy { command } => policy(command).await,
+        Command::Authkey { command } => authkey(command).await,
+        Command::Node { command } => node(command).await,
         Command::Ping { node } => ping(node).await,
     }
 }
@@ -127,6 +187,201 @@ async fn policy(command: PolicyCommand) -> std::process::ExitCode {
     }
 }
 
+/// Auth Key 子命令：统一经本地 hzd 转发（操作者 = 本 Node 归属的 User）。
+async fn authkey(command: AuthkeyCommand) -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = match &command {
+        AuthkeyCommand::Create { expiry, once, tags } => {
+            let expires_unix = match parse_expiry(expiry) {
+                Ok(unix) => unix,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            Request::new(
+                7,
+                "authkey_create",
+                serde_json::json!({
+                    "expires_unix": expires_unix,
+                    "single_use": once,
+                    "tags": tags,
+                }),
+            )
+        }
+        AuthkeyCommand::Revoke { key_id } => {
+            Request::new(8, "authkey_revoke", serde_json::json!({ "key_id": key_id }))
+        }
+    };
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = match response {
+        Response::Ok { result, .. } => result,
+        Response::Error { error, .. } => {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match &command {
+        AuthkeyCommand::Create { expiry, .. } => {
+            let key = result["auth_key"].as_str().unwrap_or_default();
+            let key_id = result["key_id"].as_str().unwrap_or_default();
+            println!("Auth Key（仅此一次显示，请立即保存）：");
+            println!("{key}");
+            println!("Key ID：{key_id}");
+            if let Ok(unix) = parse_expiry(expiry) {
+                if let Some(time) = chrono::DateTime::from_timestamp(unix, 0) {
+                    println!("有效期至：{}", time.to_rfc3339());
+                }
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        AuthkeyCommand::Revoke { key_id } => {
+            println!("已吊销 Auth Key {key_id}");
+            std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Node 管理子命令：同样经 hzd 转发；列表的可见范围由服务端按操作者裁剪。
+async fn node(command: NodeCommand) -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = match &command {
+        NodeCommand::List { .. } => Request::new(9, "node_list", serde_json::json!({})),
+        NodeCommand::Rename { node_id, new_name } => Request::new(
+            10,
+            "node_rename",
+            serde_json::json!({ "node_id": node_id, "new_name": new_name }),
+        ),
+        NodeCommand::Delete { node_id } => {
+            Request::new(11, "node_delete", serde_json::json!({ "node_id": node_id }))
+        }
+        NodeCommand::Revoke { node_id } => {
+            Request::new(12, "node_revoke", serde_json::json!({ "node_id": node_id }))
+        }
+    };
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = match response {
+        Response::Ok { result, .. } => result,
+        Response::Error { error, .. } => {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match &command {
+        NodeCommand::List { json } => {
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                return std::process::ExitCode::SUCCESS;
+            }
+            print_node_table(&result)
+        }
+        NodeCommand::Rename { .. } => {
+            println!(
+                "改名成功，新 Node Name：{}",
+                result["name"].as_str().unwrap_or("?")
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        NodeCommand::Delete { node_id } => {
+            println!("已删除 Node {node_id}");
+            std::process::ExitCode::SUCCESS
+        }
+        NodeCommand::Revoke { node_id } => {
+            println!("已吊销 Node {node_id}（立即从所有 Network Map 消失）");
+            std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `hz node list` 的表格输出：id / 名字 / 地址 / 归属与 Tag / 有效期 / 状态。
+fn print_node_table(result: &serde_json::Value) -> std::process::ExitCode {
+    let Some(nodes) = result.as_array() else {
+        eprintln!("hzd 应答格式异常：{result}");
+        return std::process::ExitCode::FAILURE;
+    };
+    if nodes.is_empty() {
+        println!("没有可见的 Node");
+        return std::process::ExitCode::SUCCESS;
+    }
+    println!("Node ID | Node Name | IPv4 | 归属 User | Tags | 有效期至 | 状态");
+    for node in nodes {
+        let field = |name: &str| {
+            node.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string()
+        };
+        let owner = node
+            .get("owner_user")
+            .and_then(|v| v.as_str())
+            .unwrap_or("无（Tag 注册）");
+        let tags = node
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|joined| !joined.is_empty())
+            .unwrap_or_else(|| "无".to_string());
+        let expires = node
+            .get("expires_at_unix")
+            .and_then(|v| v.as_i64())
+            .and_then(|unix| chrono::DateTime::from_timestamp(unix, 0))
+            .map(|t| t.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "不过期".to_string());
+        let state = if node.get("revoked").and_then(|v| v.as_bool()) == Some(true) {
+            "已吊销"
+        } else {
+            "在册"
+        };
+        println!(
+            "{} | {} | {} | {} | {} | {} | {}",
+            field("node_id"),
+            field("name"),
+            field("ipv4"),
+            owner,
+            tags,
+            expires,
+            state
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// 支持 `7d`/`30d` 相对天数与 RFC3339 绝对时刻（与 hz-coord bootstrap 同语法）。
+fn parse_expiry(text: &str) -> anyhow::Result<i64> {
+    if let Some(days) = text.strip_suffix('d') {
+        let days: i64 = days
+            .parse()
+            .map_err(|_| anyhow::anyhow!("无效的过期时间 {text}：天数应为数字，如 7d"))?;
+        if days < 0 {
+            anyhow::bail!("过期天数不能为负：{text}");
+        }
+        return Ok(chrono::Utc::now().timestamp() + days * 86_400);
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(text)
+        .map_err(|e| anyhow::anyhow!("无效的过期时间 {text}：{e}"))?;
+    Ok(parsed.timestamp())
+}
+
 fn print_policy(result: &serde_json::Value) -> std::process::ExitCode {
     let version = result["version"].as_i64().unwrap_or(0);
     if version == 0 {
@@ -177,7 +432,11 @@ async fn status(json_output: bool) -> std::process::ExitCode {
                 std::process::ExitCode::SUCCESS
             }
             Ok(NodeStatus::Expired(info)) => {
-                println!("已过期，请重新执行 hz up 登录");
+                if result.get("revoked").and_then(|v| v.as_bool()) == Some(true) {
+                    println!("已吊销：本 Node 已被 Admin 吊销，无法通信；重新加入需以新身份注册");
+                } else {
+                    println!("已过期，请重新执行 hz up 登录");
+                }
                 print_identity(&info);
                 if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
                     println!("网内域名后缀：{suffix}");
@@ -440,5 +699,25 @@ fn print_identity(info: &RegisteredInfo) {
             None => println!("有效期至：{unix}"),
         },
         None => println!("有效期：不过期"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_parsing_supports_relative_days_and_rfc3339() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(parse_expiry("0d").unwrap(), now);
+        assert_eq!(parse_expiry("7d").unwrap(), now + 7 * 86_400);
+        assert_eq!(
+            parse_expiry("2027-01-02T03:04:05Z").unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2027-01-02T03:04:05Z")
+                .unwrap()
+                .timestamp()
+        );
+        assert!(parse_expiry("yesterday").is_err());
+        assert!(parse_expiry("-3d").is_err());
     }
 }

@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use hz_core::coord_client::{
-    DEFAULT_COORD_ADDR, LoginPoll, PunchCounters, StartedLogin, begin_interactive_login,
-    local_hostname, open_network_map_stream, policy_get, policy_push, policy_rollback,
-    poll_login_status, register_with_auth_key, report_endpoints,
+    DEFAULT_COORD_ADDR, LoginPoll, PunchCounters, StartedLogin, admin_create_auth_key,
+    admin_revoke_auth_key, begin_interactive_login, delete_node, list_nodes, local_hostname,
+    open_network_map_stream, policy_get, policy_push, policy_rollback, poll_login_status,
+    register_with_auth_key, rename_node, report_endpoints, revoke_node,
 };
 use hz_core::endpoint::{self, DiscoveredEndpoint};
 use hz_core::ipc::{self, Handler};
@@ -108,6 +109,9 @@ struct Daemon {
     punch: Arc<StdMutex<PunchCounters>>,
     /// 等待中的 ping 探针（应答到达时唤醒）。
     probes: Arc<ping::Probes>,
+    /// 本 Node 已被 Admin 吊销（区别于过期：重新登录救不回来）。
+    /// 到期/吊销共享 Expired 会话态，此标记决定 `hz status` 的文案。
+    revoked: StdMutex<bool>,
 }
 
 impl Daemon {
@@ -186,6 +190,7 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         policy_gate: Arc::new(InboundGate::new()),
         punch: Arc::new(StdMutex::new(PunchCounters::default())),
         probes: Arc::new(ping::Probes::default()),
+        revoked: StdMutex::new(false),
     });
 
     // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
@@ -244,6 +249,7 @@ async fn handle_request(
             value["peers"] =
                 serde_json::to_value(peers_view(&daemon)).map_err(|e| e.to_string())?;
             value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
+            value["revoked"] = serde_json::json!(*daemon.revoked.lock().expect("revoked poisoned"));
             value["policy"] = serde_json::json!({
                 "version": daemon.policy_gate.version(),
                 "dropped": daemon.policy_gate.dropped(),
@@ -364,6 +370,108 @@ async fn handle_request(
                 .map_err(|error| format!("{error:#}"))?;
             Ok(serde_json::json!({ "version": rolled }))
         }
+        "authkey_create" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let expires_unix = request
+                .params
+                .get("expires_unix")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "缺少 expires_unix（Auth Key 过期时刻，unix 秒）".to_string())?;
+            let single_use = request
+                .params
+                .get("single_use")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let tags: Vec<String> = request
+                .params
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let issued = admin_create_auth_key(
+                &daemon.state_dir,
+                &coord_addr,
+                expires_unix,
+                single_use,
+                &tags,
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({
+                "auth_key": issued.plaintext,
+                "key_id": issued.key_id,
+            }))
+        }
+        "authkey_revoke" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let key_id = request
+                .params
+                .get("key_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少 key_id".to_string())?
+                .to_string();
+            admin_revoke_auth_key(&daemon.state_dir, &coord_addr, &key_id)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({}))
+        }
+        "node_list" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let nodes = list_nodes(&daemon.state_dir, &coord_addr)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            serde_json::to_value(nodes).map_err(|e| e.to_string())
+        }
+        "node_rename" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let node_id = request
+                .params
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少 node_id".to_string())?
+                .to_string();
+            let new_name = request
+                .params
+                .get("new_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少 new_name".to_string())?
+                .to_string();
+            let name = rename_node(&daemon.state_dir, &coord_addr, &node_id, &new_name)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({ "name": name }))
+        }
+        "node_delete" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let node_id = request
+                .params
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少 node_id".to_string())?
+                .to_string();
+            delete_node(&daemon.state_dir, &coord_addr, &node_id)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({}))
+        }
+        "node_revoke" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let node_id = request
+                .params
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少 node_id".to_string())?
+                .to_string();
+            revoke_node(&daemon.state_dir, &coord_addr, &node_id)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({}))
+        }
         "login_poll" => {
             let progress = daemon.login.lock().expect("login poisoned").clone();
             let value = serde_json::to_value(&progress).map_err(|e| e.to_string())?;
@@ -380,7 +488,7 @@ async fn handle_request(
     }
 }
 
-/// Policy 类 rpc 需要 hzd 已注册（拿注册时记下的 Coordination Server 地址）。
+/// Policy / Admin 管理 rpc 需要 hzd 已注册（拿注册时记下的 Coordination Server 地址）。
 fn daemon_coord_addr(daemon: &Daemon) -> Result<String, String> {
     daemon
         .coord_addr
@@ -388,7 +496,7 @@ fn daemon_coord_addr(daemon: &Daemon) -> Result<String, String> {
         .expect("coord addr poisoned")
         .clone()
         .filter(|addr| !addr.is_empty())
-        .ok_or_else(|| "hzd 尚未注册，无法执行 Policy 操作（先 hz up）".to_string())
+        .ok_or_else(|| "hzd 尚未注册，无法执行管理操作（先 hz up）".to_string())
 }
 
 /// `hz ping`（FR-12）：朝对端 Node Address 发应用层探针，测往返时延，
@@ -1243,6 +1351,24 @@ fn spawn_tunnel_drain(
     });
 }
 
+/// 从 Map 消失后向服务端问一次，区分吊销与到期（removed 差量不携带原因，
+/// 两种结局共享 Expired 会话态）。吊销态决定 `hz status` 文案：已吊销
+/// 不能靠重新登录恢复，重新加入只能以全新身份注册。
+async fn note_revocation(
+    daemon: &Arc<Daemon>,
+    state_dir: &std::path::Path,
+    endpoint: &str,
+    coord_addr: &str,
+) {
+    match open_network_map_stream(state_dir, vec![endpoint.to_string()], coord_addr).await {
+        Err(error) if error.to_string().contains("已吊销") => {
+            tracing::warn!(%error, "node revoked by admin");
+            *daemon.revoked.lock().expect("revoked poisoned") = true;
+        }
+        _ => {}
+    }
+}
+
 /// Network Map 消费任务（FR-6）：启动即用本地缓存配置数据面（Coordination
 /// Server 不可达也照常），然后循环 订阅 → 消费差量/全量 → 断线退避重连。
 /// 每次重连都重新走挑战认证并重报 Endpoint（服务端在流打开时落库）。
@@ -1324,6 +1450,7 @@ fn spawn_map_task(
                             }
                             if removed_own {
                                 daemon.mark_expired(&engine);
+                                note_revocation(&daemon, &state_dir, &endpoint, &coord_addr).await;
                                 break;
                             }
                         }
@@ -1333,6 +1460,11 @@ fn spawn_map_task(
                     if error.to_string().contains("已过期") {
                         tracing::warn!(%error, "coord rejected map subscription: node expired");
                         daemon.mark_expired(&engine);
+                        backoff = BACKOFF_START;
+                    } else if error.to_string().contains("已吊销") {
+                        tracing::warn!(%error, "coord rejected map subscription: node revoked");
+                        daemon.mark_expired(&engine);
+                        *daemon.revoked.lock().expect("revoked poisoned") = true;
                         backoff = BACKOFF_START;
                     } else {
                         tracing::warn!(%error, "network map subscription failed");

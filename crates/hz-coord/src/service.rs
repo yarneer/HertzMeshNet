@@ -9,11 +9,15 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION;
 use hz_proto::coord_server::{Coord, CoordServer};
 use hz_proto::{
-    BeginLoginRequest, BeginLoginResponse, HelloRequest, HelloResponse, LoginStatusRequest,
-    LoginStatusResponse, NetworkMapMessage, PolicyGetRequest, PolicyGetResponse, PolicyPushRequest,
-    PolicyPushResponse, PolicyRollbackRequest, PolicyRollbackResponse, PolicyVersionInfo,
-    RegisterAuthKeyRequest, RegisterResponse, RelayCheckRequest, RelayCheckResponse,
-    ReportEndpointsRequest, ReportEndpointsResponse, StreamMapRequest,
+    AdminCreateAuthKeyRequest, AdminCreateAuthKeyResponse, AdminNodeInfo,
+    AdminRevokeAuthKeyRequest, AdminRevokeAuthKeyResponse, BeginLoginRequest, BeginLoginResponse,
+    DeleteNodeRequest, DeleteNodeResponse, HelloRequest, HelloResponse, ListNodesRequest,
+    ListNodesResponse, LoginStatusRequest, LoginStatusResponse, NetworkMapMessage,
+    PolicyGetRequest, PolicyGetResponse, PolicyPushRequest, PolicyPushResponse,
+    PolicyRollbackRequest, PolicyRollbackResponse, PolicyVersionInfo, RegisterAuthKeyRequest,
+    RegisterResponse, RelayCheckRequest, RelayCheckResponse, RenameNodeRequest, RenameNodeResponse,
+    ReportEndpointsRequest, ReportEndpointsResponse, RevokeNodeRequest, RevokeNodeResponse,
+    StreamMapRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
@@ -299,8 +303,9 @@ impl CoordServiceImpl {
         Ok(challenge)
     }
 
-    /// Policy rpc 的共用前置：挑战认证 + Node 在册且未过期。
-    async fn authenticate_policy_caller(
+    /// 需认证 rpc 的共用前置：挑战认证 + Node 在册且未过期。
+    /// Policy（#13）与 Admin 管理（#12）rpc 都从这里进。
+    async fn authenticate_node_caller(
         &self,
         req_protocol_version: u32,
         req_machine_key_pub: &[u8],
@@ -817,7 +822,7 @@ impl Coord for CoordServiceImpl {
     ) -> Result<Response<PolicyPushResponse>, Status> {
         let req = request.into_inner();
         let record = self
-            .authenticate_policy_caller(
+            .authenticate_node_caller(
                 req.protocol_version,
                 &req.machine_key_pub,
                 &req.hostname,
@@ -842,7 +847,7 @@ impl Coord for CoordServiceImpl {
         request: Request<PolicyGetRequest>,
     ) -> Result<Response<PolicyGetResponse>, Status> {
         let req = request.into_inner();
-        self.authenticate_policy_caller(
+        self.authenticate_node_caller(
             req.protocol_version,
             &req.machine_key_pub,
             &req.hostname,
@@ -887,7 +892,7 @@ impl Coord for CoordServiceImpl {
     ) -> Result<Response<PolicyRollbackResponse>, Status> {
         let req = request.into_inner();
         let record = self
-            .authenticate_policy_caller(
+            .authenticate_node_caller(
                 req.protocol_version,
                 &req.machine_key_pub,
                 &req.hostname,
@@ -917,6 +922,154 @@ impl Coord for CoordServiceImpl {
         Ok(Response::new(PolicyRollbackResponse {
             version: req.version,
         }))
+    }
+
+    // ---- Admin 远程管理（FR-11 / #12）：认证 → 解析操作者 → 权限表 → 业务。----
+
+    async fn admin_create_auth_key(
+        &self,
+        request: Request<AdminCreateAuthKeyRequest>,
+    ) -> Result<Response<AdminCreateAuthKeyResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        crate::admin::require_admin(&operator)?;
+        let (auth_key, key_id) =
+            crate::admin::create_auth_key(&self.store, req.expires_unix, req.single_use, &req.tags)
+                .await?;
+        tracing::info!(node_id = %record.id, key_id, "auth key issued via admin rpc");
+        Ok(Response::new(AdminCreateAuthKeyResponse {
+            auth_key,
+            key_id,
+        }))
+    }
+
+    async fn admin_revoke_auth_key(
+        &self,
+        request: Request<AdminRevokeAuthKeyRequest>,
+    ) -> Result<Response<AdminRevokeAuthKeyResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        crate::admin::require_admin(&operator)?;
+        crate::admin::revoke_auth_key(&self.store, &req.key_id).await?;
+        tracing::info!(node_id = %record.id, key_id = %req.key_id, "auth key revoked via admin rpc");
+        Ok(Response::new(AdminRevokeAuthKeyResponse {}))
+    }
+
+    async fn list_nodes(
+        &self,
+        request: Request<ListNodesRequest>,
+    ) -> Result<Response<ListNodesResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        let scope = crate::admin::list_scope(&operator)?;
+        let nodes = self
+            .store
+            .list_nodes(&scope)
+            .await
+            .map_err(|e| {
+                tracing::error!(%e, "list nodes failed");
+                Status::internal("列出 Node 失败")
+            })?
+            .into_iter()
+            .map(|row| AdminNodeInfo {
+                node_id: row.node_id,
+                name: row.name,
+                ipv4: row.ipv4,
+                ipv6: row.ipv6,
+                tags: row.tags,
+                owner_user: row.owner_user,
+                expires_at_unix: row.expires_at_unix,
+                revoked: row.revoked,
+            })
+            .collect();
+        Ok(Response::new(ListNodesResponse { nodes }))
+    }
+
+    async fn rename_node(
+        &self,
+        request: Request<RenameNodeRequest>,
+    ) -> Result<Response<RenameNodeResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        let name =
+            crate::admin::rename_node(&self.store, &operator, &req.node_id, &req.new_name).await?;
+        Ok(Response::new(RenameNodeResponse { name }))
+    }
+
+    async fn delete_node(
+        &self,
+        request: Request<DeleteNodeRequest>,
+    ) -> Result<Response<DeleteNodeResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        crate::admin::delete_node(&self.store, &operator, &req.node_id).await?;
+        tracing::info!(node_id = %req.node_id, by = %record.id, "node deleted via admin rpc");
+        Ok(Response::new(DeleteNodeResponse {}))
+    }
+
+    async fn revoke_node(
+        &self,
+        request: Request<RevokeNodeRequest>,
+    ) -> Result<Response<RevokeNodeResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        crate::admin::require_admin(&operator)?;
+        crate::admin::revoke_node(&self.store, &req.node_id).await?;
+        Ok(Response::new(RevokeNodeResponse {}))
     }
 }
 

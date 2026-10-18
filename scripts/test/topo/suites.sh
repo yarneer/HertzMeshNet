@@ -1107,3 +1107,191 @@ assert_suite_ratelimit() {
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
 }
+
+# ---------------------------------------------------------------------------
+# 套件 admin_revoke：ticket #12 Admin 远程管理（FR-11 / A3）
+# ---------------------------------------------------------------------------
+node_field_of() { # node_field_of <operator-node> <target-name> <field>：node list json 里按名字取字段
+  hz_cli "$1" node list --json 2>/dev/null | python3 -c '
+import json, sys
+nodes = json.load(sys.stdin)
+node = next(n for n in nodes if n["name"] == sys.argv[1])
+print(node[sys.argv[2]])' "$2" "$3"
+}
+
+dns_a_record() { # dns_a_record <node> <fqdn>：本地 DNS 应答的 A 记录（手写 UDP 查询）
+  local ns; ns=$(node_ns "$1")
+  ip netns exec "$ns" timeout 5 python3 - "$2" <<'PY'
+import socket, struct, sys
+labels = sys.argv[1].split(".")
+q = b"".join(bytes([len(l)]) + l.encode() for l in labels) + b"\x00"
+msg = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+s.sendto(msg, ("100.96.0.53", 53))
+data, _ = s.recvfrom(512)
+head = struct.unpack(">HHHHHH", data[:12])
+assert head[3] >= 1, f"应答不含 Answer 区：{head}"
+# hzd 应答器把问题名原样（非压缩指针）复写在 Answer 区：单条 A 记录的
+# RDATA 就是报文末 4 字节。
+print(socket.inet_ntoa(data[-4:]))
+PY
+}
+
+assert_suite_admin_revoke() {
+  local db="$ART_DIR/coord.db" a b d b4 d_id out rc start elapsed
+  a=$(reg_list | awk -F'|' '$1 == "a" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$1 == "b" { print $1; exit }')
+  d=$(reg_list | awk -F'|' '$1 == "d" { print $1; exit }')
+  [[ -n $a && -n $b && -n $d ]] || { fail "场景需要 a/b/d 三个节点"; return 1; }
+
+  note "[$d] 签发带 tag:db 的 Auth Key 并种入 Admin alice（bootstrap --admin，无需 Kanidm）"
+  ip netns exec "$WAN_NS" "$BIN_DIR/hz-coord" bootstrap --db "$db" \
+    --auth-key-expiry 1d --tag db --admin alice --json > "$ART_DIR/key-db-tag.json" \
+    || { fail "bootstrap --admin 失败"; return 1; }
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["admin"]=="alice"' "$ART_DIR/key-db-tag.json" \
+    && pass "bootstrap --admin alice 落库成功" || fail "bootstrap 应答缺少 admin 字段"
+
+  note "[a/b/d] 启动 hzd 并注册（a、b 用普通 Key，d 用 tag Key）"
+  start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$d" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-db-tag.json"))["auth_key"])')" || return 1
+
+  note "等待无 Policy 时的三方全互通"
+  wait_peer_set "$a" "hznodeb,hznoded" || return 1
+  wait_peer_set "$b" "hznodea,hznoded" || return 1
+  wait_peer_set "$d" "hznodea,hznodeb" || return 1
+  pass "三方 Network Map 互见"
+
+  note "种入 bob（普通 User）与 Node 归属（生产路径是交互式登录，此处直写库）"
+  python3 - "$db" <<'PY' || { fail "身份种子写入失败"; return 1; }
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=10)
+db.execute("INSERT OR IGNORE INTO users (id, name, is_admin) VALUES ('u-bob', 'bob', 0)")
+db.execute("UPDATE nodes SET user_id = (SELECT id FROM users WHERE name = 'alice') WHERE name = 'hznodea'")
+db.execute("UPDATE nodes SET user_id = (SELECT id FROM users WHERE name = 'bob') WHERE name = 'hznodeb'")
+db.commit()
+PY
+
+  note "断言 1：alice 名下的 a 可签发 Auth Key（FR-11 AC）"
+  if out=$(hz_cli "$a" authkey create --expiry 7d 2>&1); then
+    if [[ $out == *"仅此一次显示"* && $out == *"Key ID："* ]]; then
+      pass "a：hz authkey create 成功并提示仅此一次显示"
+    else
+      fail "a：签发输出形态异常：$out"
+    fi
+  else
+    fail "a：hz authkey create 失败：$out"
+    return 1
+  fi
+
+  note "断言 2/3：普通 User 与带 Tag 的 Node 签发被拒"
+  rc=0; out=$(hz_cli "$b" authkey create --expiry 7d 2>&1) || rc=$?
+  if (( rc != 0 )) && [[ $out == *"需要 Admin 权限"* ]]; then
+    pass "b（普通 User）：签发被拒（需要 Admin 权限）"
+  else
+    fail "b：签发应被拒（rc=$rc）：$out"
+  fi
+  rc=0; out=$(hz_cli "$d" authkey create --expiry 7d 2>&1) || rc=$?
+  if (( rc != 0 )) && [[ $out == *"带 Tag"* ]]; then
+    pass "d（带 Tag 的 Node）：管理操作被拒"
+  else
+    fail "d：签发应被拒（rc=$rc）：$out"
+  fi
+
+  note "断言 4：hz node list 的可见范围（Admin 全部 / User 自己名下）"
+  local listed
+  listed=$(hz_cli "$a" node list --json | python3 -c 'import json,sys; print(",".join(sorted(n["name"] for n in json.load(sys.stdin))))')
+  if [[ $listed == "hznodea,hznodeb,hznoded" ]]; then
+    pass "a（Admin）：列表包含全部 3 个 Node"
+  else
+    fail "a（Admin）：列表异常：$listed"
+  fi
+  listed=$(hz_cli "$b" node list --json | python3 -c 'import json,sys; print(",".join(sorted(n["name"] for n in json.load(sys.stdin))))')
+  if [[ $listed == "hznodeb" ]]; then
+    pass "b（普通 User）：列表只有自己名下的 hznodeb"
+  else
+    fail "b（普通 User）：列表异常：$listed"
+  fi
+  b4=$(node_field_of "$a" hznodeb ipv4)
+  d_id=$(node_field_of "$a" hznoded node_id)
+  note "b 的 Node Address（a 视角）：$b4；d 的 node id：$d_id"
+
+  note "断言 5：a 吊销 b → 5 秒内 b 从 a/d 的 Map 消失、无法通信、b 显示已吊销"
+  start=$(python3 -c 'import time; print(time.time())')
+  if ! out=$(hz_cli "$a" node revoke "$(node_field_of "$a" hznodeb node_id)" 2>&1); then
+    fail "a：hz node revoke 失败：$out"
+    return 1
+  fi
+  pass "a：hz node revoke 执行成功"
+  if wait_peer_set "$a" "hznoded" && wait_peer_set "$d" "hznodea"; then
+    elapsed=$(python3 -c "import sys, time; sys.stdout.write('%.1f' % (time.time() - float(sys.argv[1])))" "$start")
+    if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5.0 else 1)" "$elapsed"; then
+      pass "吊销后 ${elapsed}s 内 a 与 d 的 Map 都不再有 hznodeb（< 5s AC）"
+    else
+      fail "吊销后 ${elapsed}s 才从 Map 消失，超过 5 秒 AC"
+    fi
+  else
+    fail "吊销后 a/d 的对端视图未收敛"
+    return 1
+  fi
+  if ip netns exec "$(node_ns "$a")" ping -c 3 -W 2 "$b4" > /dev/null 2>&1; then
+    fail "a → b（$b4）不应再 ping 通"
+  else
+    pass "a → b（$b4）ICMP 不通（Seam A）"
+  fi
+  rc=0; out=$(hz_cli "$a" ping hznodeb 2>&1) || rc=$?
+  if (( rc != 0 )) && [[ $out == *"找不到对端"* ]]; then
+    pass "a：hz ping hznodeb 找不到对端"
+  else
+    fail "a：hz ping hznodeb 应失败（rc=$rc）：$out"
+  fi
+  local i revoked_seen=""
+  for i in $(seq 1 20); do
+    if hz_cli "$b" status 2>/dev/null | grep -q "已吊销"; then revoked_seen=yes; break; fi
+    sleep 0.5
+  done
+  if [[ -n $revoked_seen ]]; then
+    pass "b：hz status 显示已吊销"
+  else
+    fail "b：hz status 未显示已吊销（实际：$(hz_cli "$b" status | head -2 | tr '\n' ' ')）"
+  fi
+
+  note "断言 6：改名冲突拒绝（Node Name 已存在）"
+  rc=0; out=$(hz_cli "$a" node rename "$d_id" hznodea 2>&1) || rc=$?
+  if (( rc != 0 )) && [[ $out == *"Node Name 已存在"* ]]; then
+    pass "改名到已存在的名字被拒：$out"
+  else
+    fail "改名冲突应被拒（rc=$rc）：$out"
+  fi
+
+  note "断言 7：改成新名 → 对端 Map 与本地 DNS 应答跟随"
+  if out=$(hz_cli "$a" node rename "$d_id" hznoded2 2>&1); then
+    pass "改名成功：$out"
+  else
+    fail "改名失败：$out"
+    return 1
+  fi
+  start=$(python3 -c 'import time; print(time.time())')
+  if wait_peer_set "$a" "hznoded2"; then
+    elapsed=$(python3 -c "import sys, time; sys.stdout.write('%.1f' % (time.time() - float(sys.argv[1])))" "$start")
+    if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5.0 else 1)" "$elapsed"; then
+      pass "改名后 ${elapsed}s 内 a 的 Map 显示新名（< 5s）"
+    else
+      fail "改名后 ${elapsed}s 才生效，超过 5 秒"
+    fi
+  else
+    fail "a 的 Map 未跟随新名 hznoded2"
+    return 1
+  fi
+  local d4 dns
+  d4=$(node_field_of "$a" hznoded2 ipv4)
+  dns=$(dns_a_record "$a" "hznoded2.hznet.internal")
+  if [[ $dns == "$d4" ]]; then
+    pass "本地 DNS 应答跟随新名：hznoded2.hznet.internal → $dns"
+  else
+    fail "DNS 应答异常：hznoded2.hznet.internal → ${dns:-无应答}，期望 $d4"
+  fi
+
+  (( FAILURES == 0 ))
+}

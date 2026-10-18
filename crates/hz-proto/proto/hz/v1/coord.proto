@@ -30,6 +30,20 @@ service Coord {
   rpc PolicyGet(PolicyGetRequest) returns (PolicyGetResponse);
   // 回滚到历史版本：内容须仍通过校验，否则拒绝。
   rpc PolicyRollback(PolicyRollbackRequest) returns (PolicyRollbackResponse);
+  // ---- Admin 远程管理（FR-11 / #12）：以下 rpc 全部携带标准挑战认证字段，
+  // 操作者 = 调用方 Node 归属的 User（A3）；带 Tag 的 Node 一律拒绝。----
+  // 签发 Auth Key（仅 Admin）：明文只在应答里出现一次。
+  rpc AdminCreateAuthKey(AdminCreateAuthKeyRequest) returns (AdminCreateAuthKeyResponse);
+  // 吊销 Auth Key（仅 Admin）：吊销后不可再用于注册。
+  rpc AdminRevokeAuthKey(AdminRevokeAuthKeyRequest) returns (AdminRevokeAuthKeyResponse);
+  // 列出 Node（Admin 看全部含已吊销；普通 User 只看自己名下）。
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  // 改名（Admin 任意 Node；普通 User 仅自己名下）：新名规范化后须唯一。
+  rpc RenameNode(RenameNodeRequest) returns (RenameNodeResponse);
+  // 删除 Node（Admin 任意；普通 User 仅自己名下）：硬删行，立即退出所有 Map。
+  rpc DeleteNode(DeleteNodeRequest) returns (DeleteNodeResponse);
+  // 吊销 Node（仅 Admin）：保留行供审计，立即退出所有 Map 且无法通信。
+  rpc RevokeNode(RevokeNodeRequest) returns (RevokeNodeResponse);
 }
 
 message HelloRequest {
@@ -255,3 +269,100 @@ message PolicyRollbackRequest {
 message PolicyRollbackResponse {
   int64 version = 1;
 }
+
+// ---- Admin 远程管理（FR-11 / #12）的消息，与上方 rpc 同期新增 ----
+
+message AdminCreateAuthKeyRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  // 必填：Auth Key 的过期时刻（unix 秒）。
+  int64 expires_unix = 6;
+  // 一次性 Key（用一次即作废）。
+  bool single_use = 7;
+  // 预绑定 Tag，可多个。
+  repeated string tags = 8;
+}
+
+message AdminCreateAuthKeyResponse {
+  // 明文 Key，仅此一次返回。
+  string auth_key = 1;
+  // 供 AdminRevokeAuthKey 吊销用。
+  string key_id = 2;
+}
+
+message AdminRevokeAuthKeyRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  string key_id = 6;
+}
+
+message AdminRevokeAuthKeyResponse {}
+
+message ListNodesRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+}
+
+// Admin 视角的 Node 行（比 NodeInfo 多吊销标记，少数据面字段）。
+message AdminNodeInfo {
+  string node_id = 1;
+  string name = 2;
+  string ipv4 = 3;
+  string ipv6 = 4;
+  repeated string tags = 5;
+  optional string owner_user = 6;
+  optional int64 expires_at_unix = 7;
+  // true = 已吊销（保留行供审计，不在任何 Network Map 里）。
+  bool revoked = 8;
+}
+
+message ListNodesResponse {
+  repeated AdminNodeInfo nodes = 1;
+}
+
+message RenameNodeRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  string node_id = 6;
+  // 期望的新 Node Name；服务端按 Node Name 规则规范化后要求唯一。
+  string new_name = 7;
+}
+
+message RenameNodeResponse {
+  // 规范化并落库后的新名字。
+  string name = 1;
+}
+
+message DeleteNodeRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  string node_id = 6;
+}
+
+message DeleteNodeResponse {}
+
+message RevokeNodeRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  string node_id = 6;
+}
+
+message RevokeNodeResponse {}
