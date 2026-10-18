@@ -13,7 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -24,3 +24,4 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 chrono.workspace = true
 tempfile.workspace = true
 x25519-dalek.workspace = true
+sqlx.workspace = true

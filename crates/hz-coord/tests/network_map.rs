@@ -605,3 +605,100 @@ async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
     handle.shutdown();
     handle.terminated().await;
 }
+
+#[tokio::test]
+async fn rebind_rotation_pushes_new_node_key_as_delta() {
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let auth_key = auth_key(&store).await;
+    let node_a = node_keys();
+    let node_b = node_keys();
+    let mut client = connect(addr).await;
+    let _info_a = register(&mut client, &node_a, "node-a", &auth_key).await;
+    let info_b = register(&mut client, &node_b, "node-b", &auth_key).await;
+
+    let mut stream = open_map(&mut client, &node_a, vec![], None).await.unwrap();
+    let _ = next_message(&mut stream, Duration::from_secs(5)).await;
+
+    // 重新登录：同一 Machine Key 换归属与 Node Key（#10 的 bind 路径）。
+    let user_id = store.upsert_user("alice", false).await.unwrap();
+    let rotated_key = [7u8; 32];
+    store
+        .bind_node_to_user(
+            &node_b.machine.verifying_key().to_bytes(),
+            &rotated_key,
+            "node-b",
+            &user_id,
+            hz_coord::store::unix_now() + 3600,
+        )
+        .await
+        .unwrap();
+
+    let delta = next_delta(&mut stream, Duration::from_secs(5)).await;
+    let updated = delta
+        .added_or_updated
+        .iter()
+        .find(|node| node.node_id == info_b.node_id)
+        .expect("轮换必须立即推给对端，不能等周期清扫");
+    assert_eq!(updated.node_key_pub, rotated_key.to_vec());
+    assert_eq!(updated.owner_user.as_deref(), Some("alice"));
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+#[tokio::test]
+async fn tagged_node_never_gets_an_expiry_but_login_bound_nodes_do() {
+    let (handle, store, addr) = start_server(LONG, LONG).await;
+    let tagged_key = store
+        .create_auth_key(
+            chrono::Utc::now().timestamp() + 3600,
+            false,
+            &["edge".to_string()],
+        )
+        .await
+        .unwrap();
+    let mut client = connect(addr).await;
+    let tagged = register(&mut client, &node_keys(), "node-tagged", &tagged_key).await;
+    assert!(
+        tagged.expires_at_unix.is_none() && tagged.owner_user.is_none(),
+        "带 Tag 注册的 Node 不归属 User，也永不设置有效期（FR-3）"
+    );
+
+    let user_id = store.upsert_user("bob", false).await.unwrap();
+    let login_keys = node_keys();
+    let bound = store
+        .bind_node_to_user(
+            &login_keys.machine.verifying_key().to_bytes(),
+            &login_keys.node_public,
+            "node-bound",
+            &user_id,
+            hz_coord::store::unix_now() + 60,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bound.expires_at_unix,
+        Some(hz_coord::store::unix_now() + 60),
+        "登录绑定的 Node 必须带有效期"
+    );
+
+    // 有效期语义落在 map：到期后只有归属 User 的 Node 消失。
+    sqlx::query("UPDATE nodes SET expires_at_unix = ?1 WHERE id = ?2")
+        .bind(hz_coord::store::unix_now() - 1)
+        .bind(&bound.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let names: Vec<String> = store
+        .network_map()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.name)
+        .collect();
+    assert!(names.contains(&"node-tagged".to_string()));
+    assert!(!names.contains(&"node-bound".to_string()));
+
+    handle.shutdown();
+    handle.terminated().await;
+}

@@ -475,3 +475,172 @@ fn peer_reports_expose_path_endpoint_and_handshake_state() {
     assert_eq!(relayed.endpoint, None, "Relayed 时没有在用的对端 Endpoint");
     assert!(relayed.handshake_age.is_some());
 }
+
+#[test]
+fn own_key_rotation_drops_sessions_and_rejoins_with_new_key() {
+    let (a, b, mut engine_a, mut engine_b) = wired_pair();
+
+    let packet = udp_v4_packet(a.v4, b.v4, b"before-rotation");
+    let init = engine_a.send_ip_packet(&packet);
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let decrypted = deliver(&flushed, &mut engine_b, a.udp);
+    assert_eq!(
+        decrypted.to_tunnel,
+        vec![packet.clone()],
+        "轮换前两端必须已经互通"
+    );
+
+    let fresh = NodeStaticSecret::random_from_rng(OsRng);
+    let fresh_public = NodePublicKey::from(&fresh).to_bytes();
+    engine_a.rotate_own_key(fresh);
+    assert_eq!(
+        engine_a.peer_count(),
+        0,
+        "轮换后旧密钥建立的会话必须全部作废"
+    );
+
+    // 对端按新公钥重建（coord 下发的 node_key_pub 变化），本机重放对账。
+    engine_b.configure(PeerSpec {
+        node_key_pub: fresh_public,
+        ..spec_for(&a)
+    });
+    engine_a.reconcile(vec![spec_for(&b)]);
+
+    let after = udp_v4_packet(a.v4, b.v4, b"after-rotation");
+    let init2 = engine_a.send_ip_packet(&after);
+    assert_eq!(init2.to_network.len(), 1, "轮换后首个出站包必须重新握手");
+    let response2 = deliver(&init2, &mut engine_b, a.udp);
+    let flushed2 = deliver(&response2, &mut engine_a, b.udp);
+    let decrypted2 = deliver(&flushed2, &mut engine_b, a.udp);
+    assert_eq!(
+        decrypted2.to_tunnel,
+        vec![after],
+        "新密钥下通信必须恢复，旧密钥会话不再续命"
+    );
+}
+
+/// 显式 node_id 的对端描述：绕开 peer_name 的端口推断，测试里同引擎容纳多个对端。
+fn named_spec(node_id: &str, peer: &TestNode) -> PeerSpec {
+    PeerSpec {
+        node_id: node_id.to_string(),
+        ..spec_for(peer)
+    }
+}
+
+#[test]
+fn handshake_completes_when_peers_number_tunnels_differently() {
+    // 两侧给对方分配的本地隧道序号不同（B 先配了另一个对端，A 在 B 那里是第二个）。
+    // 握手响应的 [4..8] 是响应方的发送索引、[8..12] 才是回显给发起方的接收索引；
+    // 按前者寻位时，只有两侧序号空间碰巧重叠才能完成握手（#11 到期重登后的死链）。
+    let a = test_node("100.96.0.1", "fd12:3456:789a::6460:1", "192.168.1.1:51820");
+    let b = test_node("100.96.0.2", "fd12:3456:789a::6460:2", "192.168.1.2:51820");
+    let first_on_b = test_node("100.96.0.9", "fd12:3456:789a::6460:9", "192.168.1.9:51820");
+    let mut engine_a = Engine::new(a.secret.clone());
+    let mut engine_b = Engine::new(b.secret.clone());
+    engine_b.configure(named_spec("b-first", &first_on_b));
+    engine_a.configure(named_spec("peer-b", &b));
+    engine_b.configure(named_spec("peer-a", &a));
+
+    let packet = udp_v4_packet(a.v4, b.v4, b"index-bases-differ");
+    let init = engine_a.send_ip_packet(&packet);
+    assert_eq!(init.to_network.len(), 1, "首包必须产生握手发起包");
+    let response = deliver(&init, &mut engine_b, a.udp);
+    assert_eq!(response.to_network.len(), 1, "B 必须回应握手响应");
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    assert!(
+        !flushed.to_network.is_empty(),
+        "A 必须接受 B 的握手响应并补发排队包（而不是按未知索引丢弃）"
+    );
+    let decrypted = deliver(&flushed, &mut engine_b, a.udp);
+    assert_eq!(
+        decrypted.to_tunnel,
+        vec![packet],
+        "序号错开时链路也必须打通"
+    );
+}
+
+#[test]
+fn rotation_converges_when_peer_learns_new_key_before_we_rotate() {
+    // 重登录的真实时序：coord 在回调时刻就把新 node_key_pub 推给对端，
+    // 本机要等轮询到 Completed 才换私钥；对端先重建、本机后轮换，链路必须收敛。
+    let a = test_node("100.96.0.1", "fd12:3456:789a::6460:1", "192.168.1.1:51820");
+    let b = test_node("100.96.0.2", "fd12:3456:789a::6460:2", "192.168.1.2:51820");
+    let first_on_b = test_node("100.96.0.9", "fd12:3456:789a::6460:9", "192.168.1.9:51820");
+    let mut engine_a = Engine::new(a.secret.clone());
+    let mut engine_b = Engine::new(b.secret.clone());
+    engine_b.configure(named_spec("b-first", &first_on_b));
+    engine_a.configure(named_spec("peer-b", &b));
+    engine_b.configure(named_spec("peer-a", &a));
+
+    let before = udp_v4_packet(a.v4, b.v4, b"before-rotation");
+    let init = engine_a.send_ip_packet(&before);
+    let response = deliver(&init, &mut engine_b, a.udp);
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let decrypted = deliver(&flushed, &mut engine_b, a.udp);
+    assert_eq!(
+        decrypted.to_tunnel,
+        vec![before.clone()],
+        "轮换前两端必须互通"
+    );
+
+    let fresh = NodeStaticSecret::random_from_rng(OsRng);
+    let fresh_public = NodePublicKey::from(&fresh).to_bytes();
+    engine_b.configure(PeerSpec {
+        node_key_pub: fresh_public,
+        ..named_spec("peer-a", &a)
+    });
+
+    // 本机仍是旧密钥的窗口期：旧密钥流量不得再被对端解出。
+    let stale = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"stale-key"));
+    let stale_seen = deliver(&stale, &mut engine_b, a.udp);
+    assert!(stale_seen.to_tunnel.is_empty(), "密钥更换后旧会话不得续命");
+
+    engine_a.rotate_own_key(fresh);
+    engine_a.reconcile(vec![named_spec("peer-b", &b)]);
+    let after = udp_v4_packet(a.v4, b.v4, b"after-rotation");
+    let init2 = engine_a.send_ip_packet(&after);
+    assert_eq!(init2.to_network.len(), 1, "轮换后首个出站包必须重新握手");
+    let response2 = deliver(&init2, &mut engine_b, a.udp);
+    assert_eq!(response2.to_network.len(), 1, "对端必须回应新密钥握手");
+    let flushed2 = deliver(&response2, &mut engine_a, b.udp);
+    assert!(!flushed2.to_network.is_empty(), "发起方必须完成新密钥握手");
+    let decrypted2 = deliver(&flushed2, &mut engine_b, a.udp);
+    assert_eq!(
+        decrypted2.to_tunnel,
+        vec![after],
+        "后轮换的一侧也必须恢复通信"
+    );
+}
+
+#[test]
+fn key_change_rebuild_keeps_learned_endpoints() {
+    // 密钥轮换重建会话时，旧密钥期间学到的直连 Endpoint 仍然可达，必须保留。
+    let (a, b, mut engine_a, _engine_b) = wired_pair();
+    let packet = udp_v4_packet(a.v4, b.v4, b"learn-endpoint");
+    let init = engine_a.send_ip_packet(&packet);
+    assert_eq!(init.to_network.len(), 1);
+    let roamed: SocketAddr = "192.168.1.7:51820".parse().unwrap();
+    engine_a.prefer_endpoint(peer_name(&b), roamed);
+    assert_eq!(
+        engine_a.endpoint_candidates(peer_name(&b)).first(),
+        Some(&roamed)
+    );
+
+    let fresh_public = NodePublicKey::from(&NodeStaticSecret::random_from_rng(OsRng)).to_bytes();
+    engine_a.configure(PeerSpec {
+        endpoints: vec![],
+        node_key_pub: fresh_public,
+        ..spec_for(&b)
+    });
+    assert_eq!(
+        engine_a.endpoint_candidates(peer_name(&b)).first(),
+        Some(&roamed),
+        "密钥更换重建后学到的 Endpoint 必须保留为首选"
+    );
+    let out = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"after-key-change"));
+    assert!(
+        out.to_network.iter().any(|send| send.primary == roamed),
+        "重建后的会话必须仍能向学到的 Endpoint 发送"
+    );
+}

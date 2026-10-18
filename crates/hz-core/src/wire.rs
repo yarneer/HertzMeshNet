@@ -29,6 +29,21 @@ const KEEPALIVE_SECS: u16 = 8;
 const MSG_HANDSHAKE_INIT: u8 = 1;
 const MSG_HANDSHAKE_RESPONSE: u8 = 2;
 
+/// 入向数据报的接收索引：定位能解密它的本地对端。握手响应的 [4..8] 是
+/// 响应方的发送索引，回显给我们的接收索引在 [8..12]；其余消息类型
+/// （传输数据、Cookie）的接收索引都在 [4..8]。握手发起包不带索引，
+/// 在此之前已逐对端试解归队。
+fn inbound_receiver_index(datagram: &[u8]) -> Option<u32> {
+    let offset = if datagram.first() == Some(&MSG_HANDSHAKE_RESPONSE) {
+        8
+    } else {
+        4
+    };
+    datagram
+        .get(offset..offset + 4)
+        .map(|raw| u32::from_le_bytes(raw.try_into().expect("4 bytes")))
+}
+
 /// Network Map 里一个对端的数据面描述。
 #[derive(Debug, Clone)]
 pub struct PeerSpec {
@@ -167,11 +182,18 @@ impl Engine {
                 None,
             );
             self.next_local_index += 1;
+            // 密钥轮换只意味着会话作废；旧密钥期间学到的直连 Endpoint
+            // （对端漫游后的实际地址）仍然可达，作为回退保留进重建后的对端。
+            let learned = self
+                .peers
+                .get(&spec.node_id)
+                .map(|peer| peer.endpoints.clone())
+                .unwrap_or_default();
             let old = self.peers.insert(
                 spec.node_id.clone(),
                 Peer {
                     node_key_pub: spec.node_key_pub,
-                    endpoints: spec.endpoints,
+                    endpoints: merge_endpoints(learned, spec.endpoints),
                     tunn,
                     dst_addrs: spec.dst_addrs,
                     use_relay: spec.use_relay,
@@ -201,6 +223,16 @@ impl Engine {
                 }
             }
             self.by_index.retain(|_, owner| owner != node_id);
+        }
+    }
+
+    /// 本机 Node Key 轮换（重新登录，FR-3）：替换静态私钥并清空全部对端。
+    /// 旧私钥建立的会话不允许在新密钥下续命；对端由随后的 reconcile 重建。
+    pub fn rotate_own_key(&mut self, secret: StaticSecret) {
+        self.own_secret = secret;
+        let stale: Vec<String> = self.peers.keys().cloned().collect();
+        for id in stale {
+            self.remove_peer(&id);
         }
     }
 
@@ -270,10 +302,9 @@ impl Engine {
             return out;
         }
 
-        let index = datagram
-            .get(4..8)
-            .map(|raw| u32::from_le_bytes(raw.try_into().expect("4 bytes")));
-        let Some(node_id) = index.and_then(|index| self.by_index.get(&index).cloned()) else {
+        let Some(node_id) =
+            inbound_receiver_index(datagram).and_then(|index| self.by_index.get(&index).cloned())
+        else {
             tracing::debug!(%msg_type, %from, "drop wireguard datagram for unknown index");
             return out;
         };
@@ -347,10 +378,9 @@ impl Engine {
             return out;
         }
 
-        let index = datagram
-            .get(4..8)
-            .map(|raw| u32::from_le_bytes(raw.try_into().expect("4 bytes")));
-        let Some(node_id) = index.and_then(|index| self.by_index.get(&index).cloned()) else {
+        let Some(node_id) =
+            inbound_receiver_index(datagram).and_then(|index| self.by_index.get(&index).cloned())
+        else {
             tracing::debug!(%msg_type, "drop relayed wireguard datagram for unknown index");
             return out;
         };
@@ -546,9 +576,9 @@ impl Engine {
     }
 }
 
-/// 合并 Endpoint：新地址提到最前，已有地址去重，保持偏好序。
+/// 合并 Endpoint：新地址提到最前（保持 fresh 自身顺序），已有地址去重，保持偏好序。
 fn merge_endpoints(mut preferred: Vec<SocketAddr>, fresh: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    for addr in fresh {
+    for addr in fresh.into_iter().rev() {
         preferred.retain(|existing| *existing != addr);
         preferred.insert(0, addr);
     }
@@ -648,6 +678,15 @@ impl SocketEngine {
             .lock()
             .expect("engine poisoned")
             .reconcile(specs);
+    }
+
+    /// 重新登录后的本机 Node Key 轮换：换私钥、清对端，调用方随后重放
+    /// Network Map 对账以重建会话。
+    pub fn rotate_own_key(&self, secret: StaticSecret) {
+        self.engine
+            .lock()
+            .expect("engine poisoned")
+            .rotate_own_key(secret);
     }
 
     pub fn handshake_ages(&self) -> HashMap<String, Option<Duration>> {

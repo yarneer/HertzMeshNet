@@ -21,6 +21,18 @@ pub struct RegisteredInfo {
 pub enum NodeStatus {
     Unregistered,
     Registered(RegisteredInfo),
+    /// 归属 User 的 Node 已过有效期（FR-3）：身份与密钥仍在，重新登录即恢复。
+    Expired(RegisteredInfo),
+}
+
+impl NodeStatus {
+    /// 已注册或已过期都持有注册身份；区分只影响提示文案。
+    pub fn info(&self) -> Option<&RegisteredInfo> {
+        match self {
+            NodeStatus::Unregistered => None,
+            NodeStatus::Registered(info) | NodeStatus::Expired(info) => Some(info),
+        }
+    }
 }
 
 impl Serialize for NodeStatus {
@@ -29,23 +41,26 @@ impl Serialize for NodeStatus {
         S: serde::Serializer,
     {
         use serde::ser::SerializeMap;
-        match self {
-            NodeStatus::Unregistered => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("registered", &false)?;
-                map.end()
-            }
-            NodeStatus::Registered(info) => {
-                let value = serde_json::to_value(info).map_err(serde::ser::Error::custom)?;
-                let object = value.as_object().cloned().unwrap_or_default();
-                let mut map = serializer.serialize_map(Some(object.len() + 1))?;
-                map.serialize_entry("registered", &true)?;
-                for (key, val) in object {
-                    map.serialize_entry(&key, &val)?;
-                }
-                map.end()
-            }
+        let (registered, expired, info) = match self {
+            NodeStatus::Unregistered => (false, false, None),
+            NodeStatus::Registered(info) => (true, false, Some(info)),
+            NodeStatus::Expired(info) => (false, true, Some(info)),
+        };
+        let identity = info
+            .map(|info| serde_json::to_value(info).map_err(serde::ser::Error::custom))
+            .transpose()?
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut map = serializer.serialize_map(Some(identity.len() + 2))?;
+        map.serialize_entry("registered", &registered)?;
+        // expired 只在过期态出现：Unregistered/Registered 的 JSON 形状是稳定契约。
+        if expired {
+            map.serialize_entry("expired", &expired)?;
         }
+        for (key, val) in identity {
+            map.serialize_entry(&key, &val)?;
+        }
+        map.end()
     }
 }
 
@@ -57,12 +72,16 @@ impl<'de> Deserialize<'de> for NodeStatus {
         #[derive(Deserialize)]
         struct NodeStatusDto {
             registered: bool,
+            #[serde(default)]
+            expired: bool,
             #[serde(flatten, default)]
             info: RegisteredInfo,
         }
         let dto = NodeStatusDto::deserialize(deserializer)?;
         if dto.registered {
             Ok(NodeStatus::Registered(dto.info))
+        } else if dto.expired {
+            Ok(NodeStatus::Expired(dto.info))
         } else {
             Ok(NodeStatus::Unregistered)
         }

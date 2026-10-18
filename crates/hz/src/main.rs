@@ -176,6 +176,15 @@ async fn status(json_output: bool) -> std::process::ExitCode {
                 println!("未加入 HzNet");
                 std::process::ExitCode::SUCCESS
             }
+            Ok(NodeStatus::Expired(info)) => {
+                println!("已过期，请重新执行 hz up 登录");
+                print_identity(&info);
+                if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
+                    println!("网内域名后缀：{suffix}");
+                }
+                print_peers(&result);
+                std::process::ExitCode::SUCCESS
+            }
             Ok(NodeStatus::Registered(info)) => {
                 println!("已加入 HzNet");
                 print_identity(&info);

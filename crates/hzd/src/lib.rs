@@ -17,7 +17,7 @@ use hz_core::coord_client::{
 };
 use hz_core::endpoint::{self, DiscoveredEndpoint};
 use hz_core::ipc::{self, Handler};
-use hz_core::keys::KeyStore;
+use hz_core::keys::{KeyStore, NodeStaticSecret};
 use hz_core::map::{MapNode, NetworkMapCache};
 use hz_core::path::{PathEvent, PathManager, PeerEndpoints};
 use hz_core::policy::{InboundGate, InboundPolicyView};
@@ -41,6 +41,27 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// Endpoint 收集与上报周期（FR-8）。
 const ENDPOINT_COLLECT_EVERY: Duration = Duration::from_secs(30);
+
+/// 过期驻留时的轮询间隔：Network Map 订阅暂停，等待重新登录翻转状态。
+const EXPIRED_POLL: Duration = Duration::from_secs(2);
+
+/// 守护进程视角的注册会话状态机：Registered 与 Expired 共享同一份身份，
+/// 区别只在能否通信。Expired 不删除任何本地状态（ADR-0005：重新登录保身份）。
+#[derive(Debug, Clone)]
+enum Session {
+    None,
+    Registered(RegisteredInfo),
+    Expired(RegisteredInfo),
+}
+
+impl Session {
+    fn info(&self) -> Option<RegisteredInfo> {
+        match self {
+            Session::None => None,
+            Session::Registered(info) | Session::Expired(info) => Some(info.clone()),
+        }
+    }
+}
 
 /// 一次交互式登录在 hzd 内的进度；终态只保留最后一次，重复 up 覆盖。
 #[derive(Debug, Clone, Serialize)]
@@ -68,7 +89,7 @@ pub struct MapPeer {
 
 struct Daemon {
     state_dir: PathBuf,
-    registration: StdMutex<Option<RegisteredInfo>>,
+    registration: StdMutex<Session>,
     map_cache: Arc<NetworkMapCache>,
     engine: StdMutex<Option<Arc<SocketEngine>>>,
     /// 最近一次成功使用的 Coordination Server 地址；重启后自动重连用它。
@@ -86,6 +107,41 @@ struct Daemon {
     punch: Arc<StdMutex<PunchCounters>>,
     /// 等待中的 ping 探针（应答到达时唤醒）。
     probes: Arc<ping::Probes>,
+}
+
+impl Daemon {
+    fn registration_info(&self) -> Option<RegisteredInfo> {
+        self.registration
+            .lock()
+            .expect("registration poisoned")
+            .info()
+    }
+
+    /// 到期/吊销反应（FR-3）：记录 Expired 状态、拆掉全部对端隧道，
+    /// TUN 与本地身份保持原样，等 `hz up` 重新登录。重复触发是空操作。
+    fn mark_expired(&self, engine: &SocketEngine) {
+        let mut registration = self.registration.lock().expect("registration poisoned");
+        match &*registration {
+            Session::Registered(_) => {
+                *registration =
+                    Session::Expired(registration.info().expect("checked above in match"));
+            }
+            Session::Expired(_) | Session::None => return,
+        }
+        drop(registration);
+        engine.reconcile(Vec::new());
+        tracing::warn!(
+            "own node removed from network map (expired or revoked); \
+             data plane down until interactive re-login"
+        );
+    }
+
+    fn is_expired(&self) -> bool {
+        matches!(
+            &*self.registration.lock().expect("registration poisoned"),
+            Session::Expired(_)
+        )
+    }
 }
 
 pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()> {
@@ -109,7 +165,12 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
     };
     let daemon = Arc::new(Daemon {
         state_dir,
-        registration: StdMutex::new(registration.as_ref().map(|file| file.info.clone())),
+        registration: StdMutex::new(
+            registration
+                .as_ref()
+                .map(|file| Session::Registered(file.info.clone()))
+                .unwrap_or(Session::None),
+        ),
         map_cache,
         engine: StdMutex::new(None),
         coord_addr: StdMutex::new(
@@ -127,11 +188,8 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
     });
 
     // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
-    let boot_info = daemon
-        .registration
-        .lock()
-        .expect("registration poisoned")
-        .clone();
+    // 上次运行期间是否已过期不落盘：由 Map 订阅被拒（已过期）在线发现。
+    let boot_info = daemon.registration_info();
     if let Some(info) = boot_info {
         let coord_addr = daemon
             .coord_addr
@@ -174,8 +232,9 @@ async fn handle_request(
                 .expect("registration poisoned")
                 .clone();
             let status = match registration {
-                Some(info) => NodeStatus::Registered(info),
-                None => {
+                Session::Registered(info) => NodeStatus::Registered(info),
+                Session::Expired(info) => NodeStatus::Expired(info),
+                Session::None => {
                     return serde_json::to_value(NodeStatus::Unregistered)
                         .map_err(|e| e.to_string());
                 }
@@ -223,15 +282,34 @@ async fn handle_request(
                 }
                 None => {
                     // 无 Auth Key：交互式登录（FR-2）。申请到一次性链接立刻返回给
-                    // CLI 打印，轮询在后台任务里继续。
-                    let started =
-                        begin_interactive_login(&daemon.state_dir, &local_hostname(), &coord_addr)
-                            .await
-                            .map_err(|error| format!("{error:#}"))?;
+                    // CLI 打印，轮询在后台任务里继续。已注册（含已过期）的 Node
+                    // 重新登录按 ADR-0005 轮换 Node Key：先在内存暂存新密钥对，
+                    // 新公钥随 BeginLoginRequest 上行，登录完成才落盘生效。
+                    let already_registered = daemon.registration_info().is_some();
+                    let staged = already_registered.then(|| keys.stage_node_rotation());
+                    let node_key_pub = staged
+                        .as_ref()
+                        .map(|(_, public)| *public)
+                        .unwrap_or_else(|| keys.node_public());
+                    let started = begin_interactive_login(
+                        &daemon.state_dir,
+                        &local_hostname(),
+                        &coord_addr,
+                        node_key_pub,
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"))?;
                     *daemon.login.lock().expect("login poisoned") = LoginProgress::Pending;
                     let login_url = started.login_url.clone();
                     let expires_unix = started.expires_unix;
-                    spawn_login_poller(daemon.clone(), keys.clone(), started, coord_addr);
+                    let staged_secret = staged.map(|(secret, _)| secret);
+                    spawn_login_poller(
+                        daemon.clone(),
+                        keys.clone(),
+                        started,
+                        coord_addr,
+                        staged_secret,
+                    );
                     Ok(serde_json::json!({
                         "login_url": login_url,
                         "expires_unix": expires_unix,
@@ -287,13 +365,8 @@ async fn handle_request(
         }
         "login_poll" => {
             let progress = daemon.login.lock().expect("login poisoned").clone();
-            let registration = daemon
-                .registration
-                .lock()
-                .expect("registration poisoned")
-                .clone();
             let value = serde_json::to_value(&progress).map_err(|e| e.to_string())?;
-            match (&progress, registration) {
+            match (&progress, daemon.registration_info()) {
                 (LoginProgress::Completed, Some(info)) => {
                     let mut value = value;
                     value["node"] = serde_json::to_value(&info).map_err(|e| e.to_string())?;
@@ -331,7 +404,7 @@ async fn ping_peer(daemon: &Arc<Daemon>, target: &str) -> Result<Value, String> 
         .registration
         .lock()
         .expect("registration poisoned")
-        .clone()
+        .info()
         .ok_or_else(|| "本机未注册".to_string())?;
     let peer = daemon
         .map_cache
@@ -395,7 +468,7 @@ async fn finish_registration(
 ) -> Result<Value, String> {
     save_registration(&daemon.state_dir, &info, coord_addr)
         .map_err(|error| format!("{error:#}"))?;
-    *daemon.registration.lock().expect("registration poisoned") = Some(info.clone());
+    *daemon.registration.lock().expect("registration poisoned") = Session::Registered(info.clone());
     *daemon.coord_addr.lock().expect("coord addr poisoned") = Some(coord_addr.to_string());
     tracing::info!(node_id = %info.node_id, name = %info.name, "node registered");
     if let Err(error) = start_dataplane(daemon, keys, &info, coord_addr).await {
@@ -407,11 +480,14 @@ async fn finish_registration(
 
 /// 每 2 秒轮询一次登录状态，直到终态；总预算 10 分钟。
 /// 落定时刷新注册与数据面；失败原样透出给 login_poll。
+/// staged_secret 是重新登录暂存的新 Node Key：只有登录完成才提交（落盘 +
+/// 换引擎私钥 + 重放对账），失败路径不碰旧密钥。
 fn spawn_login_poller(
     daemon: Arc<Daemon>,
     keys: Arc<KeyStore>,
     started: StartedLogin,
     coord_addr: String,
+    staged_secret: Option<NodeStaticSecret>,
 ) {
     tokio::spawn(async move {
         let hostname = local_hostname();
@@ -428,6 +504,27 @@ fn spawn_login_poller(
             {
                 Ok(LoginPoll::Pending) => {}
                 Ok(LoginPoll::Completed(info)) => {
+                    if let Some(secret) = staged_secret {
+                        if let Err(error) = keys.commit_node_rotation(&daemon.state_dir, &secret) {
+                            let error = format!("Node Key 轮换落盘失败：{error:#}");
+                            tracing::error!(%error, "commit node key rotation failed");
+                            *daemon.login.lock().expect("login poisoned") =
+                                LoginProgress::Failed { error };
+                            return;
+                        }
+                        if let Some(engine) = daemon.engine.lock().expect("engine poisoned").clone()
+                        {
+                            engine.rotate_own_key(secret);
+                            let decisions =
+                                daemon.use_relay.lock().expect("use_relay poisoned").clone();
+                            apply_cache_to_engine(
+                                &daemon.map_cache,
+                                &engine,
+                                &info.node_id,
+                                &decisions,
+                            );
+                        }
+                    }
                     if let Err(error) = finish_registration(&daemon, &keys, info, &coord_addr).await
                     {
                         *daemon.login.lock().expect("login poisoned") =
@@ -453,12 +550,11 @@ fn spawn_login_poller(
 }
 
 fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {
-    let own_node_id = daemon
-        .registration
-        .lock()
-        .expect("registration poisoned")
-        .as_ref()
-        .map(|info| info.node_id.clone());
+    // 过期态不可能与任何对端通信；缓存留在盘上，status 不再展示对端。
+    if daemon.is_expired() {
+        return Vec::new();
+    }
+    let own_node_id = daemon.registration_info().map(|info| info.node_id);
     let ages = daemon
         .engine
         .lock()
@@ -525,7 +621,7 @@ async fn start_dataplane(
         .ok()
         .and_then(|text| text.parse().ok())
         .unwrap_or(0);
-    let engine = Arc::new(SocketEngine::bind(keys.node().clone(), port).await?);
+    let engine = Arc::new(SocketEngine::bind(keys.node(), port).await?);
     let endpoint = lan_endpoint(coord_addr, engine.local_addr().port()).await?;
     tracing::info!(%endpoint, "reporting lan endpoint");
 
@@ -543,10 +639,7 @@ async fn start_dataplane(
         daemon.probes.clone(),
     );
     spawn_map_task(
-        daemon.state_dir.clone(),
-        daemon.map_cache.clone(),
-        daemon.map_signal.clone(),
-        daemon.use_relay.clone(),
+        daemon.clone(),
         engine.clone(),
         info.node_id.clone(),
         endpoint.to_string(),
@@ -852,7 +945,7 @@ async fn apply_path_event(
             let Some(peer) = peers.iter().find(|peer| peer.endpoints.node_id == node_id) else {
                 return;
             };
-            let codec = PunchCodec::new(keys.node(), &peer.node_key);
+            let codec = PunchCodec::new(&keys.node(), &peer.node_key);
             let mut nonce = [0u8; 16];
             use rand_core::RngCore;
             rand_core::OsRng.fill_bytes(&mut nonce);
@@ -879,7 +972,7 @@ async fn apply_path_event(
             let Some(peer) = peers.iter().find(|peer| peer.endpoints.node_id == node_id) else {
                 return;
             };
-            let codec = PunchCodec::new(keys.node(), &peer.node_key);
+            let codec = PunchCodec::new(&keys.node(), &peer.node_key);
             let ack = PunchMessage::Ack { chosen };
             relay.send_datagram(&node_id, codec.seal(&ack)).await;
         }
@@ -902,7 +995,7 @@ async fn handle_punch_frame(
     }
     let now = hz_core::punch::now_unix();
     for peer in peer_endpoint_view(cache, own_node_id) {
-        let codec = PunchCodec::new(keys.node(), &peer.node_key);
+        let codec = PunchCodec::new(&keys.node(), &peer.node_key);
         let Some(message) = codec.open(frame, now) else {
             continue;
         };
@@ -1130,23 +1223,30 @@ fn spawn_tunnel_drain(
 /// Server 不可达也照常），然后循环 订阅 → 消费差量/全量 → 断线退避重连。
 /// 每次重连都重新走挑战认证并重报 Endpoint（服务端在流打开时落库）。
 /// Map 有实际变化时唤醒路径任务（打洞轮次紧跟对端 Endpoint 更新）。
-#[allow(clippy::too_many_arguments)]
+/// 到期反应（FR-3）：自己出现在 removed 差量、或订阅被服务端以「已过期」
+/// 拒绝时，转入 Expired 并拆掉对端，随后驻留轮询——不退避重连浪费连接，
+/// 重新登录完成后状态翻回 Registered，本任务自动恢复订阅。
 fn spawn_map_task(
-    state_dir: PathBuf,
-    cache: Arc<NetworkMapCache>,
-    map_signal: Arc<tokio::sync::Notify>,
-    use_relay: Arc<StdMutex<HashMap<String, bool>>>,
+    daemon: Arc<Daemon>,
     engine: Arc<SocketEngine>,
     own_node_id: String,
     endpoint: String,
     coord_addr: String,
     policy_gate: Arc<InboundGate>,
 ) {
+    let state_dir = daemon.state_dir.clone();
+    let cache = daemon.map_cache.clone();
+    let map_signal = daemon.map_signal.clone();
+    let use_relay = daemon.use_relay.clone();
     tokio::spawn(async move {
         let decisions = use_relay.lock().expect("use_relay poisoned").clone();
         apply_cache_to_engine(&cache, &engine, &own_node_id, &decisions);
         let mut backoff = BACKOFF_START;
         loop {
+            if daemon.is_expired() {
+                tokio::time::sleep(EXPIRED_POLL).await;
+                continue;
+            }
             match open_network_map_stream(&state_dir, vec![endpoint.clone()], &coord_addr).await {
                 Ok(mut stream) => {
                     backoff = BACKOFF_START;
@@ -1167,6 +1267,12 @@ fn spawn_map_task(
                             policy_gate.update(InboundPolicyView::from_proto(view));
                         }
                         if let Some(kind) = message.kind {
+                            let removed_own = match &kind {
+                                hz_proto::network_map_message::Kind::Delta(delta) => {
+                                    delta.removed_node_ids.iter().any(|id| id == &own_node_id)
+                                }
+                                hz_proto::network_map_message::Kind::Full(_) => false,
+                            };
                             let change = match kind {
                                 hz_proto::network_map_message::Kind::Full(map) => cache
                                     .apply_full(map.nodes.into_iter().map(MapNode::from).collect()),
@@ -1192,15 +1298,27 @@ fn spawn_map_task(
                                 apply_cache_to_engine(&cache, &engine, &own_node_id, &decisions);
                                 map_signal.notify_one();
                             }
+                            if removed_own {
+                                daemon.mark_expired(&engine);
+                                break;
+                            }
                         }
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "network map subscription failed");
+                    if error.to_string().contains("已过期") {
+                        tracing::warn!(%error, "coord rejected map subscription: node expired");
+                        daemon.mark_expired(&engine);
+                        backoff = BACKOFF_START;
+                    } else {
+                        tracing::warn!(%error, "network map subscription failed");
+                    }
                 }
             }
-            tokio::time::sleep(jittered(backoff)).await;
-            backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
+            if !daemon.is_expired() {
+                tokio::time::sleep(jittered(backoff)).await;
+                backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
+            }
         }
     });
 }
