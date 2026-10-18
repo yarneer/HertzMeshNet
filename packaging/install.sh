@@ -52,11 +52,11 @@ install_one() {
   name=$1
   fetch "$COORD_URL/dl/$PLATFORM/$name" "$STAGE/$name"
   want=$(manifest_sha "$PLATFORM/$name")
-  [ -n "$want" ] || fail "manifest 缺少 $PLATFORM/$name，服务器分发包不完整"
+  [ -n "$want" ] || fail "manifest 缺少 $PLATFORM/${name}，服务器分发包不完整"
   got=$(file_sha "$STAGE/$name")
-  [ "$got" = "$want" ] || fail "$name sha256 校验失败（期望 $want，实际 $got）"
+  [ "$got" = "$want" ] || fail "$name sha256 校验失败（期望 ${want}，实际 ${got}）"
   install -m 0755 "$STAGE/$name" "/usr/local/bin/$name"
-  echo "已安装 /usr/local/bin/$name（sha256 $got）"
+  echo "已安装 /usr/local/bin/${name}（sha256 ${got}）"
 }
 
 mkdir -p /usr/local/bin

@@ -25,7 +25,7 @@ esac
 
 for bin in hzd hz hz-coord; do
   if [ ! -f "$DIST_DIR/$PLATFORM/$bin" ]; then
-    echo "缺少 $DIST_DIR/$PLATFORM/$bin（先完成 musl release 构建并拷入 dist 目录）" >&2
+    echo "缺少 $DIST_DIR/$PLATFORM/${bin}（先完成 musl release 构建并拷入 dist 目录）" >&2
     exit 1
   fi
 done
