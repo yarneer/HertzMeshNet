@@ -52,10 +52,10 @@ set_password() {
   update=$(curl -sk -X POST "$ISSUER/v1/credential/_update" -H 'Content-Type: application/json' \
     -d "[{\"password\":\"$password\"},$sess]")
   echo "$update" | grep -q '"can_commit":true' \
-    || { echo "口令被质量检查拒绝（$user）：$update" >&2; exit 1; }
+    || { echo "口令被质量检查拒绝（${user}）：$update" >&2; exit 1; }
   commit=$(curl -sk -X POST "$ISSUER/v1/credential/_commit" -H 'Content-Type: application/json' \
     -d "$sess")
-  [ "$commit" = "null" ] || { echo "口令提交失败（$user）：$commit" >&2; exit 1; }
+  [ "$commit" = "null" ] || { echo "口令提交失败（${user}）：$commit" >&2; exit 1; }
 }
 
 # 口令登录 → 特权升级 → 输出特权 bearer。认证会话靠 auth-session-id cookie

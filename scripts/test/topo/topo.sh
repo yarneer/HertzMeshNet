@@ -68,7 +68,7 @@ load_scenario() {
     [[ "$node" =~ ^[a-z0-9]+$ ]] || die "节点名只允许小写字母数字：$node"
     case "$att" in
       lan|fullcone|portrestricted|symmetric) ;;
-      *) die "未知 NAT 绑定 $att（节点 $node）" ;;
+      *) die "未知 NAT 绑定 ${att}（节点 ${node}）" ;;
     esac
   done
 }
@@ -321,7 +321,7 @@ build_binaries() {
   for bin in hz-coord hz-relay hzd hz; do
     [[ -x $BIN_DIR/$bin ]] && continue
     command -v cargo >/dev/null 2>&1 || die "$BIN_DIR/$bin 缺失且无 cargo 可构建"
-    note "构建 release 二进制到 $BIN_DIR（首次约数分钟）"
+    note "构建 release 二进制到 ${BIN_DIR}（首次约数分钟）"
     (cd "$REPO_ROOT" && CARGO_TARGET_DIR="${HZ_TOPO_CARGO_TARGET_DIR:-/target}" \
        cargo build --release -p hz-coord -p hz-relay -p hzd -p hz || exit 1)
     local tgt="${HZ_TOPO_CARGO_TARGET_DIR:-/target}/release"
@@ -346,7 +346,7 @@ except OSError:
 ' "$host" "$port" 2>/dev/null; then return 0; fi
     sleep 1
   done
-  fail "$label 未就绪（$target）"
+  fail "$label 未就绪（${target}）"
   return 1
 }
 
@@ -377,7 +377,7 @@ start_relay() {
     --tls-self-signed --tls-san 203.0.113.1 --tls-ca-out "$ART_DIR/relay-ca.pem" \
     > "$ART_DIR/relay.log" 2>&1 &
   wait_tcp "$WAN_NS" "203.0.113.1:$RELAY_PORT" "Relay" || return 1
-  pass "Relay 已在 $WAN_NS 启动（203.0.113.1:$RELAY_PORT，TLS 自签，CA 已写出）"
+  pass "Relay 已在 $WAN_NS 启动（203.0.113.1:${RELAY_PORT}，TLS 自签，CA 已写出）"
 }
 
 start_reflector() {
@@ -399,7 +399,7 @@ while True:
         s.sendto(str(addr[1]).encode(), addr)
 PY
   sleep 0.3
-  ip netns pids "$WAN_NS" | grep -q . && pass "UDP 反射器已启动（$REFL_ADDR:$REFL_PORT_A/$REFL_PORT_B）"
+  ip netns pids "$WAN_NS" | grep -q . && pass "UDP 反射器已启动（$REFL_ADDR:$REFL_PORT_A/${REFL_PORT_B}）"
 }
 
 # ---------------------------------------------------------------------------
@@ -440,7 +440,7 @@ cmd_up() {
   if [[ $HZ_REFLECTOR == 1 ]]; then start_reflector; fi
   if [[ $HZ_COORD == 1 ]]; then start_coord || return 1; fi
   if [[ $HZ_RELAY == 1 ]]; then start_relay || return 1; fi
-  note "拓扑已就绪：场景 $scenario（artifacts: $ART_DIR）"
+  note "拓扑已就绪：场景 ${scenario}（artifacts: ${ART_DIR}）"
 }
 
 cmd_run() {

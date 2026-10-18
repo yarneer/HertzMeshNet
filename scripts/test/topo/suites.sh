@@ -35,11 +35,11 @@ start_node_daemon() { # start_node_daemon <node> <auth-key>
     ip netns exec "$ns" test -S "$ART_DIR/hzd-$name.sock" 2>/dev/null && break
     sleep 0.5
   done
-  ip netns exec "$ns" test -S "$ART_DIR/hzd-$name.sock" || { fail "$name：hzd socket 未出现"; return 1; }
+  ip netns exec "$ns" test -S "$ART_DIR/hzd-$name.sock" || { fail "${name}：hzd socket 未出现"; return 1; }
   if hz_cli "$name" up --auth-key "$key" >/dev/null 2>&1; then
-    pass "$name：hz up --auth-key 注册成功"
+    pass "${name}：hz up --auth-key 注册成功"
   else
-    fail "$name：注册失败（见 $ART_DIR/hz-node-$name.log）"
+    fail "${name}：注册失败（见 $ART_DIR/hz-node-$name.log）"
     return 1
   fi
 }
@@ -85,12 +85,12 @@ wait_for_log() { # wait_for_log <file> <pattern> <label> [timeout-secs]
   local file="$1" pattern="$2" label="$3" timeout="${4:-60}" i
   for i in $(seq 1 $((timeout * 2))); do
     if [[ -f $file ]] && grep -q "$pattern" "$file"; then
-      pass "$label（$(grep "$pattern" "$file" | tail -1 | cut -c1-160)）"
+      pass "${label}（$(grep "$pattern" "$file" | tail -1 | cut -c1-160)）"
       return 0
     fi
     sleep 0.5
   done
-  fail "$label：${timeout}s 内未在 $(basename "$file") 见到 /$pattern/"
+  fail "${label}：${timeout}s 内未在 $(basename "$file") 见到 /$pattern/"
   return 1
 }
 
@@ -128,9 +128,9 @@ assert_single_udp_socket() { # assert_single_udp_socket <node...>
     ns=$(node_ns "$node")
     count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
     if [[ $count == 1 ]]; then
-      pass "$node：hzd 恰好 1 个 UDP socket（WireGuard/打洞/STUN 共用，ADR-0002）"
+      pass "${node}：hzd 恰好 1 个 UDP socket（WireGuard/打洞/STUN 共用，ADR-0002）"
     else
-      fail "$node：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
+      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
     fi
   done
 }
@@ -180,7 +180,7 @@ assert_suite_lan() {
       local blackhole
       blackhole=$(ip netns exec "$ns" ip route get "$b_lan_ip" 2>/dev/null | head -1)
       if [[ $blackhole == *proxytun* ]]; then
-        pass "黑洞生效：未绑定流量到 $b_lan_ip 已被第三方 TUN 吞下（$blackhole）"
+        pass "黑洞生效：未绑定流量到 $b_lan_ip 已被第三方 TUN 吞下（${blackhole}）"
       else
         fail "黑洞未生效，共存场景不成立：$blackhole"
       fi
@@ -190,24 +190,24 @@ assert_suite_lan() {
     local estab
     estab=$(ip netns exec "$ns" sh -c "ss -t -n -p 2>/dev/null | grep hzd | grep -c ESTAB || true")
     if (( estab >= 1 )); then
-      pass "$a：黑洞之下 hzd 与 Coordination Server 的 TCP 连接仍存活（ESTAB x${estab}）"
+      pass "${a}：黑洞之下 hzd 与 Coordination Server 的 TCP 连接仍存活（ESTAB x${estab}）"
     else
-      fail "$a：hzd 到 Coordination Server 的 TCP 连接丢失"
+      fail "${a}：hzd 到 Coordination Server 的 TCP 连接丢失"
     fi
     if hz_cli "$a" status >/dev/null 2>&1; then
-      pass "$a：hz status 经本地 IPC 正常返回"
+      pass "${a}：hz status 经本地 IPC 正常返回"
     else
-      fail "$a：hz status 失败"
+      fail "${a}：hz status 失败"
     fi
   fi
 
   note "断言 1：双向 IPv4 Node Address ping"
-  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
 
   note "断言 2：双向 ULA IPv6 Node Address ping"
-  ping_assert "$a" "$b6" "$a → $b IPv6（$b6）" -6
-  ping_assert "$b" "$a6" "$b → $a IPv6（$a6）" -6
+  ping_assert "$a" "$b6" "$a → $b IPv6（${b6}）" -6
+  ping_assert "$b" "$a6" "$b → $a IPv6（${a6}）" -6
 
   note "断言 3：hz0 只接管 HzNet 段（100.100.2.136 不入隧道）"
   local node ns route hz_route
@@ -215,15 +215,15 @@ assert_suite_lan() {
     ns=$(node_ns "$node")
     route=$(ip netns exec "$ns" ip route get 100.100.2.136 2>/dev/null | head -1)
     if [[ $route != *hz0* ]]; then
-      pass "$node：100.100.2.136 不经 hz0（$route）"
+      pass "${node}：100.100.2.136 不经 hz0（${route}）"
     else
-      fail "$node：100.100.2.136 被路由进 hz0：$route"
+      fail "${node}：100.100.2.136 被路由进 hz0：$route"
     fi
     hz_route=$(ip netns exec "$ns" ip route show dev hz0 2>/dev/null)
     if [[ $hz_route == *"100.96.0.0/16"* && $hz_route != *"100.64.0.0/10"* ]]; then
-      pass "$node：hz0 仅接管 100.96.0.0/16（$hz_route）"
+      pass "${node}：hz0 仅接管 100.96.0.0/16（${hz_route}）"
     else
-      fail "$node：hz0 路由异常：$hz_route"
+      fail "${node}：hz0 路由异常：$hz_route"
     fi
   done
 
@@ -232,9 +232,9 @@ assert_suite_lan() {
     ns=$(node_ns "$node")
     count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
     if [[ $count == 1 ]]; then
-      pass "$node：hzd 恰好 1 个 UDP socket"
+      pass "${node}：hzd 恰好 1 个 UDP socket"
     else
-      fail "$node：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
+      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
     fi
   done
 
@@ -265,7 +265,7 @@ s.sendto(b'knock', ('$1', $2))
 "
 }
 
-unsolicited_listener() { # unsolicited_listener <node>：监听 $HZ_WG_PORT，输出 RECV 或 TIMEOUT
+unsolicited_listener() { # unsolicited_listener <node>：监听 ${HZ_WG_PORT}，输出 RECV 或 TIMEOUT
   local ns; ns=$(node_ns "$1")
   ip netns exec "$ns" timeout 5 python3 - <<PY
 import socket
@@ -284,23 +284,23 @@ assert_suite_selftest() {
     IFS='|' read -r name att ns ipaddr extport _ <<<"$row"
     wanip="203.0.113.1$(nat_num_of "$att")"
     note "[$name / $att] 映射观测：同一 UDP socket 发往反射器两个端口"
-    out=$(nat_probe "$name") || { fail "$name：反射器探测无应答"; continue; }
+    out=$(nat_probe "$name") || { fail "${name}：反射器探测无应答"; continue; }
     pa=${out% *}; pb=${out#* }
     case "$att" in
       fullcone)
         [[ $pa == "$extport" && $pb == "$extport" ]] \
-          && pass "$name：完全锥形——两个目标看到同一外端口 ${pa}（= 静态映射 $extport）" \
-          || fail "$name：完全锥形映射不稳定：$pa/$pb ≠ $extport"
+          && pass "${name}：完全锥形——两个目标看到同一外端口 ${pa}（= 静态映射 ${extport}）" \
+          || fail "${name}：完全锥形映射不稳定：$pa/$pb ≠ $extport"
         ;;
       portrestricted)
         [[ $pa == "$extport" && $pb == "$extport" ]] \
-          && pass "$name：端口受限——映射与目标无关（${pa} = $extport）" \
-          || fail "$name：端口受限映射不稳定：$pa/$pb ≠ $extport"
+          && pass "${name}：端口受限——映射与目标无关（${pa} = ${extport}）" \
+          || fail "${name}：端口受限映射不稳定：$pa/$pb ≠ $extport"
         ;;
       symmetric)
         [[ $pa != "$pb" ]] \
-          && pass "$name：对称型——两个目标看到不同外端口（$pa ≠ $pb）" \
-          || fail "$name：对称型未表现出按流变化：$pa == $pb"
+          && pass "${name}：对称型——两个目标看到不同外端口（$pa ≠ ${pb}）" \
+          || fail "${name}：对称型未表现出按流变化：$pa == $pb"
         ;;
     esac
 
@@ -316,13 +316,13 @@ assert_suite_selftest() {
     case "$att" in
       fullcone)
         [[ $out == RECV* ]] \
-          && pass "$name：完全锥形——任意第三方入站直达 Node（$out）" \
-          || fail "$name：完全锥形应放行任意入站，实际：$out"
+          && pass "${name}：完全锥形——任意第三方入站直达 Node（${out}）" \
+          || fail "${name}：完全锥形应放行任意入站，实际：$out"
         ;;
       portrestricted|symmetric)
         [[ $out == TIMEOUT ]] \
-          && pass "$name：$att——未见目标之外的入站被丢弃" \
-          || fail "$name：$att 不应放行第三方入站，实际：$out"
+          && pass "${name}：$att——未见目标之外的入站被丢弃" \
+          || fail "${name}：$att 不应放行第三方入站，实际：$out"
         ;;
     esac
   done < <(reg_list)
@@ -359,21 +359,21 @@ assert_suite_relay() {
   note "$b=${b4} / ${b6}；$a=${a4} / ${a6}"
 
   note "断言 1：经 Relay 的双向 IPv4 Node Address ping"
-  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（${a4}）"
 
   note "断言 2：经 Relay 的双向 ULA IPv6 ping（WG 加密任意 IP，中继不改路径语义）"
-  ping_assert "$a" "$b6" "$a → $b IPv6 经 Relay（$b6）" -6
-  ping_assert "$b" "$a6" "$b → $a IPv6 经 Relay（$a6）" -6
+  ping_assert "$a" "$b6" "$a → $b IPv6 经 Relay（${b6}）" -6
+  ping_assert "$b" "$a6" "$b → $a IPv6 经 Relay（${a6}）" -6
 
   note "断言 3：路径确实经过 Relay（双方各持一条到 $RELAY_PORT 的 ESTAB，会话各开一次）"
   for node in "$a" "$b"; do
     ns=$(node_ns "$node")
     estab=$(ip netns exec "$ns" sh -c "ss -t -n -p 2>/dev/null | grep hzd | grep -c ':$RELAY_PORT' || true")
     if (( estab >= 1 )); then
-      pass "$node：hzd 与 Relay 的 TLS 连接存活（ESTAB x${estab}）"
+      pass "${node}：hzd 与 Relay 的 TLS 连接存活（ESTAB x${estab}）"
     else
-      fail "$node：hzd 到 Relay 的 TLS 连接缺失"
+      fail "${node}：hzd 到 Relay 的 TLS 连接缺失"
     fi
   done
   local opened
@@ -391,7 +391,7 @@ assert_suite_relay() {
   if (( probe_rc != 0 )) && [[ $probe_out == *"被拒绝"* ]]; then
     pass "未注册身份被拒：$probe_out"
   else
-    fail "未注册身份应被拒绝（rc=$probe_rc）：$probe_out"
+    fail "未注册身份应被拒绝（rc=${probe_rc}）：$probe_out"
   fi
 
   note "断言 5：Relay 日志只见密文帧（载荷带 pattern 的 ping 不在日志出现明文）"
@@ -431,10 +431,10 @@ assert_suite_direct() {
   a4=$(peer_field "$b" ipv4); a6=$(peer_field "$b" ipv6)
 
   note "断言 1：双向 IPv4 / ULA IPv6 Node Address ping"
-  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
-  ping_assert "$a" "$b6" "$a → $b IPv6（$b6）" -6
-  ping_assert "$b" "$a6" "$b → $a IPv6（$a6）" -6
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
+  ping_assert "$a" "$b6" "$a → $b IPv6（${b6}）" -6
+  ping_assert "$b" "$a6" "$b → $a IPv6（${a6}）" -6
 
   note "断言 2：双方 hzd 日志出现 path=direct（打洞升级成功）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
@@ -443,9 +443,9 @@ assert_suite_direct() {
   wait_peer_path "$a" direct 30 || return 1
   wait_peer_path "$b" direct 30 || return 1
   if hz_cli "$a" status | grep -q "Direct Path"; then
-    pass "$a：hz status 对端表出现 Direct Path"
+    pass "${a}：hz status 对端表出现 Direct Path"
   else
-    fail "$a：hz status 缺少 Direct Path：$(hz_cli "$a" status | tail -2)"
+    fail "${a}：hz status 缺少 Direct Path：$(hz_cli "$a" status | tail -2)"
   fi
 
   note "断言 3：STUN 公网 Endpoint 已发现并上报（锥形静态映射端口）"
@@ -456,11 +456,11 @@ assert_suite_direct() {
   ext_a=$(reg_field "$a" 5); ext_b=$(reg_field "$b" 5)
   # 日志行带 ANSI 颜色码，直接匹配 "值+空格"（字段值后即消息文本）。
   grep -q "$wan_a:$ext_a$" "$ART_DIR/hz-node-$a.log" \
-    && pass "$a：STUN Endpoint = $wan_a:$ext_a（静态映射端口）" \
-    || fail "$a：STUN Endpoint 与静态映射不符（期望 $wan_a:$ext_a）：$(grep 'stun mapped' "$ART_DIR/hz-node-$a.log" | tail -1)"
+    && pass "${a}：STUN Endpoint = $wan_a:${ext_a}（静态映射端口）" \
+    || fail "${a}：STUN Endpoint 与静态映射不符（期望 $wan_a:${ext_a}）：$(grep 'stun mapped' "$ART_DIR/hz-node-$a.log" | tail -1)"
   grep -q "$wan_b:$ext_b$" "$ART_DIR/hz-node-$b.log" \
-    && pass "$b：STUN Endpoint = $wan_b:$ext_b（静态映射端口）" \
-    || fail "$b：STUN Endpoint 与静态映射不符（期望 $wan_b:$ext_b）：$(grep 'stun mapped' "$ART_DIR/hz-node-$b.log" | tail -1)"
+    && pass "${b}：STUN Endpoint = $wan_b:${ext_b}（静态映射端口）" \
+    || fail "${b}：STUN Endpoint 与静态映射不符（期望 $wan_b:${ext_b}）：$(grep 'stun mapped' "$ART_DIR/hz-node-$b.log" | tail -1)"
 
   note "断言 4：Coordination Server 不参与打洞信令（coord 日志无 punch 痕迹）"
   local punch_hits
@@ -492,8 +492,8 @@ assert_suite_symcone() {
   b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
 
   note "断言 1：双向 ping（经 Relay）"
-  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（${a4}）"
 
   note "断言 2：60s 观察窗内不出现 path=direct（直连失败后稳定走 Relay，不抖动）"
   flaps=0
@@ -509,7 +509,7 @@ assert_suite_symcone() {
   fi
 
   note "断言 3：窗口结束时连通仍在"
-  ping_assert "$a" "$b4" "$a → $b 窗口后仍通（$b4）"
+  ping_assert "$a" "$b4" "$a → $b 窗口后仍通（${b4}）"
 
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
@@ -528,8 +528,8 @@ assert_suite_symsym() {
   b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
 
   note "断言 1：双向 ping（经 Relay）"
-  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（${a4}）"
 
   note "断言 2：60s 观察窗内不出现 path=direct"
   flaps=0
@@ -541,7 +541,7 @@ assert_suite_symsym() {
   (( flaps == 0 )) && pass "双对称 NAT 稳定走 Relay" || fail "出现 path=direct x${flaps}，双对称不应直连"
 
   note "断言 3：窗口结束时连通仍在"
-  ping_assert "$a" "$b4" "$a → $b 窗口后仍通（$b4）"
+  ping_assert "$a" "$b4" "$a → $b 窗口后仍通（${b4}）"
 
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
@@ -561,14 +561,14 @@ assert_suite_v6pair() {
   local a_v6 b_v6
   a_v6=$(ip netns exec "$a_ns" ip -6 addr show dev eth0 scope global | awk '/2001:db8/{print $2; exit}' | cut -d/ -f1)
   b_v6=$(ip netns exec "$b_ns" ip -6 addr show dev eth0 scope global | awk '/2001:db8/{print $2; exit}' | cut -d/ -f1)
-  [[ -n $a_v6 && -n $b_v6 ]] || { fail "Node 缺少 v6 地址（a=$a_v6 b=$b_v6），HZ_WAN_V6 未生效？"; return 1; }
+  [[ -n $a_v6 && -n $b_v6 ]] || { fail "Node 缺少 v6 地址（a=$a_v6 b=${b_v6}），HZ_WAN_V6 未生效？"; return 1; }
   local probe_rc=1 probe
   for probe in 1 2 3 4 5 6 7 8 9 10; do
     if ip netns exec "$a_ns" ping -6 -c 2 -W 2 "$b_v6" >/dev/null 2>&1; then probe_rc=0; break; fi
     sleep 1
   done
   if (( probe_rc == 0 )); then
-    pass "底层 v6 直达（$a_v6 → $b_v6，DAD 稳定后第 ${probe} 次探测通过）"
+    pass "底层 v6 直达（$a_v6 → ${b_v6}，DAD 稳定后第 ${probe} 次探测通过）"
   else
     fail "底层 v6 不通，v6 直连无从谈起"
   fi
@@ -580,10 +580,10 @@ assert_suite_v6pair() {
   a4=$(peer_field "$b" ipv4); a6=$(peer_field "$b" ipv6)
 
   note "断言 1：Node Address 双向 ping（v4 与 ULA v6）"
-  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
-  ping_assert "$a" "$b6" "$a → $b IPv6（$b6）" -6
-  ping_assert "$b" "$a6" "$b → $a IPv6（$a6）" -6
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
+  ping_assert "$a" "$b6" "$a → $b IPv6（${b6}）" -6
+  ping_assert "$b" "$a6" "$b → $a IPv6（${a6}）" -6
 
   note "断言 2：双方选择 IPv6 Direct Path（日志 path=direct 的 endpoint 落在 2001:db8::/32）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct.*2001:db8" "$a 以 IPv6 直连" 90 || return 1
@@ -611,7 +611,7 @@ assert_suite_blockfallback() {
   start_pair_with_relay "$a" "$b" || return 1
   wait_pair_mutual_view "$a" "$b" || return 1
   b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
-  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
 
@@ -628,8 +628,8 @@ assert_suite_blockfallback() {
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=relay" "$b 退回 Relayed Path" 15 || return 1
 
   note "断言 2：连通不中断（退回后 ping 恢复应答）"
-  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay 恢复（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay 恢复（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay 恢复（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay 恢复（${a4}）"
 
   note "断言 3：退回后 20s 内不再反复升级（阻断期间无 path=direct 增量）"
   sleep 20
@@ -672,7 +672,7 @@ assert_suite_proxysim() {
     local defaults
     defaults=$(ip netns exec "$ns" ip route show default)
     if [[ $defaults == *proxytun* && $defaults == *eth0* ]]; then
-      pass "黑洞生效：默认路由由第三方 TUN 以更优 metric 接管，物理默认保留在 eth0（$defaults）"
+      pass "黑洞生效：默认路由由第三方 TUN 以更优 metric 接管，物理默认保留在 eth0（${defaults}）"
     else
       fail "默认路由形态异常：$defaults"
     fi
@@ -688,17 +688,17 @@ assert_suite_proxysim() {
   wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 90 || return 1
   expected="203.0.113.1$(nat_num_of fullcone):$(reg_field "$a" 5)"
   if grep -q -- "$expected" "$ART_DIR/hz-node-a.log"; then
-    pass "$a：STUN Endpoint = $expected（真实出口，非黑洞地址 198.18.0.1）"
+    pass "${a}：STUN Endpoint = ${expected}（真实出口，非黑洞地址 198.18.0.1）"
   else
     stun_line=$(grep "stun mapped endpoint discovered" "$ART_DIR/hz-node-a.log" | tail -1)
-    fail "$a：STUN Endpoint 异常（期望 $expected）：$stun_line"
+    fail "${a}：STUN Endpoint 异常（期望 ${expected}）：$stun_line"
   fi
 
   note "断言 2：黑洞之下仍建立 Direct Path、双向 ping"
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path（黑洞共存）" 90 || return 1
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path（黑洞共存）" 90 || return 1
-  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
 
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
@@ -720,7 +720,7 @@ wait_peer_set() { # wait_peer_set <node> <期望对端名逗号串>
     if [[ $(peer_names_of "$node") == "$expected" ]]; then return 0; fi
     sleep 0.5
   done
-  fail "$node：对端视图未在 30s 内变为 [$expected]，实际 [$(peer_names_of "$node")]"
+  fail "${node}：对端视图未在 30s 内变为 [$expected]，实际 [$(peer_names_of "$node")]"
   return 1
 }
 
@@ -853,7 +853,7 @@ EOF
   if (( dropped_after > dropped_before )); then
     pass "d 的 Policy 丢弃计数增加：$dropped_before → $dropped_after"
   else
-    fail "d 的丢弃计数未增加（$dropped_before → $dropped_after）"
+    fail "d 的丢弃计数未增加（$dropped_before → ${dropped_after}）"
   fi
 
   note "断言 4：b → d:5432 不通（b 的 Map 没有 d，无路由/无对端）"
@@ -864,7 +864,7 @@ EOF
   fi
 
   note "断言 5：a ping d 可达（非 TCP/UDP 跟随 Map 可见性）"
-  ping_assert "$a" "$d4" "a → d ICMP（$d4）"
+  ping_assert "$a" "$d4" "a → d ICMP（${d4}）"
 
   note "断言 6：第二份 Policy 放行 22 → 5 秒内生效"
   cat > "$ART_DIR/policy-5432-22.toml" <<'EOF'
@@ -957,12 +957,12 @@ wait_peer_path() { # wait_peer_path <node> <direct|relay> [timeout-secs]
   for i in $(seq 1 $((timeout * 2))); do
     current=$(peer_field "$node" path 2>/dev/null)
     if [[ $current == "$expected" ]]; then
-      pass "$node：hz status 路径=$expected（数据面报告）"
+      pass "${node}：hz status 路径=${expected}（数据面报告）"
       return 0
     fi
     sleep 0.5
   done
-  fail "$node：hz status 路径未变为 $expected（当前 ${current:-无}）"
+  fail "${node}：hz status 路径未变为 ${expected}（当前 ${current:-无}）"
   return 1
 }
 
@@ -1021,30 +1021,30 @@ assert_suite_ratelimit() {
   b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
 
   note "断言 0：双向 ping 打热 Relayed Path"
-  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4 经 Relay（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4 经 Relay（${a4}）"
 
   note "断言 1：hz status 显示每个对端的路径 Relayed Path"
   wait_peer_path "$a" relay || return 1
   wait_peer_path "$b" relay || return 1
   if hz_cli "$a" status | grep -q "Relayed Path"; then
-    pass "$a：hz status 对端表出现 Relayed Path"
+    pass "${a}：hz status 对端表出现 Relayed Path"
   else
-    fail "$a：hz status 缺少 Relayed Path：$(hz_cli "$a" status | tail -2)"
+    fail "${a}：hz status 缺少 Relayed Path：$(hz_cli "$a" status | tail -2)"
   fi
 
   note "断言 2：hz ping 显示往返时延与所走路径"
   rc=0; out=$(hz_cli "$a" ping "hznode$b") || rc=$?
   if [[ $rc -eq 0 && $out == *"往返"* && $out == *"Relayed Path"* ]]; then
-    pass "$a → $b：$out"
+    pass "$a → ${b}：$out"
   else
-    fail "hz ping 输出异常（rc=$rc）：$out"
+    fail "hz ping 输出异常（rc=${rc}）：$out"
   fi
   rc=0; out=$(hz_cli "$b" ping "hznode$a") || rc=$?
   if [[ $rc -eq 0 && $out == *"往返"* && $out == *"Relayed Path"* ]]; then
-    pass "$b → $a：$out"
+    pass "$b → ${a}：$out"
   else
-    fail "hz ping 输出异常（rc=$rc）：$out"
+    fail "hz ping 输出异常（rc=${rc}）：$out"
   fi
 
   note "断言 3：单个 Node 经 Relay 的吞吐不超过配置上限"
@@ -1071,9 +1071,9 @@ assert_suite_ratelimit() {
     fail "缺少 $ida 的 in 字节计数：$bytes_in"
   fi
   if [[ -n $dropped && $dropped -gt 0 ]]; then
-    pass "hz_relay_dropped_bytes_total[$ida] = $dropped（限速丢帧在案）"
+    pass "hz_relay_dropped_bytes_total[$ida] = ${dropped}（限速丢帧在案）"
   else
-    fail "丢弃计数缺失或为零：$dropped（限速 2 Mbps 下超限帧应有丢弃）"
+    fail "丢弃计数缺失或为零：${dropped}（限速 2 Mbps 下超限帧应有丢弃）"
   fi
   if [[ $sessions == 2 ]]; then
     pass "hz_relay_sessions = 2"
@@ -1098,7 +1098,7 @@ assert_suite_ratelimit() {
     fail "hz_coord_online_nodes = ${online:-缺失}（应为 2）"
   fi
   if [[ -n $attempts && $attempts -gt 0 ]]; then
-    pass "hz_coord_punch_attempts_total = $attempts（双对称打洞在案）"
+    pass "hz_coord_punch_attempts_total = ${attempts}（双对称打洞在案）"
   else
     fail "hz_coord_punch_attempts_total = ${attempts:-缺失}（应为 >0）"
   fi
@@ -1190,13 +1190,13 @@ PY
   if (( rc != 0 )) && [[ $out == *"需要 Admin 权限"* ]]; then
     pass "b（普通 User）：签发被拒（需要 Admin 权限）"
   else
-    fail "b：签发应被拒（rc=$rc）：$out"
+    fail "b：签发应被拒（rc=${rc}）：$out"
   fi
   rc=0; out=$(hz_cli "$d" authkey create --expiry 7d 2>&1) || rc=$?
   if (( rc != 0 )) && [[ $out == *"带 Tag"* ]]; then
     pass "d（带 Tag 的 Node）：管理操作被拒"
   else
-    fail "d：签发应被拒（rc=$rc）：$out"
+    fail "d：签发应被拒（rc=${rc}）：$out"
   fi
 
   note "断言 4：hz node list 的可见范围（Admin 全部 / User 自己名下）"
@@ -1236,15 +1236,15 @@ PY
     return 1
   fi
   if ip netns exec "$(node_ns "$a")" ping -c 3 -W 2 "$b4" > /dev/null 2>&1; then
-    fail "a → b（$b4）不应再 ping 通"
+    fail "a → b（${b4}）不应再 ping 通"
   else
-    pass "a → b（$b4）ICMP 不通（Seam A）"
+    pass "a → b（${b4}）ICMP 不通（Seam A）"
   fi
   rc=0; out=$(hz_cli "$a" ping hznodeb 2>&1) || rc=$?
   if (( rc != 0 )) && [[ $out == *"找不到对端"* ]]; then
     pass "a：hz ping hznodeb 找不到对端"
   else
-    fail "a：hz ping hznodeb 应失败（rc=$rc）：$out"
+    fail "a：hz ping hznodeb 应失败（rc=${rc}）：$out"
   fi
   local i revoked_seen=""
   for i in $(seq 1 20); do
@@ -1262,7 +1262,7 @@ PY
   if (( rc != 0 )) && [[ $out == *"Node Name 已存在"* ]]; then
     pass "改名到已存在的名字被拒：$out"
   else
-    fail "改名冲突应被拒（rc=$rc）：$out"
+    fail "改名冲突应被拒（rc=${rc}）：$out"
   fi
 
   note "断言 7：改成新名 → 对端 Map 与本地 DNS 应答跟随"
@@ -1309,12 +1309,12 @@ wait_new_direct_log() { # wait_new_direct_log <node> <已有条数> [timeout-sec
   for i in $(seq 1 $((timeout * 2))); do
     now=$(grep -c "path=direct" "$ART_DIR/hz-node-$node.log" 2>/dev/null || true)
     if (( now > before )); then
-      pass "$node：换网后再次出现 path=direct（第 ${now} 条）"
+      pass "${node}：换网后再次出现 path=direct（第 ${now} 条）"
       return 0
     fi
     sleep 0.5
   done
-  fail "$node：${timeout}s 内未见新的 path=direct（仍 ${now:-0} 条）"
+  fail "${node}：${timeout}s 内未见新的 path=direct（仍 ${now:-0} 条）"
   return 1
 }
 
@@ -1329,14 +1329,14 @@ assert_suite_netchange() {
   b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
 
   note "断言 1：换网前双向 ping 且已建立 Direct Path"
-  ping_assert "$a" "$b4" "$a → $b IPv4（$b4）"
-  ping_assert "$b" "$a4" "$b → $a IPv4（$a4）"
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
   wait_peer_path "$a" direct 30 || return 1
   old_ext=$(last_stun_endpoint "$a")
   [[ $old_ext == 203.0.113.11:* ]] || { fail "$a 换网前 STUN Endpoint 异常：${old_ext:-无}"; return 1; }
-  pass "$a 换网前 STUN Endpoint = $old_ext（NAT1 出口）"
+  pass "$a 换网前 STUN Endpoint = ${old_ext}（NAT1 出口）"
 
   note "断言 2：更换 $a 的上游出口（NAT 换 WAN IP + 新静态映射 + 换网卡与新内网地址，模拟换 Wi-Fi）"
   # path=direct 基线在搬移前取：恢复可能快过后续断言的簿记，事后取会漏计。
@@ -1369,15 +1369,15 @@ assert_suite_netchange() {
   else
     fail "30s 内未恢复连通（AC 不满足，现场见 forensics）"
   fi
-  ping_assert "$b" "$a4" "$b → $a 恢复后双向（$a4）"
+  ping_assert "$b" "$a4" "$b → $a 恢复后双向（${a4}）"
 
   note "断言 5：恢复后 a 的 STUN Endpoint 已更换为新 NAT 出口"
   wait_for_log "$ART_DIR/hz-node-$a.log" "$new_ext" "$a 新 STUN Endpoint $new_ext" 30 || return 1
   now=$(last_stun_endpoint "$a")
   if [[ $now == "$new_ext" && $now != "$old_ext" ]]; then
-    pass "$a STUN Endpoint $old_ext → $now（出口 IP 已更换）"
+    pass "$a STUN Endpoint $old_ext → ${now}（出口 IP 已更换）"
   else
-    fail "$a 最近 STUN Endpoint = ${now:-无}（期望 $new_ext，旧值 $old_ext）"
+    fail "$a 最近 STUN Endpoint = ${now:-无}（期望 ${new_ext}，旧值 ${old_ext}）"
   fi
 
   note "断言 6：条件允许时再次升级 Direct Path（≤60s）"

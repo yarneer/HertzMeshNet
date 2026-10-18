@@ -16,6 +16,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Shell 变量后全角标点检查（bash 3.2 会吞变量名）
+        run: |
+          if grep -rnP '\$[A-Za-z_][A-Za-z0-9_]*(?=[（）：，、。！？])' --include='*.sh' scripts packaging; then
+            echo '::error::变量后紧跟全角标点必须写 ${var}'; exit 1; fi
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
