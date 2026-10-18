@@ -85,6 +85,11 @@ impl MapHub {
         self.wake.notify_one();
         rx
     }
+
+    /// 打开中的下发流数（在线 Node 数，FR-12 指标用）。
+    pub fn online_nodes(&self) -> usize {
+        self.subscribers.lock().expect("map hub poisoned").len()
+    }
 }
 
 /// 一轮推送的输入快照：全部在册 Node + 当前 Policy（None = 尚无 Policy，

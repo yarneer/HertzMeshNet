@@ -3,13 +3,15 @@
 //! 本模块的领域结构；身份校验在流边界完成——首帧 RelayHello 经
 //! Coordination Server 的 RelayCheckNode 代理验证，未通过的流不进入转发。
 
+pub mod limiter;
+pub mod metrics;
 pub mod tls;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hz_proto::coord_client::CoordClient;
 use hz_proto::relay_frame;
@@ -20,10 +22,15 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Channel, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::limiter::Limiter;
+use crate::metrics::{Metrics, MetricsHandle, serve_metrics};
+
 /// 认证前等待首帧 RelayHello 的时限。
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// 每会话出向队列深度。满则丢弃该帧（WireGuard 自带重传，不阻塞其他会话）。
 const SESSION_DEPTH: usize = 128;
+/// 每 Node 的 Relay 限速默认值（FR-9：默认 10 Mbps、可配置）。
+pub const DEFAULT_RATE_LIMIT_MBPS: u64 = 10;
 
 pub struct RelayConfig {
     pub listen: SocketAddr,
@@ -32,28 +39,51 @@ pub struct RelayConfig {
     pub coord_addr: String,
     /// bootstrap 签发的 Relay Token。
     pub relay_token: String,
+    /// 每 Node 的入口限速（Mbps）。桶容量为 1 秒额度。
+    pub rate_limit_mbps: u64,
+    /// Prometheus /metrics 监听地址；None 时不开指标面。
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 pub struct RelayHandle {
     pub local_addr: SocketAddr,
     shutdown: tokio::sync::watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    metrics: Option<MetricsHandle>,
 }
 
 impl RelayHandle {
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
+        if let Some(metrics) = &self.metrics {
+            metrics.shutdown();
+        }
     }
 
     pub async fn terminated(self) {
         let _ = self.join.await;
+        if let Some(metrics) = self.metrics {
+            let _ = metrics.terminated().await;
+        }
+    }
+
+    /// 指标面的实际监听地址（配置了 metrics_listen 时才有）。
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.metrics.as_ref().map(|metrics| metrics.local_addr)
     }
 }
 
 pub async fn serve_relay(config: RelayConfig) -> anyhow::Result<RelayHandle> {
     let coord = CoordClient::new(connect_coord(&config.coord_addr).await?);
+    let metrics = Arc::new(Metrics::new()?);
+    let metrics_handle = match config.metrics_listen {
+        Some(listen) => Some(serve_metrics(listen, metrics.clone()).await?),
+        None => None,
+    };
     let service = RelayServiceImpl {
         sessions: Arc::new(SessionRegistry::default()),
+        limiter: Arc::new(StdMutex::new(Limiter::new(config.rate_limit_mbps))),
+        metrics,
         coord,
         relay_token: config.relay_token,
     };
@@ -83,6 +113,7 @@ pub async fn serve_relay(config: RelayConfig) -> anyhow::Result<RelayHandle> {
         local_addr,
         shutdown: shutdown_tx,
         join,
+        metrics: metrics_handle,
     })
 }
 
@@ -115,18 +146,33 @@ fn error_frame(code: &str, message: &str) -> Result<RelayFrame, Status> {
 
 struct RelayServiceImpl {
     sessions: Arc<SessionRegistry>,
+    limiter: Arc<StdMutex<Limiter>>,
+    metrics: Arc<Metrics>,
     coord: CoordClient<Channel>,
     relay_token: String,
 }
 
-/// 按登记表转发一帧数据；目标不在线时向发送端回 dst_not_connected。
+/// 按登记表转发一帧数据；先过发送方的入口限速（FR-9），目标不在线时向
+/// 发送端回 dst_not_connected。投递成功计入双向流量账，超额丢弃只记发送方。
 fn forward_data(
     sessions: &SessionRegistry,
+    limiter: &Arc<StdMutex<Limiter>>,
+    metrics: &Arc<Metrics>,
     back: &mpsc::Sender<Result<RelayFrame, Status>>,
     src: &str,
     data: RelayData,
 ) {
     let dst_node_id = data.dst_node_id.clone();
+    let len = data.payload.len();
+    if !limiter
+        .lock()
+        .expect("limiter poisoned")
+        .admit(src, len, Instant::now())
+    {
+        metrics.note_drop(src, len);
+        tracing::debug!(src, %dst_node_id, len, "relay frame dropped by rate limit");
+        return;
+    }
     let Some(dst) = sessions
         .0
         .lock()
@@ -141,7 +187,6 @@ fn forward_data(
         ));
         return;
     };
-    let len = data.payload.len();
     let frame = RelayFrame {
         kind: Some(relay_frame::Kind::Data(data)),
     };
@@ -149,6 +194,7 @@ fn forward_data(
         tracing::warn!(src, %dst_node_id, "relay session queue full or closed, dropping frame");
         return;
     }
+    metrics.note_forward(src, &dst_node_id, len);
     tracing::debug!(src, %dst_node_id, len, "relay frame forwarded");
 }
 
@@ -206,15 +252,18 @@ impl Relay for RelayServiceImpl {
             .lock()
             .expect("sessions poisoned")
             .insert(node_id.clone(), tx.clone());
+        self.metrics.session_opened();
         tracing::info!(%node_id, "relay session opened");
 
         let sessions = self.sessions.clone();
+        let limiter = self.limiter.clone();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
                     Ok(Some(frame)) => match frame.kind {
                         Some(relay_frame::Kind::Data(data)) => {
-                            forward_data(&sessions, &tx, &node_id, data);
+                            forward_data(&sessions, &limiter, &metrics, &tx, &node_id, data);
                         }
                         Some(relay_frame::Kind::Hello(_)) => {
                             tracing::warn!(%node_id, "duplicate hello, closing session");
@@ -243,6 +292,7 @@ impl Relay for RelayServiceImpl {
                 .is_some_and(|current| current.same_channel(&tx))
             {
                 sessions.remove(&node_id);
+                metrics.session_closed();
             }
             tracing::info!(%node_id, "relay session closed");
         });

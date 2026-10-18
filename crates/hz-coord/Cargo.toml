@@ -14,6 +14,7 @@ chrono.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 libc.workspace = true
+prometheus.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true
 serde.workspace = true

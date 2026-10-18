@@ -116,12 +116,21 @@ pub async fn open_network_map_stream(
     Ok(stream)
 }
 
+/// 一次 Endpoint 上报附带的路径管理累计计数（FR-12 打洞成功率的数据源）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PunchCounters {
+    pub attempts: u64,
+    pub successes: u64,
+}
+
 /// 上报收集到的 Endpoint（FR-8）：Hello → 签挑战 → ReportEndpoints。
-/// 服务端落库后随 Network Map 差量推给其他 Node。
+/// 服务端落库后随 Network Map 差量推给其他 Node。punch 为 Some 时随上报
+/// 携带打洞累计计数（Node 自启动起），服务端按 Node 去差量累加。
 pub async fn report_endpoints(
     state_dir: &Path,
     endpoints: &[DiscoveredEndpoint],
     coord_addr: &str,
+    punch: Option<PunchCounters>,
 ) -> anyhow::Result<()> {
     let keys = KeyStore::load_or_create(state_dir)?;
     let channel = connect(coord_addr).await?;
@@ -157,6 +166,10 @@ pub async fn report_endpoints(
                     },
                 })
                 .collect(),
+            path_report: punch.map(|counters| hz_proto::PathReport {
+                punch_attempts: u32::try_from(counters.attempts).unwrap_or(u32::MAX),
+                punch_success: u32::try_from(counters.successes).unwrap_or(u32::MAX),
+            }),
         })
         .await
         .map_err(|status| anyhow!("Endpoint 上报失败：{status}"))?;
