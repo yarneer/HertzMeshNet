@@ -325,12 +325,12 @@ start_coord() {
 
 start_reflector() {
   # 对每个数据报回复观测到的源端口（十进制字符串），供 NAT 映射断言。
-  ip netns exec "$WAN_NS" setsid python3 - > "$ART_DIR/reflector.log" 2>&1 <<'PY' &
+  ip netns exec "$WAN_NS" setsid python3 - > "$ART_DIR/reflector.log" 2>&1 <<PY &
 import socket
 socks = {}
-for port in (19990, 19991):
+for port in ($REFL_PORT_A, $REFL_PORT_B):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("203.0.113.1", port))
+    s.bind(("$REFL_ADDR", port))
     s.settimeout(600)
     socks[port] = s
 while True:
@@ -342,7 +342,7 @@ while True:
         s.sendto(str(addr[1]).encode(), addr)
 PY
   sleep 0.3
-  ip netns pids "$WAN_NS" | grep -q . && pass "UDP 反射器已启动（203.0.113.1:$REFL_PORT_A/$REFL_PORT_B）"
+  ip netns pids "$WAN_NS" | grep -q . && pass "UDP 反射器已启动（$REFL_ADDR:$REFL_PORT_A/$REFL_PORT_B）"
 }
 
 # ---------------------------------------------------------------------------
