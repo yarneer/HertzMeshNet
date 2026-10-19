@@ -29,7 +29,7 @@ jobs:
           cd target/x86_64-unknown-linux-musl/release
           for bin in hzd hz hz-coord hz-relay; do
             file "$bin"
-            file "$bin" | grep -q "statically linked" || { echo "$bin 不是静态二进制"; exit 1; }
+            file "$bin" | grep -Eq "statically linked|static-pie linked" || { echo "$bin 不是静态二进制"; exit 1; }
             ldd "$bin" 2>&1 | grep -q "not a dynamic executable" || { echo "$bin 仍有动态依赖"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
@@ -58,7 +58,7 @@ jobs:
           cd target/aarch64-unknown-linux-musl/release
           for bin in hzd hz hz-coord hz-relay; do
             file "$bin"
-            file "$bin" | grep -q "statically linked" || { echo "$bin 不是静态二进制"; exit 1; }
+            file "$bin" | grep -Eq "statically linked|static-pie linked" || { echo "$bin 不是静态二进制"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
         with:
