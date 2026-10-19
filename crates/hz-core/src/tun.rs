@@ -54,8 +54,9 @@ pub fn route_args(cfg: &TunConfig) -> Vec<Vec<String>> {
             DEVICE_NAME,
             "nodad",
         ]),
-        ip_args(&["route", "add", &cfg.v4_cidr, "dev", DEVICE_NAME]),
-        ip_args(&["-6", "route", "add", &ula48, "dev", DEVICE_NAME]),
+        // replace 幂等：设备/路由残留（如快速重启）不会让 setup 失败。
+        ip_args(&["route", "replace", &cfg.v4_cidr, "dev", DEVICE_NAME]),
+        ip_args(&["-6", "route", "replace", &ula48, "dev", DEVICE_NAME]),
     ]
 }
 
@@ -138,10 +139,15 @@ pub fn macos_config_args(cfg: &TunConfig, iface: &str) -> Vec<Vec<String>> {
             "ifconfig",
             &[iface, "inet6", &format!("{}/128", cfg.ipv6), "add"],
         ),
+        // utun 名字每次创建都变（utun8→utun9→…），旧实例残留的同段路由会让
+        // add 报 File exists；先删后加保证幂等（delete 对不存在的路由报错，
+        // setup 里对 delete 一类命令容忍失败）。
+        cmd_args("route", &["-n", "delete", "-net", &cfg.v4_cidr]),
         cmd_args(
             "route",
             &["-n", "add", "-net", &cfg.v4_cidr, "-interface", iface],
         ),
+        cmd_args("route", &["-n", "delete", "-inet6", &ula48]),
         cmd_args(
             "route",
             &["-n", "add", "-inet6", &ula48, "-interface", iface],
@@ -263,7 +269,13 @@ impl Tun {
             .tun_name()
             .with_context(|| "query utun device name failed")?;
         for args in macos_config_args(cfg, &iface) {
-            run_macos_cmd(&args)?;
+            // route delete 清残留时路由本就不存在是常态，失败不致命；
+            // 其余命令失败仍视为 setup 失败。
+            if args.get(1).is_some_and(|sub| sub == "delete") {
+                let _ = run_macos_cmd(&args);
+            } else {
+                run_macos_cmd(&args)?;
+            }
         }
         let _ = MAC_IFACE.set(iface.clone());
         tracing::info!(
@@ -322,8 +334,8 @@ mod tests {
     fn routes_cover_only_hznet_v4_cidr_and_own_ula() {
         let args = route_args(&config());
         let joined: Vec<String> = args.iter().map(|a| a.join(" ")).collect();
-        assert!(joined.contains(&"route add 100.96.0.0/16 dev hz0".to_string()));
-        assert!(joined.contains(&"-6 route add fd12:3456:789a::/48 dev hz0".to_string()));
+        assert!(joined.contains(&"route replace 100.96.0.0/16 dev hz0".to_string()));
+        assert!(joined.contains(&"-6 route replace fd12:3456:789a::/48 dev hz0".to_string()));
         assert!(
             joined.contains(&"addr add 100.96.0.1/32 dev hz0".to_string()),
             "本机 v4 地址必须是点对点 /32：{joined:?}"
@@ -347,7 +359,7 @@ mod tests {
             ..config()
         };
         let joined: Vec<String> = route_args(&cfg).iter().map(|a| a.join(" ")).collect();
-        assert!(joined.contains(&"route add 10.200.0.0/16 dev hz0".to_string()));
+        assert!(joined.contains(&"route replace 10.200.0.0/16 dev hz0".to_string()));
     }
 
     #[test]
@@ -378,13 +390,18 @@ mod tests {
         );
         assert_eq!(
             joined[3],
-            "route -n add -net 100.96.0.0/16 -interface utun9"
+            "route -n delete -net 100.96.0.0/16"
         );
         assert_eq!(
             joined[4],
+            "route -n add -net 100.96.0.0/16 -interface utun9"
+        );
+        assert_eq!(joined[5], "route -n delete -inet6 fd12:3456:789a::/48");
+        assert_eq!(
+            joined[6],
             "route -n add -inet6 fd12:3456:789a::/48 -interface utun9"
         );
-        assert_eq!(joined.len(), 5, "不得有多余命令：{joined:?}");
+        assert_eq!(joined.len(), 7, "不得有多余命令：{joined:?}");
     }
 
     #[cfg(target_os = "macos")]
@@ -409,6 +426,7 @@ mod tests {
             .iter()
             .map(|a| a.join(" "))
             .collect();
+        assert!(joined.contains(&"route -n delete -net 10.200.0.0/16".to_string()));
         assert!(joined.contains(&"route -n add -net 10.200.0.0/16 -interface utun3".to_string()));
     }
 
