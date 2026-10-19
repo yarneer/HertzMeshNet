@@ -161,6 +161,8 @@ kanidm group add-members hznet_admins <某人>
 
 ## 6. bootstrap 与首个 Node 接入（G2）
 
+> Node 侧的完整安装、注册、验证、升级与卸载步骤单独成篇：[install-guide.md](install-guide.md)。本节只讲服务器侧的 bootstrap 与首台验收。
+
 ### 6.1 服务器本机引导
 
 ```sh

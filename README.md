@@ -129,7 +129,7 @@ hz status                                     # 本机状态与 Network Map
 hz ping db-1                                  # 对端时延与当前路径
 ping db-1.hznet.internal                      # 网内名字解析
 hz policy push policy.toml                    # 整份替换 Policy（TOML）
-hz authkey create --expire 7d --once          # 签发一次性 Auth Key（需 Admin）
+hz authkey create --expiry 7d --once          # 签发一次性 Auth Key（需 Admin）
 ```
 
 支持平台：Linux x86_64 / aarch64（systemd），macOS arm64（launchd）。安装脚本 `https://coord.<域名>/install.sh` 按平台下发二进制并注册系统服务。
@@ -138,14 +138,15 @@ Supported platforms: Linux x86_64 / aarch64 (systemd) and macOS arm64 (launchd).
 
 ## 项目状态 · Status
 
-MVP 各功能票（注册、数据面、NAT 穿透、Map 推送、交互式登录、Policy、Admin、有效期、Relay 限速、macOS、分发、部署手册）已全部实现并通过自动化门禁；遗留小项见 issue 列表（DNS 场景接入 CI、地址段可配置）。真实云主机上的三机部署验收为人工步骤，手册见 [docs/runbook.md](docs/runbook.md)。
+MVP 各功能票（注册、数据面、NAT 穿透、Map 推送、交互式登录、Policy、Admin、有效期、Relay 限速、macOS、分发、部署手册、DNS 场景进 CI、地址段可配置）已全部实现并通过自动化门禁。真实云主机上的三机部署验收为人工步骤，服务器手册见 [docs/runbook.md](docs/runbook.md)，Node 安装手册见 [docs/install-guide.md](docs/install-guide.md)。
 
-All MVP feature tickets (registration, data plane, NAT traversal, Map streaming, interactive login, Policy, admin, expiry, relay rate limiting, macOS, distribution, deployment runbook) are implemented and pass the automated gates; a few small follow-ups are tracked in the issue list (DNS scenario in CI, configurable address range). Real three-node deployment on a cloud host is a manual acceptance step — see [docs/runbook.md](docs/runbook.md).
+All MVP feature tickets (registration, data plane, NAT traversal, Map streaming, interactive login, Policy, admin, expiry, relay rate limiting, macOS, distribution, deployment runbook, DNS scenario in CI, configurable address range) are implemented and pass the automated gates. Real three-node deployment on a cloud host is a manual acceptance step — see [docs/runbook.md](docs/runbook.md) for the server side and [docs/install-guide.md](docs/install-guide.md) for installing nodes.
 
 ## 更多文档 · Further reading
 
 | 文档 | 内容 |
 |---|---|
+| [docs/install-guide.md](docs/install-guide.md) | Node 安装手册：一条命令安装、注册、验证、升级、卸载 / Install guide: one-command install, registration, verification, upgrade, uninstall |
 | [docs/mvp-spec.md](docs/mvp-spec.md) | MVP 规格说明：13 条功能需求与验收标准 / MVP spec: 13 functional requirements with acceptance criteria |
 | [docs/adr/](docs/adr/) | 架构决策记录 / Architecture decision records |
 | [docs/runbook.md](docs/runbook.md) | 云主机部署与运维手册 / Cloud deployment & operations runbook |
