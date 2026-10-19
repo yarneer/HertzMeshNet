@@ -1,5 +1,7 @@
 # HertzMeshNet MVP 实现任务
 
+> **已取代**：本文是最早的按层拆分（T01–T20），实际实现改按纵向切片进行，见 GitHub issue [#2](https://github.com/yarneer/HertzMeshNet/issues/2)–[#18](https://github.com/yarneer/HertzMeshNet/issues/18)（均为 [#1](https://github.com/yarneer/HertzMeshNet/issues/1) 的 sub-issue），已全部完成并随 v0.1.1 发布。下文仅作历史记录保留。
+
 > 依据 [mvp-spec.md](mvp-spec.md)。每张任务都是一个可以独立合并、可以验证的切片。"依赖"列出必须先完成的任务。
 > 关键路径：T01 → T02 → T04 → T05 → T07 → T08 → T10 → T11 → T12。
 

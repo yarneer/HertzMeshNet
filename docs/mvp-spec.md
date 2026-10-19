@@ -1,6 +1,6 @@
 # HertzMeshNet MVP 规格说明
 
-> 状态：草案 · 2026-10-18
+> 状态：已完成 · 2026-10-19 发布于 [v0.1.1](https://github.com/yarneer/HertzMeshNet/releases/tag/v0.1.1)（草案 2026-10-18；跟踪 issue [#1](https://github.com/yarneer/HertzMeshNet/issues/1)）
 > 术语以 [GLOSSARY.md](../GLOSSARY.md) 为准，关键决策见 [docs/adr/](adr/)。本文只描述 MVP 要做到什么、怎样算做完，不规定内部实现。
 
 ## 1. 目标
