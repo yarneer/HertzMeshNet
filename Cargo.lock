@@ -1117,6 +1117,7 @@ dependencies = [
  "chrono",
  "clap",
  "hz-core",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",

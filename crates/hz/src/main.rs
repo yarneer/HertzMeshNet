@@ -123,6 +123,7 @@ enum PolicyCommand {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     match cli.command {
         Command::Status { json } => status(json).await,
@@ -132,6 +133,16 @@ async fn main() -> std::process::ExitCode {
         Command::Authkey { command } => authkey(command).await,
         Command::Node { command } => node(command).await,
         Command::Ping { node } => ping(node).await,
+    }
+}
+
+/// Rust 运行时默认忽略 SIGPIPE，`hz … | grep -q` 里读端先退出时 `println!` 会因
+/// EPIPE panic。恢复默认行为，让 hz 像普通 Unix 工具一样被 SIGPIPE 静默终止。
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: 在 main 起点、尚未产生任何输出时调用，只把 SIGPIPE 设回内核默认处置。
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 

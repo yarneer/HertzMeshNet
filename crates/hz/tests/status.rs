@@ -74,3 +74,52 @@ fn status_fails_fast_with_clear_error_when_daemon_is_absent() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("无法连接 hzd"), "stderr 实际内容：{stderr}");
 }
+
+// `hz status | grep -q …` 里 grep 先退出时，hz 写 stdout 会遇到断管：
+// 必须像普通 Unix 工具一样被 SIGPIPE 静默终止，而不是 panic（Seam A 偶发失败的根因）。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn status_exits_quietly_when_stdout_reader_is_gone() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            ipc::serve(
+                &socket,
+                ipc::handler(|_request: ipc::Request| async {
+                    serde_json::to_value(NodeStatus::Unregistered).map_err(|e| e.to_string())
+                }),
+            )
+            .await
+        }
+    });
+    wait_for_socket(&socket).await;
+
+    let mut child = hz_binary()
+        .env("HZD_SOCK_PATH", &socket)
+        .arg("status")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // hz 先连 socket 再输出，读端在它写之前就已关闭，断管必然发生。
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    server.abort();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "hz 不应 panic，stderr：{stderr}"
+    );
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGPIPE),
+        "hz 应被 SIGPIPE 终止，实际：{:?}",
+        output.status
+    );
+}

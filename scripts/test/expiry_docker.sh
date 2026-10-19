@@ -252,7 +252,8 @@ wait_status n1 "d.get('expired') is True" "n1：到期后 status 应显示已过
 }
 pass "n1：hz status 已过期（已过期，请重新执行 hz up 登录）"
 
-hz_cli n1 status 2>/dev/null | grep -q "已过期" \
+N1_STATUS_OUT=$(hz_cli n1 status 2>/dev/null)
+grep -q "已过期" <<<"$N1_STATUS_OUT" \
   && pass "n1：hz status 文案含「已过期」" || fail "n1：hz status 文案缺「已过期」"
 
 node_ping n1 "$N2_IPV4" >/dev/null 2>&1 && fail "到期后 n1 → n2 仍可通信" || pass "到期后 n1 → n2 无法通信"

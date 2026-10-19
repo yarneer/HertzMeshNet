@@ -442,7 +442,8 @@ assert_suite_direct() {
   # 数据面报告交叉验证（#15）：hz status 的路径不再只能靠日志判断。
   wait_peer_path "$a" direct 30 || return 1
   wait_peer_path "$b" direct 30 || return 1
-  if hz_cli "$a" status | grep -q "Direct Path"; then
+  local status_out; status_out=$(hz_cli "$a" status)
+  if grep -q "Direct Path" <<<"$status_out"; then
     pass "${a}：hz status 对端表出现 Direct Path"
   else
     fail "${a}：hz status 缺少 Direct Path：$(hz_cli "$a" status | tail -2)"
@@ -911,7 +912,8 @@ EOF
   else
     pass "语法错误的 Policy 被整份拒绝"
   fi
-  if hz_cli "$a" policy get | grep -q 'ports = \[5432, 22\]'; then
+  local policy_out; policy_out=$(hz_cli "$a" policy get)
+  if grep -q 'ports = \[5432, 22\]' <<<"$policy_out"; then
     pass "现行 Policy 保持版本 2 内容"
   else
     fail "现行 Policy 内容异常（get 输出：$(hz_cli "$a" policy get 2>&1 | head -4 | tr '\n' ' ')）"
@@ -1027,7 +1029,8 @@ assert_suite_ratelimit() {
   note "断言 1：hz status 显示每个对端的路径 Relayed Path"
   wait_peer_path "$a" relay || return 1
   wait_peer_path "$b" relay || return 1
-  if hz_cli "$a" status | grep -q "Relayed Path"; then
+  local status_out; status_out=$(hz_cli "$a" status)
+  if grep -q "Relayed Path" <<<"$status_out"; then
     pass "${a}：hz status 对端表出现 Relayed Path"
   else
     fail "${a}：hz status 缺少 Relayed Path：$(hz_cli "$a" status | tail -2)"
@@ -1248,7 +1251,8 @@ PY
   fi
   local i revoked_seen=""
   for i in $(seq 1 20); do
-    if hz_cli "$b" status 2>/dev/null | grep -q "已吊销"; then revoked_seen=yes; break; fi
+    local revoke_out; revoke_out=$(hz_cli "$b" status 2>/dev/null)
+    if grep -q "已吊销" <<<"$revoke_out"; then revoked_seen=yes; break; fi
     sleep 0.5
   done
   if [[ -n $revoked_seen ]]; then

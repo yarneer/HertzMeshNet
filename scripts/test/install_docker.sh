@@ -94,7 +94,8 @@ echo "PASS: 按 hzd.service 的 ExecStart 手动拉起 hzd，UDS 就绪（容器
 UP_OUT=$(docker exec "$NODE" /usr/local/bin/hz up --auth-key "$AUTH_KEY")
 printf '%s\n' "$UP_OUT" | grep -q "注册成功"
 echo "PASS: hz up --auth-key 注册成功"
-docker exec "$NODE" /usr/local/bin/hz status | grep -q "已加入 HzNet"
+STATUS_OUT=$(docker exec "$NODE" /usr/local/bin/hz status)
+grep -q "已加入 HzNet" <<<"$STATUS_OUT"
 echo "PASS: hz status 显示已加入 HzNet"
 
 docker exec "$NODE" sh -c "curl -fsSL http://coord:$HTTP_PORT/install.sh | sh" >/dev/null
