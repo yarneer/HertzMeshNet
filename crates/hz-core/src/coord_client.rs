@@ -613,7 +613,10 @@ pub(crate) async fn connect_tls_channel(
         .connect_timeout(std::time::Duration::from_secs(10));
     let endpoint = match uri.scheme_str() {
         Some("https") => {
-            let mut tls = ClientTlsConfig::new();
+            // 默认根不能留空：tonic 的 ClientTlsConfig 不自动加载任何系统/内置
+            // CA（两个 with_*_roots 开关默认全关），公网 ACME 证书会被判
+            // UnknownIssuer。ca_pem 显式给私有 CA 时以它为准。
+            let mut tls = ClientTlsConfig::new().with_webpki_roots();
             if let Some(pem) = ca_pem {
                 tls = tls.ca_certificate(Certificate::from_pem(pem.as_bytes()));
             }
