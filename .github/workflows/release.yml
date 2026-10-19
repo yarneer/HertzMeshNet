@@ -129,20 +129,23 @@ jobs:
           for bin in hzd hz; do
             mv "stage/darwin-arm64/$bin" "assets/$bin-darwin-arm64"
           done
-          cd stage
+          # manifest 的键是 <平台>/<二进制>（coord /dl 与 install.sh 的查询格式）；
+          # 二进制已并入 assets/，从资产名（hzd-linux-x86_64）反解出键。
           {
             printf '{"version":"%s","files":{' "${GITHUB_REF_NAME#v}"
             first=1
-            for f in $(find . -type f | sort); do
-              rel=${f#./}
+            for f in $(find assets -type f -name 'hz*' ! -name 'manifest.json' | sort); do
+              base=$(basename "$f")
+              bin=${base%%-*}
+              platform=${base#*-}
               sha=$(sha256sum "$f" | cut -d' ' -f1)
               size=$(wc -c < "$f" | tr -d '[:space:]')
               if [ "$first" = 1 ]; then first=0; else printf ','; fi
-              printf '"%s":{"sha256":"%s","size":%s}' "$rel" "$sha" "$size"
+              printf '"%s/%s":{"sha256":"%s","size":%s}' "$platform" "$bin" "$sha" "$size"
             done
             printf '}}\n'
-          } > ../assets/manifest.json
-          jq . ../assets/manifest.json > /dev/null
+          } > assets/manifest.json
+          jq -e '.files | length >= 6' assets/manifest.json > /dev/null
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
