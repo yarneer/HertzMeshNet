@@ -3,6 +3,9 @@
 # /etc/default/hz-relay 仍是 Relay Token 占位符，则顺带签发 Relay Token 回填
 # 并重启 hz-relay。Auth Key 与 Relay Token 都只在签发时显示一次。
 # 用法：hz-bootstrap.sh [--admin <名字>] [--expiry 90d] [--once] [--no-systemctl]
+# 部署脚本依赖 bash；被 /bin/sh（Debian 的 dash 等）执行时在 set -o pipefail
+# 前给出明确指引，而不是 "Illegal option -o pipefail"。
+[ -n "${BASH_VERSION:-}" ] || { echo "本脚本需要 bash 运行：sudo bash $0 <参数>" >&2; exit 1; }
 set -euo pipefail
 
 ADMIN=""

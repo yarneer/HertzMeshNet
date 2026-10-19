@@ -4,6 +4,9 @@
 # crates/hz-coord/src/store.rs 的 sqlx::migrate!）→ 健康检查。
 # Node 升级不在本脚本范围：在各 Node 上重新执行 install.sh（runbook §7）。
 # 用法：upgrade.sh --dist <新分发目录> [--no-systemctl]
+# 部署脚本依赖 bash；被 /bin/sh（Debian 的 dash 等）执行时在 set -o pipefail
+# 前给出明确指引，而不是 "Illegal option -o pipefail"。
+[ -n "${BASH_VERSION:-}" ] || { echo "本脚本需要 bash 运行：sudo bash $0 <参数>" >&2; exit 1; }
 set -euo pipefail
 
 DIST=""

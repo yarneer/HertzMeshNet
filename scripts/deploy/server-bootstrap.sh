@@ -9,6 +9,9 @@
 # 分发目录布局：<dist>/linux-x86_64/{hz-coord,hz-relay,hzd,hz}（#17 的 musl
 # 产物），Node 平台目录（linux-aarch64、darwin-arm64）会原样拷到
 # /var/lib/hz-coord/dist 供 /dl 下发。
+# 部署脚本依赖 bash；被 /bin/sh（Debian 的 dash 等）执行时在 set -o pipefail
+# 前给出明确指引，而不是 "Illegal option -o pipefail"。
+[ -n "${BASH_VERSION:-}" ] || { echo "本脚本需要 bash 运行：sudo bash $0 <参数>" >&2; exit 1; }
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

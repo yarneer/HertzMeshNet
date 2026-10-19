@@ -3,6 +3,9 @@
 # 停 hz-coord → 校验快照 → 覆盖（旧库留存为 hznet.db.pre-restore.<时间戳>）
 # → 启动并校验。
 # 用法：restore.sh --backup FILE [--db PATH] [--no-systemctl]
+# 部署脚本依赖 bash；被 /bin/sh（Debian 的 dash 等）执行时在 set -o pipefail
+# 前给出明确指引，而不是 "Illegal option -o pipefail"。
+[ -n "${BASH_VERSION:-}" ] || { echo "本脚本需要 bash 运行：sudo bash $0 <参数>" >&2; exit 1; }
 set -euo pipefail
 
 BACKUP=""

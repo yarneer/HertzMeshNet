@@ -2,6 +2,9 @@
 # Coordination Server SQLite 备份（docs/runbook.md §7）：在线快照（sqlite3
 # .backup，对运行中的 hz-coord 安全）+ WAL checkpoint + 完整性校验。
 # 用法：backup.sh [--db PATH] [--dest DIR] [--with-kanidm]
+# 部署脚本依赖 bash；被 /bin/sh（Debian 的 dash 等）执行时在 set -o pipefail
+# 前给出明确指引，而不是 "Illegal option -o pipefail"。
+[ -n "${BASH_VERSION:-}" ] || { echo "本脚本需要 bash 运行：sudo bash $0 <参数>" >&2; exit 1; }
 set -euo pipefail
 
 DB="${HZ_COORD_DB:-/var/lib/hz-coord/hznet.db}"

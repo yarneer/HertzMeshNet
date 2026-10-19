@@ -8,6 +8,9 @@
 #   person 口令只能走 credential-update 会话 API；oauth2 写操作需要特权会话。
 # 前提：certs.sh 已换正式证书（本脚本用系统 CA 校验 auth.<域名>）。
 # 用法：kanidm-init.sh --domain <域名> --admin-name <名字> [--no-systemctl]
+# 部署脚本依赖 bash；被 /bin/sh（Debian 的 dash 等）执行时在 set -o pipefail
+# 前给出明确指引，而不是 "Illegal option -o pipefail"。
+[ -n "${BASH_VERSION:-}" ] || { echo "本脚本需要 bash 运行：sudo bash $0 <参数>" >&2; exit 1; }
 set -euo pipefail
 
 DOMAIN=""

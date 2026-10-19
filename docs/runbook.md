@@ -66,7 +66,7 @@ Relay 与 Kanidm 需要 TLS 透传，因为它们各自在进程内终止 TLS（
 部署脚本先装 30 天占位自签证书把服务拉起，随后用 acme.sh 换正式证书：
 
 ```sh
-sudo scripts/deploy/certs.sh --domain <域名> --account-email <你的邮箱>
+sudo bash scripts/deploy/certs.sh --domain <域名> --account-email <你的邮箱>
 ```
 
 - HTTP-01 走 nginx 80 端口 webroot；一张证书三个 SAN（coord/relay/auth）。
@@ -74,7 +74,7 @@ sudo scripts/deploy/certs.sh --domain <域名> --account-email <你的邮箱>
   重启 hz-relay / kanidm（它们只在启动时读证书）。
 - 续期由 acme.sh 自带的定时任务自动完成（`crontab -l` 可见），无需人工干预；
   强制续期加 `--force`。
-- 测试环境可重生成占位证书：`sudo scripts/deploy/certs.sh --domain <域名> --self-signed`。
+- 测试环境可重生成占位证书：`sudo bash scripts/deploy/certs.sh --domain <域名> --self-signed`。
 
 自检：
 
@@ -90,7 +90,7 @@ curl -fsS https://auth.<域名>/status     # 预期 true（kanidm 已启动）
 ```sh
 git clone git@github.com:yarneer/HertzMeshNet.git   # 或 rsync 上传工作区
 cd HertzMeshNet
-sudo scripts/deploy/server-bootstrap.sh \
+sudo bash scripts/deploy/server-bootstrap.sh \
   --domain <域名> \
   --dist <dist 目录绝对路径> \
   --kanidm-tarball <kanidm 发布包路径或URL，可选>
@@ -112,7 +112,7 @@ linux-x86_64/aarch64 的 tar.gz，内含 `kanidmd` 与 `kanidm`）。两种装�
 
 ```sh
 # 装法一：随 bootstrap 一起装
-sudo scripts/deploy/server-bootstrap.sh --domain <域名> --dist <dist> \
+sudo bash scripts/deploy/server-bootstrap.sh --domain <域名> --dist <dist> \
   --kanidm-tarball https://github.com/kanidm/kanidm/releases/download/<版本>/kanidm-linux-x86_64.tar.gz
 
 # 装法二：手工解开任意路径后
@@ -133,7 +133,7 @@ systemd 运行，与 hz-coord/hz-relay 同一形态。）
 前提：§3 的正式证书已装好（本脚本用系统 CA 校验 `auth.<域名>`）。
 
 ```sh
-sudo scripts/deploy/kanidm-init.sh --domain <域名> --admin-name <第一个管理员的登录名>
+sudo bash scripts/deploy/kanidm-init.sh --domain <域名> --admin-name <第一个管理员的登录名>
 ```
 
 脚本做的事（API 流程实测自 Kanidm 1.8，与 `scripts/test/kanidm/setup.sh`
@@ -166,7 +166,7 @@ kanidm group add-members hznet_admins <某人>
 ### 6.1 服务器本机引导
 
 ```sh
-sudo scripts/deploy/hz-bootstrap.sh --admin <与 §5 相同的登录名> --expiry 365d
+sudo bash scripts/deploy/hz-bootstrap.sh --admin <与 §5 相同的登录名> --expiry 365d
 ```
 
 - 签出第一把 Auth Key 并把名为 `<登录名>` 的 User 落库为 Admin；
@@ -227,14 +227,14 @@ macOS 的详细冒烟步骤（utun、路由、launchd、DNS）见
 在线快照（对运行中的 hz-coord 安全），WAL checkpoint + 完整性校验：
 
 ```sh
-sudo scripts/deploy/backup.sh                    # → /var/backups/hznet/hz-coord-<时间戳>.db
-sudo scripts/deploy/backup.sh --with-kanidm      # 附带 Kanidm 最近一次在线备份
+sudo bash scripts/deploy/backup.sh                    # → /var/backups/hznet/hz-coord-<时间戳>.db
+sudo bash scripts/deploy/backup.sh --with-kanidm      # 附带 Kanidm 最近一次在线备份
 ```
 
 建议 crontab（root）每天 4:00 备份并保留异地拷贝：
 
 ```cron
-0 4 * * * /path/to/HertzMeshNet/scripts/deploy/backup.sh --with-kanidm >> /var/log/hznet-backup.log 2>&1
+0 4 * * * /bin/bash /path/to/HertzMeshNet/scripts/deploy/backup.sh --with-kanidm >> /var/log/hznet-backup.log 2>&1
 ```
 
 Kanidm 自身在 `/etc/kanidm/server.toml` 配置了每日 22:00 在线备份
@@ -244,7 +244,7 @@ Kanidm 自身在 `/etc/kanidm/server.toml` 配置了每日 22:00 在线备份
 
 ```sh
 sudo systemctl stop hz-coord    # restore.sh 会代停；此处仅示意
-sudo scripts/deploy/restore.sh --backup /var/backups/hznet/hz-coord-<时间戳>.db
+sudo bash scripts/deploy/restore.sh --backup /var/backups/hznet/hz-coord-<时间戳>.db
 ```
 
 旧库自动留存为 `hznet.db.pre-restore.<时间戳>`；恢复前后都做 integrity_check。
@@ -254,8 +254,8 @@ sudo scripts/deploy/restore.sh --backup /var/backups/hznet/hz-coord-<时间戳>.
 服务端（停 → 换二进制 → 启动时自动跑 sqlx 迁移 → 健康检查）：
 
 ```sh
-sudo scripts/deploy/backup.sh          # 升级前先备份（数据库迁移不可回滚）
-sudo scripts/deploy/upgrade.sh --dist <新 dist 目录>
+sudo bash scripts/deploy/backup.sh          # 升级前先备份（数据库迁移不可回滚）
+sudo bash scripts/deploy/upgrade.sh --dist <新 dist 目录>
 ```
 
 版本协议 N-2（FR-6）：先升服务器，旧 Node 仍可用；Node 升级在各 Node 重新
