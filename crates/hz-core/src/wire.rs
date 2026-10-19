@@ -1182,11 +1182,22 @@ pub async fn lan_endpoint(coord_addr: &str, wg_port: u16) -> anyhow::Result<Sock
 /// DNS 解析只在启动时做一次，阻塞可接受。
 fn coord_probe_target(coord_addr: &str) -> anyhow::Result<SocketAddr> {
     use std::net::ToSocketAddrs;
-    let host_port = coord_addr
-        .rsplit_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(coord_addr);
-    host_port
+    let (scheme, host_port) = match coord_addr.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("", coord_addr),
+    };
+    let has_port = host_port
+        .rsplit_once(':')
+        .is_some_and(|(_, tail)| tail.parse::<u16>().is_ok());
+    // to_socket_addrs 只接受 host:port；省略端口的公网地址（如
+    // https://coord.example.com）按 scheme 补默认端口，与 tonic URI 的
+    // 缺省端口规则一致（http 80 / 其余 443）。
+    let target = if has_port {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:{}", if scheme == "http" { 80 } else { 443 })
+    };
+    target
         .to_socket_addrs()
         .with_context(|| format!("无法解析 Coordination Server 地址：{coord_addr}"))?
         .next()
@@ -1208,6 +1219,15 @@ mod tests {
         assert_eq!(
             coord_probe_target("127.0.0.1:443").unwrap(),
             "127.0.0.1:443".parse::<SocketAddr>().unwrap()
+        );
+        // 省略端口的公网形态：按 scheme 补默认端口（runbook 的 HZD_COORD_ADDR 即此形态）
+        assert_eq!(
+            coord_probe_target("https://127.0.0.1").unwrap(),
+            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            coord_probe_target("http://127.0.0.1").unwrap(),
+            "127.0.0.1:80".parse::<SocketAddr>().unwrap()
         );
         assert!(coord_probe_target("no-port-here").is_err());
     }
