@@ -780,11 +780,19 @@ async fn forced_recreate_rebind_deterministically_keeps_the_port() {
     // 无 CAP_NET_RAW 的普通进程改绑已绑设备的 socket 必 EPERM（内核仅放行
     // 首次设备绑定），重绑必然落到重建路径；有特权的环境（如 Docker 默认
     // 能力集含 NET_RAW）在位改绑会成功，用钩子强制同一条重建路径，断言
-    // 重建先关旧 socket 再按原端口重绑。
-    let engine = SocketEngine::bind(NodeStaticSecret::random_from_rng(OsRng), 0)
-        .await
-        .unwrap();
+    // 重建先关旧 socket 再按原端口重绑。常驻收发循环在跑：换出旧 socket
+    // 必须先把循环从旧 socket 上唤醒，否则旧引用不释放、原端口腾不出来。
+    let engine = std::sync::Arc::new(
+        SocketEngine::bind(NodeStaticSecret::random_from_rng(OsRng), 0)
+            .await
+            .unwrap(),
+    );
     let port = engine.local_addr().port();
+    let (to_tunnel_tx, _to_tunnel) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let runner = engine.clone();
+    let pump = tokio::spawn(async move {
+        let _ = runner.run(to_tunnel_tx).await;
+    });
 
     engine.fail_live_reapply_for_test();
     assert_eq!(
@@ -794,4 +802,5 @@ async fn forced_recreate_rebind_deterministically_keeps_the_port() {
     );
     assert_eq!(engine.local_addr().port(), port);
     assert_eq!(engine.rebind("lo").await.unwrap(), RebindOutcome::Kept);
+    pump.abort();
 }

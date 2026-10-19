@@ -366,6 +366,19 @@ async fn relayed_ping_survives_periodic_punches_into_dead_endpoints() {
     node_a.engine.reconcile(vec![spec_a]);
     node_b.engine.reconcile(vec![spec_b]);
 
+    // 先等经 Relay 的会话建立（可观测事件：首包送达），再开始打洞搅动。
+    // 打洞握手发往死端点、有去无回；没有会话时数据包只能排队等引擎
+    // 5 秒一次的握手重试链送达，冷启动的共享 runner 上这条链一旦被
+    // 拖过超时，第 0 轮就会误报。本测试验证的是"已建立的会话经得起
+    // 周期打洞"，不是冷启动竞态。
+    let warmup = udp_v4_packet(record_a.ipv4, record_b.ipv4, b"punch-warmup");
+    node_a.engine.send_ip_packet(&warmup).await;
+    let got = tokio::time::timeout(RELAY_TIMEOUT, node_b.to_tunnel.recv())
+        .await
+        .expect("打洞搅动前经 Relay 的首包必须送达（会话建立）")
+        .expect("B 的隧道通道不应关闭");
+    assert_eq!(got, warmup, "会话建立包必须逐字节原样到达");
+
     // 路径任务的节奏：每 3 秒一轮打洞（握手发往死端点）。
     let puncher = {
         let a = node_a.engine.clone();
