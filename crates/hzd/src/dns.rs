@@ -335,7 +335,9 @@ impl SystemDnsPaths {
     pub fn system() -> Self {
         let suffix = hz_core::dns::dns_suffix();
         Self {
-            resolved_conf: PathBuf::from("/etc/systemd/resolved/conf.d/hznet.conf"),
+            // systemd-resolved 的 drop-in 目录是 resolved.conf.d（中缀 .conf），
+            // 写到 resolved/conf.d 不会被子加载，分域静默失效。
+            resolved_conf: PathBuf::from("/etc/systemd/resolved.conf.d/hznet.conf"),
             resolv_conf: PathBuf::from("/etc/resolv.conf"),
             resolver_file: PathBuf::from("/etc/resolver").join(suffix),
         }
