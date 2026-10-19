@@ -975,21 +975,30 @@ fn spawn_relay_supervisor(
 }
 
 /// STUN 服务器地址：显式 HZD_STUN_ADDR 优先，否则从 HZD_RELAY_ADDR 的主机
-/// 推导（FR-8：STUN 与 Relay 同主机，UDP 3478）。
+/// 推导（FR-8：STUN 与 Relay 同主机，UDP 3478）。地址可以是主机名或 IP；
+/// SocketAddr::parse 只认 IP 字面量，主机名必须走 DNS（启动时一次阻塞解析，
+/// 与 coord_probe_target 同一先例），解析失败显式告警而不是静默禁用 STUN。
 fn stun_server_addr() -> Option<SocketAddr> {
-    if let Ok(addr) = std::env::var("HZD_STUN_ADDR") {
-        return addr.parse().ok();
+    use std::net::ToSocketAddrs;
+    let raw = std::env::var("HZD_STUN_ADDR").ok().or_else(|| {
+        let relay = std::env::var("HZD_RELAY_ADDR").ok()?;
+        let host_port = relay
+            .rsplit_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&relay);
+        let host = host_port
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(host_port);
+        Some(format!("{host}:3478"))
+    })?;
+    match raw.to_socket_addrs() {
+        Ok(mut addrs) => addrs.next(),
+        Err(error) => {
+            tracing::warn!(%raw, %error, "STUN 服务器地址解析失败");
+            None
+        }
     }
-    let relay = std::env::var("HZD_RELAY_ADDR").ok()?;
-    let host_port = relay
-        .rsplit_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(&relay);
-    let host = host_port
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(host_port);
-    format!("{host}:3478").parse().ok()
 }
 
 /// Endpoint 收集与上报（FR-8）：周期性收集 Lan/STUN/V6，ReportEndpoints 落库，
