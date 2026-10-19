@@ -136,8 +136,8 @@ jobs:
             first=1
             for f in $(find assets -type f -name 'hz*' ! -name 'manifest.json' | sort); do
               base=$(basename "$f")
-              bin=${base%%-*}
-              platform=${base#*-}
+              platform=$(echo "$base" | grep -oE '(linux-(x86_64|aarch64)|darwin-arm64)$')
+              bin=${base%-$platform}
               sha=$(sha256sum "$f" | cut -d' ' -f1)
               size=$(wc -c < "$f" | tr -d '[:space:]')
               if [ "$first" = 1 ]; then first=0; else printf ','; fi
