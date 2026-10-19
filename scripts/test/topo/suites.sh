@@ -1141,6 +1141,113 @@ print(socket.inet_ntoa(data[-4:]))
 PY
 }
 
+dns_query() { # dns_query <node> <fqdn> <A|AAAA>：输出 IP 字面值 / RCODE:<n> / TIMEOUT
+  local ns; ns=$(node_ns "$1")
+  local qtype=1
+  [[ "$3" == "AAAA" ]] && qtype=28
+  ip netns exec "$ns" timeout 5 python3 - "$2" "$qtype" <<'PY'
+import socket, struct, sys
+fqdn, qtype = sys.argv[1], int(sys.argv[2])
+labels = fqdn.split(".")
+q = b"".join(bytes([len(l)]) + l.encode() for l in labels) + b"\x00"
+msg = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", qtype, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.sendto(msg, ("100.96.0.53", 53))
+    data, _ = s.recvfrom(512)
+except OSError as error:
+    print(f"TIMEOUT({error})"); sys.exit(0)
+head = struct.unpack(">HHHHHH", data[:12])
+rcode = head[1] & 0xF
+if rcode != 0 or head[3] < 1:
+    print(f"RCODE:{rcode}"); sys.exit(0)
+if qtype == 1:
+    print(socket.inet_ntoa(data[-4:]))
+else:
+    print(socket.inet_ntop(socket.AF_INET6, data[-16:]))
+PY
+}
+
+assert_suite_dns() {
+  local a b b4 b6 answer
+  a=$(reg_list | awk -F'|' '$2 == "lan" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "lan" && $1 != "'"$a"'" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要恰好两个 lan 节点"; return 1; }
+
+  note "[$a/$b] 启动 hzd 并注册"
+  start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
+
+  note "等待双方的 Network Map 互见"
+  if wait_for_peer "$a" "$b" && wait_for_peer "$b" "$a"; then
+    pass "双方 Network Map 互见（DNS 应答的数据源就绪）"
+  else
+    fail "Network Map 未在 90s 内互通"
+    return 1
+  fi
+
+  b4=$(peer_field "$a" ipv4)
+  b6=$(peer_field "$a" ipv6)
+  note "断言 1：本地应答返回 Map 里的字面地址（A 与 AAAA）"
+  answer=$(dns_query "$a" "hznode${b}.hznet.internal" A)
+  if [[ "$answer" == "$b4" ]]; then
+    pass "hznode${b}.hznet.internal A → ${answer}（与 Map 字面一致）"
+  else
+    fail "A 应答 ${answer}，期望 ${b4}"
+  fi
+  answer=$(dns_query "$a" "hznode${b}.hznet.internal" AAAA)
+  if [[ "$answer" == "$b6" ]]; then
+    pass "hznode${b}.hznet.internal AAAA → ${answer}（与 Map 字面一致）"
+  else
+    fail "AAAA 应答 ${answer}，期望 ${b6}"
+  fi
+
+  note "断言 2：非 HzNet 域名 REFUSED（不递归、不越权应答）"
+  answer=$(dns_query "$a" "github.com" A)
+  if [[ "$answer" == "RCODE:5" ]]; then
+    pass "github.com → REFUSED"
+  else
+    fail "github.com 应答 ${answer}，期望 RCODE:5"
+  fi
+
+  note "断言 3：hzd 停止后 53 口死寂，重启后应答恢复"
+  # 按 netns 作用域取该节点的全部进程再杀 hzd（ip netns pids 天然限定在本
+  # 节点，免去 pgrep 全局匹配加 /proc/environ 前缀过滤的脆弱组合）。
+  local pid
+  for pid in $(ip netns pids "hz-node-${a}"); do
+    if tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q '/hzd$'; then
+      kill "$pid"
+    fi
+  done
+  sleep 1
+  answer=$(dns_query "$a" "hznode${b}.hznet.internal" A)
+  if [[ "$answer" == TIMEOUT* ]]; then
+    pass "hzd 停止后 ${a} 的 53 口不再应答（${answer}）"
+  else
+    fail "hzd 停止后仍应答：${answer}"
+  fi
+  # SIGTERM 不触发 hzd 的 Drop 守卫，UDS 文件残留会让重启后的就绪探测命中死
+  # socket——显式清掉再拉起。
+  rm -f "$ART_DIR/hzd-${a}.sock"
+  start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
+  local i
+  for i in $(seq 1 30); do
+    answer=$(dns_query "$a" "hznode${b}.hznet.internal" A)
+    [[ "$answer" == "$b4" ]] && break
+    sleep 1
+  done
+  if [[ "$answer" == "$b4" ]]; then
+    pass "hzd 重启后应答恢复：hznode${b}.hznet.internal A → ${answer}"
+  else
+    fail "重启后未恢复：${answer}，期望 ${b4}"
+    return 1
+  fi
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
 assert_suite_admin_revoke() {
   local db="$ART_DIR/coord.db" a b d b4 d_id out rc start elapsed
   a=$(reg_list | awk -F'|' '$1 == "a" { print $1; exit }')
