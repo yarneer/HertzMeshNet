@@ -388,10 +388,7 @@ mod tests {
             joined[2],
             "ifconfig utun9 inet6 fd12:3456:789a::6460:1/128 add"
         );
-        assert_eq!(
-            joined[3],
-            "route -n delete -net 100.96.0.0/16"
-        );
+        assert_eq!(joined[3], "route -n delete -net 100.96.0.0/16");
         assert_eq!(
             joined[4],
             "route -n add -net 100.96.0.0/16 -interface utun9"
