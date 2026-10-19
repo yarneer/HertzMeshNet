@@ -738,13 +738,14 @@ fn reset_direct_rx_makes_path_manager_fall_back_and_re_punch() {
 async fn rebind_reapplies_device_idempotently_and_keeps_the_port() {
     use hz_core::wire::{RebindOutcome, SocketEngine};
 
-    // SO_BINDTODEVICE 需要 CAP_NET_RAW：无特权的普通 CI runner 上探测即失败，
+    // SO_BINDTODEVICE 首次绑定免特权、改绑已绑设备的 socket 才要求
+    // CAP_NET_RAW：完全无能力的环境里连重建路径的设备绑定也会失败，
     // 重绑的真实行为由特权容器里的 network-change 场景验证，这里让位。
     let probe = SocketEngine::bind(NodeStaticSecret::random_from_rng(OsRng), 0)
         .await
         .unwrap();
     if probe.rebind("lo").await.is_err() {
-        eprintln!("跳过：环境无 CAP_NET_RAW，无法设置 SO_BINDTODEVICE");
+        eprintln!("跳过：环境无法设置 SO_BINDTODEVICE，无法验证重绑");
         return;
     }
 
@@ -752,11 +753,14 @@ async fn rebind_reapplies_device_idempotently_and_keeps_the_port() {
     let engine = SocketEngine::bind(secret, 0).await.unwrap();
     let port = engine.local_addr().port();
 
-    // 绑到回环设备（换网卡的等价物）：要么改绑成功，要么本就绑着（无物理出口的环境）。
+    // 绑到回环设备（换网卡的等价物）。无 CAP_NET_RAW 时在位改绑必 EPERM、
+    // 走重建路径；无论走哪条分支，端口都不能变（对端学到的 Endpoint
+    // 依赖它）。
     let first = engine.rebind("lo").await.unwrap();
-    assert!(
-        matches!(first, RebindOutcome::Rebound | RebindOutcome::Kept),
-        "改绑回环设备应成功：{first:?}"
+    assert_eq!(
+        engine.local_addr().port(),
+        port,
+        "重绑无论走在位改绑还是重建都不能换端口：{first:?}"
     );
     // 幂等：重复重绑同一目标是空操作，端口不变。
     assert_eq!(engine.rebind("lo").await.unwrap(), RebindOutcome::Kept);
@@ -764,6 +768,30 @@ async fn rebind_reapplies_device_idempotently_and_keeps_the_port() {
 
     // 目标网卡不存在：改绑失败必须显式报错，不能悄悄换掉 socket 或端口。
     assert!(engine.rebind("hz-no-such-iface").await.is_err());
+    assert_eq!(engine.local_addr().port(), port);
+    assert_eq!(engine.rebind("lo").await.unwrap(), RebindOutcome::Kept);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn forced_recreate_rebind_deterministically_keeps_the_port() {
+    use hz_core::wire::{RebindOutcome, SocketEngine};
+
+    // 无 CAP_NET_RAW 的普通进程改绑已绑设备的 socket 必 EPERM（内核仅放行
+    // 首次设备绑定），重绑必然落到重建路径；有特权的环境（如 Docker 默认
+    // 能力集含 NET_RAW）在位改绑会成功，用钩子强制同一条重建路径，断言
+    // 重建先关旧 socket 再按原端口重绑。
+    let engine = SocketEngine::bind(NodeStaticSecret::random_from_rng(OsRng), 0)
+        .await
+        .unwrap();
+    let port = engine.local_addr().port();
+
+    engine.fail_live_reapply_for_test();
+    assert_eq!(
+        engine.rebind("lo").await.unwrap(),
+        RebindOutcome::Recreated { port },
+        "重建路径必须保住原端口"
+    );
     assert_eq!(engine.local_addr().port(), port);
     assert_eq!(engine.rebind("lo").await.unwrap(), RebindOutcome::Kept);
 }

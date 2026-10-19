@@ -32,6 +32,15 @@ const MSG_HANDSHAKE_RESPONSE: u8 = 2;
 /// Relay 入站泵单次等待上限：半开旧通道不会自己出错，靠周期回看槽位换新。
 const RELAY_PUMP_POLL: Duration = Duration::from_millis(200);
 
+/// 重建 socket 时等常驻任务释放旧 socket 引用的期限与轮询节奏。收发循环
+/// 对槽位变化毫秒级响应，1 秒上限只兜极端在途持有者（如 STUN 查询）；
+/// 超时后放弃保端口、落到已验证的临时端口 socket，而不是无限等待。
+/// 仅 Linux 的重绑路径使用。
+#[cfg(target_os = "linux")]
+const RECREATE_RELEASE_WAIT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const RECREATE_RELEASE_POLL: Duration = Duration::from_millis(5);
+
 /// 入向数据报的接收索引：定位能解密它的本地对端。握手响应的 [4..8] 是
 /// 响应方的发送索引，回显给我们的接收索引在 [8..12]；其余消息类型
 /// （传输数据、Cookie）的接收索引都在 [4..8]。握手发起包不带索引，
@@ -613,6 +622,10 @@ pub struct SocketEngine {
     /// macOS 侧只写不读（rebind 随 #16 接入），先豁免死代码告警。
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     device: StdMutex<Option<String>>,
+    /// 测试钩子（#[doc(hidden)] 方法置位）：让下一次 rebind 的在位改绑
+    /// 按失败处理，确定性走重建路径；仅 Linux 分支读取。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fail_live_reapply: StdMutex<bool>,
     relay: Arc<StdMutex<Option<Arc<RelayClient>>>>,
     stun_router: Arc<StunRouter>,
     punch_in: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
@@ -625,7 +638,8 @@ pub enum RebindOutcome {
     Kept,
     /// 现有 socket 重新应用了 SO_BINDTODEVICE，端口不变。
     Rebound,
-    /// 现有 socket 无法改绑，已重建并原子换入（端口可能变化）。
+    /// 现有 socket 无法改绑，已重建并原子换入。重建保端口；仅当原端口
+    /// 在腾出后的窗口被抢占等极限情形才落到新端口。
     Recreated { port: u16 },
 }
 
@@ -664,6 +678,7 @@ impl SocketEngine {
             engine: Arc::new(StdMutex::new(Engine::new(own_secret))),
             socket_tx: watch::Sender::new(Arc::new(socket)),
             device: StdMutex::new(device),
+            fail_live_reapply: StdMutex::new(false),
             relay: Arc::new(StdMutex::new(None)),
             stun_router: Arc::new(StunRouter::default()),
             punch_in: Arc::new(StdMutex::new(None)),
@@ -679,11 +694,15 @@ impl SocketEngine {
     /// socket 挪到新的物理出口网卡上，对端密钥与候选一概不动。
     /// 绑定目标未变时是幂等空操作；变了就先对现有 socket 重新应用
     /// SO_BINDTODEVICE（socket 绑的是通配地址，网卡换了名子绑定仍合法，
-    /// 端口得以保留）。SO_BINDTODEVICE 会在目标网卡瞬时消失（换 Wi-Fi、
-    /// 驱动重绑、网卡重命名的窗口期）时以 ENODEV 拒绝——旧 socket 的设备
-    /// 绑定已悬空、无法继续发送，这是必须重建 socket 的情形：按原端口重绑
-    /// 一个新 socket（UDP 无 TIME_WAIT，旧 socket 释放后同端口可用；失败则
-    /// 让内核分配新端口）并原子换入槽位。
+    /// 端口得以保留）。在位改绑失败有两类情形：目标网卡瞬时消失（换
+    /// Wi-Fi、驱动重绑、网卡重命名的窗口期）时以 ENODEV 拒绝；以及内核
+    /// 对"改绑已绑设备的 socket"要求 CAP_NET_RAW（仅首次绑定免特权，
+    /// net/core/sock.c 按 sk_bound_dev_if 判定）——无特权进程的重绑必然
+    /// 走重建。重建必须保端口（对端学到的 Endpoint 才不失效）：旧 socket
+    /// 在位时同端口重绑必 EADDRINUSE（UDP 无 SO_REUSEPORT），所以先把旧
+    /// socket 换出槽位、等常驻任务放手后关闭，再按原端口重绑新 socket
+    /// 并原子换入；换出与换入之间端口短暂无人监听，这个丢包窗口是重绑
+    /// 事件的固有代价。
     /// 重建后旧 socket 上的等待中的 STUN 事务靠自身 3 秒超时自然清理，
     /// 新查询自动走新 socket，无需显式通知 StunRouter。
     pub async fn rebind(&self, egress: &str) -> anyhow::Result<RebindOutcome> {
@@ -700,7 +719,21 @@ impl SocketEngine {
                 return Ok(RebindOutcome::Kept);
             }
             let socket = self.socket();
-            match socket2::SockRef::from(socket.as_ref()).bind_device(Some(egress.as_bytes())) {
+            // 钩子置位时在位改绑按失败处理：模拟无 CAP_NET_RAW 内核上的
+            // EPERM，让重建路径可在特权环境里被确定性测到。
+            let forced_fail = std::mem::replace(
+                &mut *self.fail_live_reapply.lock().expect("test hook poisoned"),
+                false,
+            );
+            let reapplied = if forced_fail {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "forced by test hook",
+                ))
+            } else {
+                socket2::SockRef::from(socket.as_ref()).bind_device(Some(egress.as_bytes()))
+            };
+            match reapplied {
                 Ok(()) => {
                     *self.device.lock().expect("device poisoned") = Some(egress.to_string());
                     tracing::info!(%egress, "udp socket rebound to physical egress");
@@ -709,29 +742,61 @@ impl SocketEngine {
                 Err(error) => {
                     tracing::warn!(%egress, %error, "rebind device on live socket failed, recreating");
                     let port = socket.local_addr()?.port();
-                    let fresh = match bind_dual_stack(port).await {
-                        Ok(fresh) => fresh,
-                        Err(same_port_error) => {
-                            tracing::warn!(%same_port_error, "recreate on same port failed, picking a new one");
-                            bind_dual_stack(0).await.with_context(|| {
-                                format!("recreate udp socket for egress {egress} failed")
-                            })?
-                        }
-                    };
-                    socket2::SockRef::from(&fresh)
+                    // 先在临时端口的新 socket 上验证 egress 可绑（首次绑设备
+                    // 无需特权）。失败说明 egress 本身不可用（如网卡已消失），
+                    // 旧 socket 原样在位，显式报错且端口不动。
+                    let fallback = Arc::new(bind_dual_stack(0).await.with_context(|| {
+                        format!("recreate udp socket for egress {egress} failed")
+                    })?);
+                    socket2::SockRef::from(fallback.as_ref())
                         .bind_device(Some(egress.as_bytes()))
                         .with_context(|| format!("bind recreated socket to {egress} failed"))?;
+                    // 换入临时 socket 让常驻循环放手旧 socket；引用清零后
+                    // 关闭旧 fd 腾出端口，同端口重绑才可能成功。
+                    self.socket_tx.send_modify(|slot| *slot = fallback.clone());
+                    let deadline = tokio::time::Instant::now() + RECREATE_RELEASE_WAIT;
+                    while Arc::strong_count(&socket) > 1 && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(RECREATE_RELEASE_POLL).await;
+                    }
+                    drop(socket);
+                    let fresh = match bind_dual_stack(port).await {
+                        Ok(fresh) => {
+                            // egress 刚在临时 socket 上验证过；同端口新 socket
+                            // 仍是首次绑设备，再失败只剩设备在窗口内消失的
+                            // 竞态，退回已验证的临时 socket。
+                            if let Err(error) =
+                                socket2::SockRef::from(&fresh).bind_device(Some(egress.as_bytes()))
+                            {
+                                tracing::warn!(%egress, %error, "bind same-port socket to device failed, keeping validated fallback");
+                                fallback
+                            } else {
+                                Arc::new(fresh)
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "recreate on same port failed, keeping validated fallback");
+                            fallback
+                        }
+                    };
                     let fresh_port = fresh
                         .local_addr()
                         .with_context(|| "query recreated udp local addr failed")?
                         .port();
-                    self.socket_tx.send_modify(|slot| *slot = Arc::new(fresh));
+                    self.socket_tx.send_modify(|slot| *slot = fresh);
                     *self.device.lock().expect("device poisoned") = Some(egress.to_string());
                     tracing::info!(%egress, port = fresh_port, "udp socket recreated for new egress");
                     Ok(RebindOutcome::Recreated { port: fresh_port })
                 }
             }
         }
+    }
+
+    /// 测试钩子：强制下一次 [`SocketEngine::rebind`] 走重建路径（在位改绑
+    /// 按失败处理）。模拟无 CAP_NET_RAW 的内核只放行首次设备绑定的行为；
+    /// 生产代码不得调用。
+    #[doc(hidden)]
+    pub fn fail_live_reapply_for_test(&self) {
+        *self.fail_live_reapply.lock().expect("test hook poisoned") = true;
     }
 
     /// 接入 Relay 传输。断线重连由装配层的监督任务再次调用本方法完成；
