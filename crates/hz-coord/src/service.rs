@@ -115,9 +115,11 @@ pub struct ServeHandle {
 
 impl ServeHandle {
     pub fn shutdown(&self) {
+        // 先停产生者再断连接：多线程运行时下 close_all 与 abort 之间没有
+        // 原子性，中间新产出的帧仍可能被连接任务刷给客户端。
+        self.fan_out.abort();
         self.connections.close_all();
         let _ = self.shutdown.send(true);
-        self.fan_out.abort();
         if let Some(http) = &self.http {
             http.shutdown();
         }

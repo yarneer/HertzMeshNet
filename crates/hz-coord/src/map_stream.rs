@@ -105,7 +105,14 @@ struct Snapshot {
 pub async fn run_fan_out(store: Store, hub: Arc<MapHub>, config: MapPushConfig) {
     let mut changes = store.changes();
     let mut sweep = tokio::time::interval(config.sweep_every);
-    let mut keepalive = tokio::time::interval(config.keepalive_every);
+    // interval() 的首个 tick 立即到期；select 分支随机选择会让它被推迟到
+    // 任意后续轮次消费——可能在订阅者刚收到全量之后，凭空补发一条空保活
+    // 差量（Linux CI 曾在 3600s 保活间隔下于开流数秒内收到）。interval_at
+    // 把首次保活钉在启动 + keepalive_every，消除这个不定期提前保活。
+    let mut keepalive = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.keepalive_every,
+        config.keepalive_every,
+    );
     loop {
         let keepalive_due = tokio::select! {
             _ = changes.changed() => false,
