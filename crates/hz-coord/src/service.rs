@@ -467,8 +467,11 @@ impl Coord for CoordServiceImpl {
             })?;
 
         tracing::info!(node_id = %record.id, name = %record.name, "node registered");
+        let range = self.store.range_fields();
         Ok(Response::new(RegisterResponse {
             node: Some(node_info_from(record)),
+            network_cidr: range.0,
+            dns_v4: range.1,
         }))
     }
 
@@ -554,11 +557,14 @@ impl Coord for CoordServiceImpl {
             signature,
         )?;
 
+        let range = self.store.range_fields();
         match self.logins.poll(&req.login_id, &machine_key_pub) {
             PollResult::Pending => Ok(Response::new(LoginStatusResponse {
                 completed: false,
                 node: None,
                 error: None,
+                network_cidr: range.0,
+                dns_v4: range.1,
             })),
             PollResult::Completed(record) => {
                 tracing::info!(node_id = %record.id, "interactive login delivered to node");
@@ -566,12 +572,16 @@ impl Coord for CoordServiceImpl {
                     completed: true,
                     node: Some(node_info_from(record)),
                     error: None,
+                    network_cidr: Some(self.store.addr().cidr.to_string()),
+                    dns_v4: Some(self.store.addr().reserved_dns().to_string()),
                 }))
             }
             PollResult::Failed(reason) => Ok(Response::new(LoginStatusResponse {
                 completed: true,
                 node: None,
                 error: Some(reason),
+                network_cidr: range.0,
+                dns_v4: range.1,
             })),
         }
     }

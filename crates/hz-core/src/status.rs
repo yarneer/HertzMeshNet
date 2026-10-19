@@ -15,6 +15,13 @@ pub struct RegisteredInfo {
     pub tags: Vec<String>,
     pub owner_user: Option<String>,
     pub expires_at_unix: Option<i64>,
+    /// 生效 IPv4 段与段内 DNS 应答地址（#20）：随注册/登录响应获得并随
+    /// registration.json 持久化，hzd 以此配置 TUN 路由与本地 DNS，
+    /// 替代易失配的 HZD_V4_CIDR 环境变量。旧服务端不带这两个字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_cidr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_v4: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

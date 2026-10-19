@@ -16,7 +16,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use hz_core::dns::{DNS_BIND_V4, DNS_PORT};
+use hz_core::dns::DNS_PORT;
 use hz_core::map::{MapNode, NetworkMapCache};
 
 const TYPE_A: u16 = 1;
@@ -530,20 +530,22 @@ impl Drop for ShutdownGuard {
 }
 
 /// 生产入口：辅助地址挂 hz0 → 双栈应答 → 系统接入 → 信号守护。幂等。
-pub async fn spawn(cache: Arc<NetworkMapCache>) -> anyhow::Result<()> {
+/// dns_v4：本地应答地址（段内推导，随注册响应获得；缺省回落规格 A2 的
+/// 100.96.0.53，兼容旧服务端/旧 registration.json）。
+pub async fn spawn(cache: Arc<NetworkMapCache>, dns_v4: Ipv4Addr) -> anyhow::Result<()> {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
     let suffix = hz_core::dns::dns_suffix();
-    hz_core::tun::add_secondary_addr(&DNS_BIND_V4).with_context(|| {
-        format!("TUN 辅助地址 {DNS_BIND_V4}/32 添加失败（TUN 未就绪则本地 DNS 应答不可用）")
+    hz_core::tun::add_secondary_addr(&dns_v4).with_context(|| {
+        format!("TUN 辅助地址 {dns_v4}/32 添加失败（TUN 未就绪则本地 DNS 应答不可用）")
     })?;
-    let addr = SocketAddr::from((DNS_BIND_V4, DNS_PORT));
+    let addr = SocketAddr::from((dns_v4, DNS_PORT));
     let bound = match spawn_responder(addr, cache, suffix.clone()).await {
         Ok(bound) => bound,
         Err(error) => {
-            let _ = hz_core::tun::remove_secondary_addr(&DNS_BIND_V4);
+            let _ = hz_core::tun::remove_secondary_addr(&dns_v4);
             return Err(error);
         }
     };
@@ -554,7 +556,7 @@ pub async fn spawn(cache: Arc<NetworkMapCache>) -> anyhow::Result<()> {
     );
     let config = ResolvedConfig {
         suffix: suffix.clone(),
-        dns_addr: DNS_BIND_V4,
+        dns_addr: dns_v4,
     };
     let integration = Integration::apply(
         &SystemDnsPaths::system(),
@@ -600,6 +602,7 @@ fn spawn_signal_task(_guard: Arc<ShutdownGuard>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hz_core::dns::DNS_BIND_V4;
 
     fn node(name: &str, ipv4: &str, ipv6: &str) -> MapNode {
         MapNode {

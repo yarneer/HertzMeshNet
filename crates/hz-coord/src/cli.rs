@@ -5,11 +5,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tonic::transport::{Identity, ServerTlsConfig};
 
-use crate::addr::AddressConfig;
 use crate::http::DistConfig;
 use crate::oidc::OidcConfig;
 use crate::service::{ServeConfig, serve};
-use crate::store::Store;
+use crate::store::{RangeFlags, Store};
 
 #[derive(Parser)]
 #[command(name = "hz-coord", version, about = "HzNet Coordination Server")]
@@ -28,6 +27,12 @@ enum Command {
         /// SQLite 数据库路径
         #[arg(long)]
         db: PathBuf,
+        /// IPv4 地址段（FR-4）：首次初始化固化到库；与库中固化值不同且已有 Node 时拒绝。
+        #[arg(long)]
+        cidr: Option<String>,
+        /// 额外保留地址（可重复出现），从不分配给 Node。
+        #[arg(long = "reserve")]
+        reserve: Vec<std::net::Ipv4Addr>,
         /// 监听地址，如 0.0.0.0:443
         #[arg(long)]
         listen: String,
@@ -76,6 +81,12 @@ enum Command {
         /// SQLite 数据库路径
         #[arg(long)]
         db: PathBuf,
+        /// IPv4 地址段（FR-4）：首次初始化时固化到库，默认 100.96.0.0/16。
+        #[arg(long)]
+        cidr: Option<String>,
+        /// 额外保留地址（可重复出现），从不分配给 Node。
+        #[arg(long = "reserve")]
+        reserve: Vec<std::net::Ipv4Addr>,
         /// 过期时间：Nd（如 7d、30d）或 RFC3339 时刻
         #[arg(long)]
         auth_key_expiry: String,
@@ -102,6 +113,8 @@ pub fn run() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve {
             db,
+            cidr,
+            reserve,
             listen,
             tls_cert,
             tls_key,
@@ -121,6 +134,8 @@ pub fn run() -> anyhow::Result<()> {
             .build()?
             .block_on(run_serve(ServeArgs {
                 db,
+                cidr,
+                reserve,
                 listen,
                 tls_cert,
                 tls_key,
@@ -138,6 +153,8 @@ pub fn run() -> anyhow::Result<()> {
             })),
         Command::Bootstrap {
             db,
+            cidr,
+            reserve,
             auth_key_expiry,
             once,
             tags,
@@ -149,6 +166,7 @@ pub fn run() -> anyhow::Result<()> {
             .build()?
             .block_on(run_bootstrap(
                 db,
+                RangeArgs { cidr, reserve },
                 auth_key_expiry,
                 once,
                 tags,
@@ -162,6 +180,8 @@ pub fn run() -> anyhow::Result<()> {
 /// serve 子命令的参数集合；run_serve 只接收这一个参数。
 struct ServeArgs {
     db: PathBuf,
+    cidr: Option<String>,
+    reserve: Vec<std::net::Ipv4Addr>,
     listen: String,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -181,6 +201,8 @@ struct ServeArgs {
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let ServeArgs {
         db,
+        cidr,
+        reserve,
         listen,
         tls_cert,
         tls_key,
@@ -199,7 +221,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     let listen: std::net::SocketAddr = listen
         .parse()
         .map_err(|e| anyhow::anyhow!("无效的监听地址 {listen}：{e}"))?;
-    let store = Store::open(&db, AddressConfig::default()).await?;
+    let store = Store::open_with_range(&db, RangeFlags { cidr, reserve }).await?;
     let mut config = ServeConfig::new(store, listen);
     if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
         let cert = std::fs::read(&cert_path)?;
@@ -314,8 +336,15 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct RangeArgs {
+    cidr: Option<String>,
+    reserve: Vec<std::net::Ipv4Addr>,
+}
+
+#[allow(clippy::too_many_arguments)] // CLI 入口参数即使用面；与库内 targeted allow 风格一致
 async fn run_bootstrap(
     db: PathBuf,
+    range: RangeArgs,
     auth_key_expiry: String,
     once: bool,
     tags: Vec<String>,
@@ -324,7 +353,14 @@ async fn run_bootstrap(
     json: bool,
 ) -> anyhow::Result<()> {
     let expires_at_unix = parse_expiry(&auth_key_expiry)?;
-    let store = Store::open(&db, AddressConfig::default()).await?;
+    let store = Store::open_with_range(
+        &db,
+        RangeFlags {
+            cidr: range.cidr,
+            reserve: range.reserve,
+        },
+    )
+    .await?;
     if let Some(name) = &admin {
         store.upsert_user(name, true).await?;
     }

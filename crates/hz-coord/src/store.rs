@@ -16,6 +16,8 @@ use crate::name::NodeName;
 const META_ULA_PREFIX: &str = "ula_prefix";
 const META_RELAY_TOKEN_HASH: &str = "relay_token_hash";
 const META_POLICY_CURRENT_VERSION: &str = "policy_current_version";
+const META_ADDR_CIDR: &str = "addr_cidr";
+const META_ADDR_RESERVED: &str = "addr_reserved";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthKeyError {
@@ -139,6 +141,13 @@ fn parse_stored_endpoints(json: &str) -> anyhow::Result<Vec<StoredEndpoint>> {
         .collect()
 }
 
+/// cli 原始段参数（#20）：cidr 可缺省（与固化段/默认段合并），reserve 可独立出现。
+#[derive(Debug, Default)]
+pub struct RangeFlags {
+    pub cidr: Option<String>,
+    pub reserve: Vec<std::net::Ipv4Addr>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -212,6 +221,133 @@ impl Store {
             changes,
             temp: None,
         })
+    }
+
+    /// 生效地址段（含保留地址表与推导的 DNS 地址）。
+    pub fn addr(&self) -> &AddressConfig {
+        &self.addr
+    }
+
+    /// 注册/登录响应携带的段字段对（cidr 文本, DNS 地址文本）。
+    pub fn range_fields(&self) -> (Option<String>, Option<String>) {
+        (
+            Some(self.addr.cidr.to_string()),
+            Some(self.addr.reserved_dns().to_string()),
+        )
+    }
+
+    /// 打开（必要时创建）文件库并解析生效地址段（#20 / FR-4）：
+    /// - 库中未固化：以 flags（或默认段）为准写入 meta；
+    /// - 未携带任何 flag：沿用固化值；
+    /// - 携带的段/保留地址与固化值不同：库中无 Node 时采纳（更新 meta），
+    ///   有 Node 时拒绝——旧段地址已分布在全部 Network Map 与各 Node 的
+    ///   本地配置里，MVP 不做在段迁移。旧库（无 addr_* meta）的 Node 地址
+    ///   必然出自默认段，非默认候选同样按改段拒绝。
+    pub async fn open_with_range(db_path: &Path, flags: RangeFlags) -> anyhow::Result<Self> {
+        let probe = Self::open(db_path, AddressConfig::default()).await?;
+        let effective = probe.resolve_range(flags).await?;
+        if effective == probe.addr {
+            Ok(probe)
+        } else {
+            Self::open(db_path, effective).await
+        }
+    }
+
+    /// 把生效段固化进 meta（BEGIN IMMEDIATE 事务内）。
+    async fn persist_range(&self, chosen: &AddressConfig) -> anyhow::Result<()> {
+        let mut tx = self.begin_write().await?;
+        let (cidr, extras) = chosen.meta_repr();
+        for (key, value) in [
+            (META_ADDR_CIDR, cidr.as_str()),
+            (META_ADDR_RESERVED, extras.join(",").as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn node_count(&self) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM nodes")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    async fn resolve_range(&self, flags: RangeFlags) -> anyhow::Result<AddressConfig> {
+        let stored_cidr = sqlx::query("SELECT value FROM meta WHERE key = ?1")
+            .bind(META_ADDR_CIDR)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get::<String, _>("value"));
+        let stored: Option<AddressConfig> = match &stored_cidr {
+            Some(cidr) => {
+                let extras = sqlx::query("SELECT value FROM meta WHERE key = ?1")
+                    .bind(META_ADDR_RESERVED)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .map(|row| row.get::<String, _>("value"))
+                    .unwrap_or_default();
+                Some(AddressConfig::from_meta(
+                    cidr,
+                    &extras.split(',').map(str::to_string).collect::<Vec<_>>(),
+                )?)
+            }
+            None => None,
+        };
+        if flags.cidr.is_none() && flags.reserve.is_empty() {
+            return match stored {
+                Some(stored) => Ok(stored),
+                None => {
+                    let default = AddressConfig::default();
+                    self.persist_range(&default).await?;
+                    Ok(default)
+                }
+            };
+        }
+        // 候选段：--cidr 优先；仅给 --reserve 时与固化段（或默认段）合并，
+        // reserve 不构成隐式改段。保留地址必须在候选段内（parse 校验）。
+        let base_cidr = flags
+            .cidr
+            .clone()
+            .or_else(|| stored_cidr.clone())
+            .unwrap_or_else(|| crate::addr::DEFAULT_CIDR.to_string());
+        let candidate = AddressConfig::parse(&base_cidr, &flags.reserve)?;
+        let same_set = |a: &[String], b: &[String]| {
+            a.iter().collect::<std::collections::BTreeSet<_>>()
+                == b.iter().collect::<std::collections::BTreeSet<_>>()
+        };
+        if let Some(stored) = &stored {
+            let (stored_cidr, stored_extras) = stored.meta_repr();
+            let (candidate_cidr, candidate_extras) = candidate.meta_repr();
+            if stored_cidr == candidate_cidr && same_set(&stored_extras, &candidate_extras) {
+                return Ok(stored.clone());
+            }
+            let nodes = self.node_count().await?;
+            if nodes > 0 {
+                anyhow::bail!(
+                    "地址段配置与库中固化的 {stored_cidr}（保留 {stored_extras:?}）不一致：已有 {nodes} 个 Node 的地址基于旧配置，\
+                    变更需备份 SQLite 后重新初始化（删除库文件，hz-coord bootstrap --cidr {candidate_cidr}）并重新注册全部 Node"
+                );
+            }
+        } else if candidate != AddressConfig::default() && self.node_count().await? > 0 {
+            anyhow::bail!(
+                "地址段 {} 与库中既有 Node 的默认段 {} 不一致：\
+                改段需备份 SQLite 后重新初始化（删除库文件，hz-coord bootstrap --cidr {}）并重新注册全部 Node",
+                candidate.cidr,
+                crate::addr::DEFAULT_CIDR,
+                candidate.cidr
+            );
+        }
+        candidate.validate_for_deployment()?;
+        self.persist_range(&candidate).await?;
+        Ok(candidate)
     }
 
     /// 订阅 Network Map 相关变更；每次变化 version 递增。

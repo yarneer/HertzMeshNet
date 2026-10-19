@@ -67,6 +67,10 @@ message RegisterAuthKeyRequest {
 
 message RegisterResponse {
   NodeInfo node = 1;
+  // 生效的 IPv4 段与段内推导的 DNS 应答地址（FR-4）：Node 据此配置 TUN 路由
+  // 与本地 DNS，替代易失配的 HZD_V4_CIDR 环境变量。
+  optional string network_cidr = 2;
+  optional string dns_v4 = 3;
 }
 
 message NodeInfo {
@@ -156,6 +160,9 @@ message LoginStatusResponse {
   optional NodeInfo node = 2;
   // 终态错误（链接被重复使用、已过期、IdP 拒绝等），中文可读。
   optional string error = 3;
+  // 与 RegisterResponse 同义；交互式登录路径同样需要生效段信息。
+  optional string network_cidr = 4;
+  optional string dns_v4 = 5;
 }
 
 message StreamMapRequest {

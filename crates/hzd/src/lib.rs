@@ -792,7 +792,13 @@ async fn start_dataplane(
         coord_addr.to_string(),
         daemon.policy_gate.clone(),
     );
-    if let Err(error) = dns::spawn(daemon.map_cache.clone()).await {
+    // 段内 DNS 应答地址：注册响应携带（#20）；旧服务端回落规格 A2 固定值。
+    let dns_v4 = info
+        .dns_v4
+        .as_deref()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(hz_core::dns::DNS_BIND_V4);
+    if let Err(error) = dns::spawn(daemon.map_cache.clone(), dns_v4).await {
         tracing::warn!(%error, "dns responder unavailable");
     }
     spawn_endpoint_collector(
@@ -817,6 +823,74 @@ async fn start_dataplane(
     spawn_egress_watch();
     *daemon.engine.lock().expect("engine poisoned") = Some(engine);
     Ok(())
+}
+
+/// 生效 IPv4 段（FR-4）：注册响应携带的值为权威（与坐标分配一致），
+/// HZD_V4_CIDR 仅作显式覆盖并在与注册值失配时告警，避免静默双源漂移。
+fn effective_v4_cidr(info: &RegisteredInfo, env_override: Option<String>) -> String {
+    match (
+        info.network_cidr.as_deref(),
+        env_override.filter(|v| !v.is_empty()),
+    ) {
+        (Some(from_coord), Some(override_)) => {
+            if override_ != from_coord {
+                tracing::warn!(
+                    from_coord,
+                    override_,
+                    "HZD_V4_CIDR 与服务端生效段不一致，采用环境变量覆盖（路由将不匹配分配段）"
+                );
+            }
+            override_
+        }
+        (Some(from_coord), None) => from_coord.to_string(),
+        (None, Some(override_)) => override_,
+        (None, None) => DEFAULT_V4_CIDR.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod effective_v4_cidr_tests {
+    use super::*;
+
+    fn info(cidr: Option<&str>) -> RegisteredInfo {
+        RegisteredInfo {
+            node_id: "n".into(),
+            name: "n".into(),
+            ipv4: "10.44.0.1".into(),
+            ipv6: "fd::1".into(),
+            tags: vec![],
+            owner_user: None,
+            expires_at_unix: None,
+            network_cidr: cidr.map(str::to_string),
+            dns_v4: None,
+        }
+    }
+
+    #[test]
+    fn registration_value_is_authoritative() {
+        assert_eq!(
+            effective_v4_cidr(&info(Some("10.44.0.0/24")), None),
+            "10.44.0.0/24"
+        );
+    }
+
+    #[test]
+    fn explicit_env_overrides_with_mismatch_logged() {
+        assert_eq!(
+            effective_v4_cidr(&info(Some("10.44.0.0/24")), Some("10.55.0.0/16".into())),
+            "10.55.0.0/16",
+            "显式环境变量覆盖优先（失配已在日志告警）"
+        );
+    }
+
+    #[test]
+    fn legacy_registration_falls_back_to_env_then_default() {
+        assert_eq!(
+            effective_v4_cidr(&info(None), Some("10.55.0.0/16".into())),
+            "10.55.0.0/16"
+        );
+        assert_eq!(effective_v4_cidr(&info(None), None), DEFAULT_V4_CIDR);
+    }
 }
 
 /// macOS 出口监视的守护进程侧消费：保住监视任务的生命周期并留痕。
@@ -1334,7 +1408,7 @@ fn spawn_tun_bridge(
         let tun_config = TunConfig {
             ipv4,
             ipv6,
-            v4_cidr: std::env::var("HZD_V4_CIDR").unwrap_or_else(|_| DEFAULT_V4_CIDR.to_string()),
+            v4_cidr: effective_v4_cidr(info, std::env::var("HZD_V4_CIDR").ok()),
         };
         match Tun::setup(&tun_config) {
             Ok(tun) => {

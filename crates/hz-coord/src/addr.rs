@@ -8,6 +8,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// 100.96.0.53 被 hzd 用作本地 DNS 应答地址（A2），绝不分配给 Node。
 pub const RESERVED_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 53);
 
+/// 默认段（FR-4 / ADR-0003）。cli 与 Default 共用此常量，杜绝第三份写死。
+pub const DEFAULT_CIDR: &str = "100.96.0.0/16";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CidrV4 {
     network: u32,
@@ -71,7 +74,7 @@ impl fmt::Display for CidrV4 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressConfig {
     pub cidr: CidrV4,
     pub reserved: Vec<Ipv4Addr>,
@@ -80,21 +83,76 @@ pub struct AddressConfig {
 impl Default for AddressConfig {
     fn default() -> Self {
         Self {
-            cidr: CidrV4 {
-                network: u32::from(Ipv4Addr::new(100, 96, 0, 0)),
-                prefix: 16,
-            },
+            cidr: CidrV4::parse(DEFAULT_CIDR).expect("默认段常量必须合法"),
             reserved: vec![RESERVED_DNS_V4],
         }
     }
 }
 
 impl AddressConfig {
+    /// 序列化到 meta 表的规范形：CIDR + 逗号分隔的额外保留地址（不含推导的 DNS）。
+    pub fn meta_repr(&self) -> (String, Vec<String>) {
+        let extras: Vec<String> = self
+            .reserved
+            .iter()
+            .filter(|ip| **ip != self.reserved_dns())
+            .map(|ip| ip.to_string())
+            .collect();
+        (self.cidr.to_string(), extras)
+    }
+
+    /// 部署级校验：段必须容纳段内 DNS 应答地址（A2 推广）。分配器本身
+    /// 支持任意前缀（穷尽测试依赖 /30），此约束属于配置入口的策略。
+    pub fn validate_for_deployment(&self) -> anyhow::Result<()> {
+        if self.cidr.host_bits() < 7 || !self.cidr.contains(self.reserved_dns()) {
+            anyhow::bail!(
+                "地址段 {cidr} 过小：至少 /25（为段内 DNS 应答地址与余量）",
+                cidr = self.cidr
+            );
+        }
+        Ok(())
+    }
+
+    /// 从 meta 表恢复；extra 为额外保留地址。
+    pub fn from_meta(cidr: &str, extras: &[String]) -> anyhow::Result<Self> {
+        let reserved: Vec<Ipv4Addr> = extras
+            .iter()
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                text.parse()
+                    .map_err(|_| anyhow::anyhow!("无效的保留地址：{text}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Self::parse(cidr, &reserved)
+    }
+}
+
+/// 段内 DNS 应答地址：网络基址低位置 53（A2 的推广）。默认段 100.96.0.0/16
+/// 推导出规格固定的 100.96.0.53；改段后随之落在段内，hzd 与坐标各自独立
+/// 推导必得同值。要求段至少 /25（host_bits ≥ 7）才能容纳。
+pub fn reserved_dns_for(cidr: &CidrV4) -> Ipv4Addr {
+    Ipv4Addr::from(cidr.network | 53)
+}
+
+impl AddressConfig {
     pub fn parse(cidr: &str, reserved: &[Ipv4Addr]) -> anyhow::Result<Self> {
-        Ok(Self {
-            cidr: CidrV4::parse(cidr)?,
-            reserved: reserved.to_vec(),
-        })
+        let cidr = CidrV4::parse(cidr)?;
+        let mut reserved = reserved.to_vec();
+        for ip in &reserved {
+            if !cidr.contains(*ip) {
+                anyhow::bail!("保留地址 {ip} 不在段 {cidr} 内");
+            }
+        }
+        let dns = reserved_dns_for(&cidr);
+        if cidr.contains(dns) && !reserved.contains(&dns) {
+            reserved.push(dns);
+        }
+        Ok(Self { cidr, reserved })
+    }
+
+    /// 当前段推导的 DNS 应答地址（下发给 Node）。
+    pub fn reserved_dns(&self) -> Ipv4Addr {
+        reserved_dns_for(&self.cidr)
     }
 
     pub fn is_assignable(&self, ip: Ipv4Addr) -> bool {
@@ -203,6 +261,48 @@ mod tests {
         assert!(
             cfg.allocate(&taken).is_none(),
             "/30 只含两个可分配地址，第三次应耗尽"
+        );
+    }
+
+    #[test]
+    fn reserved_dns_derives_from_the_active_range() {
+        assert_eq!(
+            reserved_dns_for(&CidrV4::parse("100.96.0.0/16").unwrap()),
+            RESERVED_DNS_V4,
+            "默认段的推导值必须与规格 A2 固定的 100.96.0.53 一致"
+        );
+        assert_eq!(
+            reserved_dns_for(&CidrV4::parse("100.110.0.0/16").unwrap()),
+            Ipv4Addr::new(100, 110, 0, 53)
+        );
+        assert_eq!(
+            reserved_dns_for(&CidrV4::parse("10.44.0.0/24").unwrap()),
+            Ipv4Addr::new(10, 44, 0, 53)
+        );
+    }
+
+    #[test]
+    fn custom_range_reserves_its_derived_dns_address() {
+        let cfg =
+            AddressConfig::parse("100.110.0.0/24", &["100.110.0.7".parse().unwrap()]).unwrap();
+        let mut taken = HashSet::new();
+        for _ in 0..252 {
+            let ip = cfg.allocate(&taken).expect("段内应有可用地址");
+            assert_ne!(
+                ip,
+                Ipv4Addr::new(100, 110, 0, 53),
+                "段内推导的 DNS 保留地址不得分配"
+            );
+            assert_ne!(
+                ip,
+                Ipv4Addr::new(100, 110, 0, 7),
+                "--reserve 指定的地址不得分配"
+            );
+            taken.insert(ip);
+        }
+        assert!(
+            cfg.allocate(&taken).is_none(),
+            "/24 的 254 个可用地址减去两个保留后恰好用尽"
         );
     }
 

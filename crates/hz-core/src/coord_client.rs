@@ -76,6 +76,8 @@ pub async fn register_with_auth_key(
         tags: node.tags,
         owner_user: node.owner_user,
         expires_at_unix: node.expires_at_unix,
+        network_cidr: response.network_cidr,
+        dns_v4: response.dns_v4,
     })
 }
 
@@ -287,6 +289,8 @@ pub async fn poll_login_status(
             tags: node.tags,
             owner_user: node.owner_user,
             expires_at_unix: node.expires_at_unix,
+            network_cidr: response.network_cidr,
+            dns_v4: response.dns_v4,
         })),
         (true, None) => Ok(LoginPoll::Failed(
             "服务端返回了完成态但没有 Node 信息".to_string(),
