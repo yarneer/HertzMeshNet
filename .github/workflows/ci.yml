@@ -3,15 +3,24 @@ name: CI
 on:
   push:
     branches: [dev, main]
+    # 只改文档不跑 CI（省 Actions 分钟）；*.sh 不在忽略之列，全角标点检查照跑。
+    paths-ignore: ["docs/**", "**.md"]
   pull_request:
     branches: [dev]
+    paths-ignore: ["docs/**", "**.md"]
+
+# 同一分支连续推送时只保留最新一次运行。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # 固定版本：ubuntu-latest 正迁移到 Ubuntu 26，按需主动升级。
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

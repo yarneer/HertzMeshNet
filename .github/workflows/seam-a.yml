@@ -3,13 +3,19 @@ name: Seam A (NAT 拓扑)
 on:
   push:
     branches: [dev, main, "ticket/**"]
+    paths-ignore: ["docs/**", "**.md"]
   pull_request:
     branches: [dev]
+    paths-ignore: ["docs/**", "**.md"]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   seam-a:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
