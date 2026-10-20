@@ -167,3 +167,8 @@
 - **A2 DNS 解析器地址**：`hzd` 在一个保留地址 `100.96.0.53` 上本地应答 DNS 请求。这个地址不分配给任何 Node。不沿用 Tailscale 的 `100.100.100.100`，因为它落在阿里云的 `100.100.0.0/16` 内。
 - **A3 远程管理的认证方式**：`hz` 发起的管理操作，以所在 Node 的归属 User 作为操作者；带 Tag 的 Node 不能执行管理操作。
 - **A4 Node 本地状态**：Machine Key、Node Key 和 Network Map 缓存存放在 `/var/lib/hzd/`（Linux）和 `/Library/Application Support/hzd/`（macOS）。
+
+## 8. 已知限制
+
+- **macOS 上与"强制接管路由"的 Network Extension 类工具共存**：此类工具开启后，系统按其规则转发，路由表中 HzNet 更具体的路由不起作用，发往 Node Address 的流量会进入对方的隧道（v0.1.1 实测）。HzNet 无法单方面绕过，只能在对方工具中排除 HzNet 地址段（且不得排除与 HzNet 完全相同的前缀，否则其同前缀路由会顶掉 HzNet 的路由）。`hz status` 会检测并提示这种冲突（#25），配置方法见安装手册第 10 节。
+

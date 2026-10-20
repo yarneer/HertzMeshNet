@@ -283,28 +283,13 @@ coord `:9100`、relay `:9101` 只绑 127.0.0.1。Prometheus 跑在同机时，�
 
 ## 8. 与第三方 TUN 类网络工具共存
 
-hzd 只把 `100.96.0.0/16` 路由进自己的 TUN，外层流量（WireGuard/STUN/到
-coord 与 relay 的连接）绑定物理出口网卡（FR-7），因此与接管默认路由的
-第三方 TUN 类网络工具可同时运行。剩余冲突点是 **DNS**：这类工具可能以
-fake-IP 模式接管系统 DNS，把所有域名先应答成假 IP，导致 `*.hznet.internal`
-查询到不了 hzd 的本地 DNS 应答（100.96.0.53，A2）。在其分流配置里加入
-以下规则即可（HzNet 域名后缀与 Node Address 段不经第三方工具处理）：
+Node 侧的现象、自检与配置方法见 [安装手册第 10 节](install-guide.md#10-与第三方-tun-类网络工具共存)，这里只列运维要点：
 
-```text
-DOMAIN-SUFFIX,hznet.internal,DIRECT
-IP-CIDR,100.96.0.0/16,DIRECT,no-resolve
-```
-
-若该工具分流配置带 fake-IP 过滤列表（以其中一种工具的写法为例），再把内网
-后缀加进去，保证 `hznet.internal` 走真实解析而不是 fake-IP：
-
-```text
-fake-ip-filter 里追加：+.hznet.internal
-```
-
-（若你把 hzd 的域名后缀改成了别的值，把上述 `hznet.internal` 一并替换。）
-`hz` 与 hzd 侧的分域 DNS（systemd-resolved / `/etc/resolver/`）只接管这个
-后缀，系统其余解析不受影响（FR-5）。
+- hzd 只把 HzNet 地址段路由进自己的 TUN，外层流量（WireGuard / STUN / 到 coord 与 relay 的连接）绑定物理出口网卡（FR-7）。
+- 外层域名解析：系统 DNS 返回 `198.18.0.0/15` 假地址时，hzd 经物理网卡改问引导 DNS（`HZD_BOOTSTRAP_DNS`，缺省为系统 DHCP DNS 再退到公共 DNS），并缓存最近一次有效结果（#23）。内网部署若公共 DNS 不可达，请在 Node 的 hzd 环境里显式配置 `HZD_BOOTSTRAP_DNS`。
+- HzNet 路由被删除或被同前缀路由占用时，hzd 在 10 秒内自动恢复（#24）。
+- 在第三方工具里**不要排除与 HzNet 完全相同的前缀**，应排除更宽的范围；只加"直连"规则不够（直连流量从物理网卡发出，到不了 HzNet）。
+- macOS 上基于 Network Extension 的工具强制接管路由时，路由表不起作用，只能在该工具里排除 HzNet 地址段（spec 已知限制）。
 
 ## 9. 与占用 100.64.0.0/10 的组网工具同时运行（如 Tailscale）
 
@@ -360,6 +345,8 @@ AC3 的三步（需要你自己的三台机器；Policy 以"dev 组可访问 db 
 | 交互式登录回调 404/被拒 | Kanidm 侧回调必须精确等于 `--oidc-redirect-uri`（`https://coord.<域名>/oidc/callback`）；重跑 §5 会重新 PATCH 回调 |
 | Node 注册成功但彼此不通 | `hz status` 看路径；Relayed Path 不通查 `journalctl -u hz-relay` 与 `/etc/default/hz-relay` 的 token 是否仍为 `@RELAY_TOKEN@`（重跑 §6.1）；直连不成立时确认安全组放行 UDP 3478（STUN） |
 | `*.hznet.internal` 解析失败 | 本机是否运行第三方 TUN 类工具（§8）；macOS 看 `/etc/resolver/hznet.internal`；`hzd` 停止时系统普通 DNS 应不受影响（FR-5 AC） |
-| STUN 发现的 Endpoint 是第三方工具的出口 | hzd 外层流量应绑物理网卡（FR-7）；确认没有把 hzd 的流量导入代理型 TUN |
+| STUN 发现的 Endpoint 是第三方工具的出口 | hzd 外层流量应绑物理网卡（FR-7）；确认没有把 hzd 的流量导入第三方 TUN 类网络工具的虚拟网卡 |
+| hzd 日志 `stun query failed server=198.18.x.x` 或连 coord/relay 失败 | 系统 DNS 被第三方工具接管：确认日志出现"改用引导 DNS"；引导 DNS 不可达时配置 `HZD_BOOTSTRAP_DNS`（§8） |
+| `hz status` 提示"流量被其他隧道接管"/"名字解析被接管" | 按安装手册第 10.4 节在对应工具中排除 HzNet 地址段、把域名后缀交给 HzNet 本地 DNS；macOS 强制接管路由的限制见 §8 |
 | 证书续期未生效 | `crontab -l` 有 acme.sh 任务；`~/.acme.sh/acme.sh --list`；手工 `--force`；reloadcmd 会 reload nginx 并重启 hz-relay/kanidm |
 | 恢复后数据异常 | `restore.sh` 的 `.pre-restore.*` 旧库仍在；WAL 已随恢复清理，勿手工混拷 `hznet.db-wal` |

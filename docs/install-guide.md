@@ -104,10 +104,10 @@ sudo hz up
 
 ## 5. 验证
 
-1. 看本机身份：
+1. 看本机身份（只读查询，普通用户即可执行）：
 
    ```sh
-   sudo hz status
+   hz status
    ```
 
    期望输出包含 `已加入 HzNet`、本机的 Node Name 与 Node Address（形如 `100.96.0.1`）。
@@ -115,7 +115,7 @@ sudo hz up
 2. 探测一个对端（把 `db-1` 换成对端 Node Name）：
 
    ```sh
-   sudo hz ping db-1
+   hz ping db-1
    ```
 
    期望显示往返时延和走的路径（`Direct Path` 或 `Relayed Path`）。
@@ -169,6 +169,50 @@ sudo rm -rf "/Library/Application Support/hzd" /Library/Logs/hzd.log /etc/resolv
 - **`hz status` 报「无法连接 hzd」**：`hzd` 没在运行。Linux 用 `systemctl status hzd`、macOS 用 `sudo tail /Library/Logs/hzd.log` 查原因。
 - **安装脚本报「未获知服务器地址」**：脚本是从 GitHub 下载的原件，按第 2 节带上 `HZNET_COORD_URL` 与 `HZNET_COORD_ADDR` 再运行。
 - **注册时报「Auth Key 已使用」或「Auth Key 已过期」**：一次性 Key 只能用一次，过期 Key 向签发人重新要一把。
-- **`hz` 命令报权限错误**：`hz` 经本地 socket 与 `hzd` 通信，遇到权限错误时加 `sudo` 重试。
+- **`hz` 命令提示「需要管理员权限，请用 sudo 执行」**：`hz status`、`hz ping` 是只读查询，普通用户即可执行；`hz up`、`hz login`、Policy、Auth Key 与 Node 管理会以本 Node 的身份改动状态，需要 `sudo`。
+- **`hz status` 提示「流量被其他隧道接管」或「名字解析被接管」**：本机有其他网络工具在接管路由或 DNS，见第 10 节。
 - **macOS 上注册成功但 ping 不通**：`hzd` 需要 root 创建 utun；确认它是经 launchd 以 root 运行的（`sudo launchctl print system/com.hznet.hzd`）。
 - **改了地址段要重装吗**：地址段是服务器侧的部署决定（runbook §9）。Node 无需配置，注册响应会携带生效段。
+
+## 10. 与第三方 TUN 类网络工具共存
+
+一些网络工具会创建自己的虚拟网卡，接管系统的默认路由与 DNS。它们与 HzNet 同时运行时可能互相干扰。
+
+### 10.1 现象
+
+- `ping` 对端看似能通，但 SSH 等 TCP 连接建立后立即被断开（`Connection closed by remote host`）；
+- 用名字（`xxx.hznet.internal`）访问失败，而且任意名字都被解析成 `198.18.x.x`；
+- 关掉那个工具后反而不通（它留下或删除了与 HzNet 相关的路由）。
+
+### 10.2 自检
+
+```sh
+hz status
+```
+
+发现冲突时会直接给出提示：
+
+- **流量被其他隧道接管**：发往 HzNet 的流量实际从别的网卡发出，提示中给出实际源地址和网卡名；
+- **名字解析被接管**：HzNet 域名后缀被解析成 `198.18.0.0/15` 内的假地址。
+
+`hz status --json` 的 `conflicts` 字段给出同样的结构化结果，便于脚本判断。
+
+### 10.3 hzd 会自动处理的部分
+
+- **连接服务器时的域名解析**：系统 DNS 对 Coordination Server、Relay、STUN 的域名返回 `198.18.x.x` 假地址时，`hzd` 会绕过系统 DNS，经物理网卡直接向引导 DNS 查询，并缓存最近一次有效结果。引导 DNS 默认取本机通过 DHCP 获得的 DNS，再退到公共 DNS；可用环境变量 `HZD_BOOTSTRAP_DNS`（逗号分隔，如 `223.5.5.5,119.29.29.29`）指定。
+- **HzNet 路由**：被删除或被其他网卡的同前缀路由占用时，`hzd` 在 10 秒内自动恢复，无需重启。
+
+`hz status` 会显示最近一次发生的引导 DNS 回退与路由修复。
+
+### 10.4 需要在对方工具里配置的部分
+
+1. **把 HzNet 地址段排除在它的隧道之外，但不要排除与 HzNet 完全相同的前缀。** 排除完全相同的前缀（例如 HzNet 段是 `10.213.0.0/16`，就排除 `10.213.0.0/16`）会让它安装一条同前缀、走物理网关的路由，顶掉 HzNet 的路由；它关闭时又连同删除，HzNet 随之失去路由。应排除一个**更宽**的范围，例如 `10.0.0.0/8`（HzNet 段在 `10.x` 时）或 `100.64.0.0/10`（默认段 `100.96.0.0/16` 时），以及 HzNet 的 ULA IPv6 段所在的更宽范围（如 `fd00::/8`）。HzNet 自己更具体的路由仍然优先。
+2. **把 HzNet 域名后缀交给 HzNet 的本地 DNS 解析**，不要让它分配假地址。本地 DNS 地址是 HzNet 段内的保留地址（默认 `100.96.0.53`；改过地址段时为该段网络地址末位换成 53，macOS 上可在 `/etc/resolver/hznet.internal` 中看到）。很多工具支持按域名指定上游 DNS，或把某些域名加入假地址的例外列表。
+3. 只加一条"直连"规则通常**不够**：直连意味着由该工具从物理网卡把流量重新发出，而物理网卡到不了 HzNet。
+
+配置改完后需要断开再重新连接该工具，排除规则才会生效；之后用 `hz status` 确认没有冲突提示。
+
+### 10.5 已知限制（macOS）
+
+macOS 上，基于系统 Network Extension 的工具可以"强制接管路由"：此时系统按它的规则转发，路由表中 HzNet 更具体的路由也不起作用，`route get` 显示的结果与实际转发不一致。这种情况下只能依靠第 10.4 节在该工具里排除 HzNet 地址段；如果该工具不支持排除，使用 HzNet 时请先关闭它。
+
