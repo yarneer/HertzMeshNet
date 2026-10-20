@@ -708,11 +708,10 @@ fn detect_conflicts(info: &RegisteredInfo, result: &serde_json::Value) -> Confli
         });
     }
     if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
-        use std::net::ToSocketAddrs;
-        let probe = format!("hz-selfcheck-{}.{suffix}", std::process::id());
-        if let Ok(addrs) = (probe.as_str(), 0).to_socket_addrs() {
+        let probe = format!("hz-selfcheck-{}.{suffix}.", std::process::id());
+        if let Some(addrs) = resolve_within(&probe, DNS_PROBE_TIMEOUT) {
             let answers: Vec<IpAddr> = addrs
-                .map(|addr| addr.ip())
+                .into_iter()
                 .filter(hz_core::outer_dns::is_fake_ip)
                 .collect();
             if !answers.is_empty() {
@@ -721,6 +720,24 @@ fn detect_conflicts(info: &RegisteredInfo, result: &serde_json::Value) -> Confli
         }
     }
     conflicts
+}
+
+/// DNS 自检的上限：系统 DNS 不可达时 getaddrinfo 可能等上数十秒，
+/// `hz status` 不能因此卡住（脚本会高频调用 `hz status --json`）。
+const DNS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// 在独立线程里做系统解析，超时即放弃（不下结论）。
+fn resolve_within(name: &str, timeout: std::time::Duration) -> Option<Vec<IpAddr>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        use std::net::ToSocketAddrs;
+        let result = (name.as_str(), 0)
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>());
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(timeout).ok()?.ok()
 }
 
 /// HzNet IPv4 段内用于路由探测的地址：网络地址 +1，与本机地址相同时取 +2。

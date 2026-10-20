@@ -1599,7 +1599,7 @@ assert_suite_routeheal() {
   note "断言 1：运行中删除 $a 的 HzNet 路由，10 秒内自动恢复"
   ip netns exec "$ns" ip route del "$cidr" dev hz0
   owner=$(ip netns exec "$ns" ip route show exact "$cidr")
-  [[ -z $owner ]] && pass "负控：路由已删除" || { fail "负控：删除后仍有路由（$owner）"; return 1; }
+  [[ -z $owner ]] && pass "负控：路由已删除" || { fail "负控：删除后仍有路由（${owner}）"; return 1; }
   wait_ping_within "$a" "$b4" 10 "路由被删除后" || return 1
   wait_for_log "$ART_DIR/hz-node-$a.log" "HzNet 路由被删除，已重新安装" "$a 记录路由恢复" 5 || return 1
 
@@ -1607,11 +1607,11 @@ assert_suite_routeheal() {
   ipaddr=$(reg_field "$a" 4); gw="${ipaddr%.*}.1"
   ip netns exec "$ns" ip route replace "$cidr" via "$gw" dev eth0
   owner=$(ip netns exec "$ns" ip route show exact "$cidr")
-  [[ $owner == *"dev eth0"* ]] && pass "负控：路由已被 eth0 占用（$owner）" || { fail "负控：替换未生效（$owner）"; return 1; }
+  [[ $owner == *"dev eth0"* ]] && pass "负控：路由已被 eth0 占用（${owner}）" || { fail "负控：替换未生效（${owner}）"; return 1; }
   wait_ping_within "$a" "$b4" 10 "路由被占用后" || return 1
   wait_for_log "$ART_DIR/hz-node-$a.log" "taken_by=eth0" "$a 记录占用网卡 eth0" 5 || return 1
   owner=$(ip netns exec "$ns" ip route show exact "$cidr")
-  [[ $owner == *"dev hz0"* ]] && pass "路由已回到 hz0（$owner）" || fail "路由未回到 hz0（$owner）"
+  [[ $owner == *"dev hz0"* ]] && pass "路由已回到 hz0（${owner}）" || fail "路由未回到 hz0（${owner}）"
 
   note "断言 3：hz status 汇报最近一次路由修复（#25）"
   local status_out; status_out=$(hz_cli "$a" status)
