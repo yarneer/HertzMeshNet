@@ -118,6 +118,8 @@ sweep() {
   for table in $(nft list tables 2>/dev/null | awk '{print $2}' | grep '^hz-' || true); do
     nft delete table ip "$table" 2>/dev/null || true
   done
+  # fakedns 场景写入的按 netns 覆盖的 hosts（ip netns exec 绑定挂载 /etc/netns/<ns>/*）
+  rm -rf /etc/netns/hz-* 2>/dev/null || true
   return 0
 }
 

@@ -10,6 +10,7 @@ pub mod netif;
 pub mod netwatch;
 #[cfg(target_os = "macos")]
 pub mod netwatch_mac;
+pub mod outer_dns;
 pub mod path;
 pub mod paths;
 pub mod policy;

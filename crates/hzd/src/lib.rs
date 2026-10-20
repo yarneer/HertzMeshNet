@@ -979,7 +979,6 @@ fn spawn_relay_supervisor(
 /// SocketAddr::parse 只认 IP 字面量，主机名必须走 DNS（启动时一次阻塞解析，
 /// 与 coord_probe_target 同一先例），解析失败显式告警而不是静默禁用 STUN。
 fn stun_server_addr() -> Option<SocketAddr> {
-    use std::net::ToSocketAddrs;
     let raw = std::env::var("HZD_STUN_ADDR").ok().or_else(|| {
         let relay = std::env::var("HZD_RELAY_ADDR").ok()?;
         let host_port = relay
@@ -992,8 +991,9 @@ fn stun_server_addr() -> Option<SocketAddr> {
             .unwrap_or(host_port);
         Some(format!("{host}:3478"))
     })?;
-    match raw.to_socket_addrs() {
-        Ok(mut addrs) => addrs.next(),
+    // 经外层解析器：系统 DNS 被接管返回假地址时改问引导 DNS（#23）。
+    match hz_core::outer_dns::resolve_host_port(&raw) {
+        Ok(addrs) => addrs.into_iter().next(),
         Err(error) => {
             tracing::warn!(%raw, %error, "STUN 服务器地址解析失败");
             None

@@ -1506,3 +1506,51 @@ assert_suite_netchange() {
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
 }
+
+# ---------------------------------------------------------------------------
+# 套件 fakedns（#23）：系统 DNS 对外层域名返回 198.18 假地址时，hzd 改问引导 DNS
+# ---------------------------------------------------------------------------
+assert_suite_fakedns() {
+  local a b b4 a4 n ns got
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个"; return 1; }
+
+  note "准备：模拟公网起引导 DNS（*.hz.test → 203.0.113.1）"
+  ip netns exec "$WAN_NS" python3 "$TOPO_DIR/bootstrap_dns.py" 203.0.113.1 53 hz.test 203.0.113.1 \
+    > "$ART_DIR/bootstrap-dns.log" 2>&1 &
+  sleep 1
+
+  note "准备：两个 Node 的系统 DNS 对 coord/stun.hz.test 返回假地址 198.18.0.9"
+  for n in "$a" "$b"; do
+    ns=$(node_ns "$n")
+    mkdir -p "/etc/netns/$ns"
+    printf '127.0.0.1 localhost\n198.18.0.9 coord.hz.test stun.hz.test\n' > "/etc/netns/$ns/hosts"
+    got=$(ip netns exec "$ns" getent hosts coord.hz.test | awk '{print $1}')
+    if [[ $got == 198.18.0.9 ]]; then
+      pass "${n}：系统 DNS 返回假地址（coord.hz.test → ${got}）"
+    else
+      fail "${n}：假地址注入失败（getent 得到 ${got:-无}）"; return 1
+    fi
+  done
+
+  HZD_NODE_EXTRA="$(relay_env_extra) HZD_COORD_ADDR=http://coord.hz.test:443 HZD_STUN_ADDR=stun.hz.test:3478 HZD_BOOTSTRAP_DNS=203.0.113.1:53"
+  note "断言 1：用域名连 Coordination Server，仍能注册"
+  start_node_daemon "$a" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$a"'.json"))["auth_key"])')" || return 1
+  start_node_daemon "$b" "$(python3 -c 'import json;print(json.load(open("'"$ART_DIR"'/key-'"$b"'.json"))["auth_key"])')" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+
+  note "断言 2：hzd 识别假地址并改用引导 DNS（日志明确记录）"
+  for n in "$a" "$b"; do
+    wait_for_log "$ART_DIR/hz-node-$n.log" "改用引导 DNS" "${n} 改用引导 DNS" 30 || return 1
+  done
+
+  note "断言 3：STUN 经域名解析到真实地址，发现真实出口 Endpoint"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 90 || return 1
+
+  note "断言 4：建立 Direct Path，双向 ping"
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
+}

@@ -669,7 +669,12 @@ async fn dial(uri: &Uri) -> io::Result<tokio::net::TcpStream> {
         } else {
             80
         });
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    // 经外层解析器：系统 DNS 被其他网络工具接管返回假地址时改问引导 DNS（#23）。
+    let owned_host = host.to_string();
+    let addrs: Vec<SocketAddr> =
+        tokio::task::spawn_blocking(move || crate::outer_dns::global().resolve(&owned_host, port))
+            .await
+            .map_err(io::Error::other)??;
     let mut last_error = io::Error::other(format!("{host}:{port} 未解析出可用地址"));
     for addr in addrs {
         match connect_bound(addr).await {

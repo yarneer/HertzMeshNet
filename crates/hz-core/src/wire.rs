@@ -1181,7 +1181,6 @@ pub async fn lan_endpoint(coord_addr: &str, wg_port: u16) -> anyhow::Result<Sock
 /// 解析 Coordination Server 地址（允许带 scheme 与主机名）到探测用 SocketAddr。
 /// DNS 解析只在启动时做一次，阻塞可接受。
 fn coord_probe_target(coord_addr: &str) -> anyhow::Result<SocketAddr> {
-    use std::net::ToSocketAddrs;
     let (scheme, host_port) = match coord_addr.split_once("://") {
         Some((scheme, rest)) => (scheme, rest),
         None => ("", coord_addr),
@@ -1197,9 +1196,9 @@ fn coord_probe_target(coord_addr: &str) -> anyhow::Result<SocketAddr> {
     } else {
         format!("{host_port}:{}", if scheme == "http" { 80 } else { 443 })
     };
-    target
-        .to_socket_addrs()
+    crate::outer_dns::resolve_host_port(&target)
         .with_context(|| format!("无法解析 Coordination Server 地址：{coord_addr}"))?
+        .into_iter()
         .next()
         .context(format!(
             "Coordination Server 地址未解析出任何结果：{coord_addr}"
