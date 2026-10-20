@@ -1609,7 +1609,8 @@ assert_suite_routeheal() {
   owner=$(ip netns exec "$ns" ip route show exact "$cidr")
   [[ $owner == *"dev eth0"* ]] && pass "负控：路由已被 eth0 占用（${owner}）" || { fail "负控：替换未生效（${owner}）"; return 1; }
   wait_ping_within "$a" "$b4" 10 "路由被占用后" || return 1
-  wait_for_log "$ART_DIR/hz-node-$a.log" "taken_by=eth0" "$a 记录占用网卡 eth0" 5 || return 1
+  # 匹配消息正文：tracing 字段（taken_by=…）在日志里夹有 ANSI 着色码。
+  wait_for_log "$ART_DIR/hz-node-$a.log" "其他网卡（eth0）的同前缀路由占用" "$a 记录占用网卡 eth0" 5 || return 1
   owner=$(ip netns exec "$ns" ip route show exact "$cidr")
   [[ $owner == *"dev hz0"* ]] && pass "路由已回到 hz0（${owner}）" || fail "路由未回到 hz0（${owner}）"
 
