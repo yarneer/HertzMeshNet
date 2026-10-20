@@ -65,9 +65,16 @@ install_one hz
 
 OS=$(uname -s)
 if [ "$OS" = "Linux" ]; then
-  cat > /etc/default/hzd <<EOF
-HZD_COORD_ADDR=$GRPC_ADDR
-EOF
+  # 升级时保留用户已有的变量（HZD_RELAY_ADDR 等，见安装手册第 6 节），
+  # 只用本次的值替换 HZD_COORD_ADDR。写回用 cat > 而非 mv，保留原文件属主与权限。
+  ENV_FILE=/etc/default/hzd
+  {
+    echo "HZD_COORD_ADDR=$GRPC_ADDR"
+    if [ -f "$ENV_FILE" ]; then
+      grep -Ev '^[[:space:]]*(export[[:space:]]+)?HZD_COORD_ADDR=' "$ENV_FILE" || true
+    fi
+  } > "$STAGE/hzd.env"
+  cat "$STAGE/hzd.env" > "$ENV_FILE"
   # 与 packaging/systemd/hzd.service 保持一致；随脚本内嵌以免安装时再拉取
   cat > /etc/systemd/system/hzd.service <<'UNIT'
 [Unit]
@@ -104,8 +111,10 @@ EOF
   fi
 else
   # 与 packaging/launchd/com.hznet.hzd.plist 同形态，额外注入 HZD_COORD_ADDR
-  # （launchd 不继承 shell 环境变量）。
-  cat > /Library/LaunchDaemons/com.hznet.hzd.plist <<EOF
+  # （launchd 不继承 shell 环境变量）。先写到临时目录，合并旧配置后再落盘。
+  PLIST=/Library/LaunchDaemons/com.hznet.hzd.plist
+  LABEL=system/com.hznet.hzd
+  cat > "$STAGE/hzd.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -132,10 +141,39 @@ else
 </dict>
 </plist>
 EOF
-  chown root:wheel /Library/LaunchDaemons/com.hznet.hzd.plist
-  chmod 644 /Library/LaunchDaemons/com.hznet.hzd.plist
-  launchctl bootout system/com.hznet.hzd >/dev/null 2>&1 || true
-  launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist
+  # 升级时保留旧 plist EnvironmentVariables 里用户加的键（HZD_RELAY_ADDR、
+  # HZD_STUN_ADDR、HZD_BOOTSTRAP_DNS 等，见安装手册第 6 节）。Merge 遇到同名键
+  # 跳过并保留新模板里的值，所以 HZD_COORD_ADDR 取本次的值、其余键原样带过来；
+  # 值整体以 plist 搬运，路径里的空格与引号不经 shell 转义。
+  if [ -f "$PLIST" ] && plutil -extract EnvironmentVariables xml1 -o "$STAGE/env.plist" "$PLIST" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Merge $STAGE/env.plist :EnvironmentVariables" "$STAGE/hzd.plist" >/dev/null \
+      || fail "无法合并 $PLIST 中已有的环境变量；原文件未改动，请检查其 EnvironmentVariables 段"
+    echo "已保留 $PLIST 中已有的环境变量（HZD_COORD_ADDR 更新为 ${GRPC_ADDR}）"
+  fi
+  plutil -lint "$STAGE/hzd.plist" >/dev/null || fail "生成的 plist 格式错误"
+  install -o root -g wheel -m 0644 "$STAGE/hzd.plist" "$PLIST"
+
+  # bootout 只是请求卸载：旧 hzd 收到 SIGTERM 后要先恢复 DNS 配置才退出，
+  # 这期间服务仍登记在 launchd 里。此时立即 bootstrap 会报
+  # "Bootstrap failed: 5: Input/output error"，服务就停在已卸载、未重载的状态。
+  # 所以等到 launchctl print 查不到服务（已彻底卸载）再 bootstrap，最多 15 秒。
+  launchctl bootout "$LABEL" >/dev/null 2>&1 || true
+  waited=0
+  while launchctl print "$LABEL" >/dev/null 2>&1; do
+    [ "$waited" -lt 30 ] || fail "旧 hzd 15 秒内未退出，服务未重载。查看日志：sudo tail -n 50 /Library/Logs/hzd.log；确认旧进程退出后执行：sudo launchctl bootstrap system $PLIST"
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  launchctl bootstrap system "$PLIST" \
+    || fail "launchd 未能加载 hzd。查看日志：sudo tail -n 50 /Library/Logs/hzd.log；稍后重试：sudo launchctl bootstrap system $PLIST"
+
+  # bootstrap 成功只代表 launchd 接受了配置；确认 hzd 进程真的跑起来再报告。
+  waited=0
+  until launchctl print "$LABEL" 2>/dev/null | grep -q '^[[:space:]]*state = running'; do
+    [ "$waited" -lt 20 ] || fail "hzd 已加载但 10 秒内未进入运行状态。查看状态：sudo launchctl print ${LABEL}；查看日志：sudo tail -n 50 /Library/Logs/hzd.log"
+    sleep 0.5
+    waited=$((waited + 1))
+  done
   echo "已启动 hzd 并设置开机自启（launchd）"
 fi
 
