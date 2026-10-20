@@ -69,7 +69,8 @@ enum Command {
         /// 分发目录（FR-13）：内含 <os>-<arch>/{hzd,hz}，经 --http-listen 下发 /install.sh 与 /dl/
         #[arg(long, requires = "http_listen")]
         dist_dir: Option<PathBuf>,
-        /// install.sh 里写入的公共 HTTP 基地址（如 https://coord.example.com:8443）
+        /// 浏览器与安装脚本可访问的公共 HTTP 基地址（如 https://coord.example.com）：
+        /// install.sh 内置它，一次性登录链接也按它拼接
         #[arg(long)]
         public_url: Option<String>,
         /// install.sh 写入 HZD_COORD_ADDR 的 gRPC 公网地址（缺省取 public-url 的主机名配 https）
@@ -297,15 +298,15 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         });
     }
 
+    // 公共基地址同时用于 install.sh 与一次性登录链接（缺省时登录链接由回调地址推导）。
+    let public_url = public_url.or_else(|| env_value("HZ_COORD_PUBLIC_URL"));
+    config.public_url = public_url.clone();
+
     let dist_dir = dist_dir.or_else(|| env_value("HZ_COORD_DIST_DIR").map(PathBuf::from));
     if let Some(dir) = dist_dir {
-        let url = public_url
-            .or_else(|| env_value("HZ_COORD_PUBLIC_URL"))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "配置了 --dist-dir 但缺少 --public-url，install.sh 无法内置服务器地址"
-                )
-            })?;
+        let url = public_url.ok_or_else(|| {
+            anyhow::anyhow!("配置了 --dist-dir 但缺少 --public-url，install.sh 无法内置服务器地址")
+        })?;
         let grpc_addr = public_grpc_addr
             .or_else(|| env_value("HZ_COORD_PUBLIC_GRPC_ADDR"))
             .or_else(|| default_grpc_addr(&url))

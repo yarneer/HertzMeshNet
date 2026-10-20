@@ -54,6 +54,9 @@ pub struct ServeConfig {
     pub dist: Option<DistConfig>,
     /// Prometheus /metrics 监听地址；None 时不开指标面。
     pub metrics_listen: Option<SocketAddr>,
+    /// 浏览器可访问的公共基地址（--public-url，如 https://coord.example.com）；
+    /// 一次性登录链接按它拼接，缺省由 OIDC 回调地址推导。
+    pub public_url: Option<String>,
     /// 一次性登录链接的有效期（默认 5 分钟）。
     pub login_ttl: Duration,
     /// 交互式登录授予的 Node 有效期（默认 90 天）。
@@ -72,6 +75,7 @@ impl ServeConfig {
             oidc: None,
             dist: None,
             metrics_listen: None,
+            public_url: None,
             login_ttl: LOGIN_TTL,
             login_node_ttl_secs: LOGIN_NODE_TTL_SECS,
         }
@@ -226,6 +230,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         let http_listen = config.http_listen.ok_or_else(|| {
             anyhow::anyhow!("配置了 OIDC 或 --dist-dir 但缺少 --http-listen，HTTP 面无处落地")
         })?;
+        let redirect_uri = config.oidc.as_ref().map(|oidc| oidc.redirect_uri.clone());
         let oidc = match config.oidc {
             Some(oidc_config) => Some(OidcClient::discover(oidc_config).await?),
             None => None,
@@ -239,9 +244,18 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
             dist: dist_state,
         });
         let http = serve_http(http_listen, http_state).await?;
-        (logins, Some(http))
+        let base = login_base_url(
+            config.public_url.as_deref(),
+            redirect_uri.as_ref(),
+            http.local_addr,
+        );
+        (logins, Some((http, base)))
     } else {
         (Arc::new(LoginRegistry::new()), None)
+    };
+    let (http_handle, login_base) = match http_handle {
+        Some((http, base)) => (Some(http), Some(base)),
+        None => (None, None),
     };
     let http_addr = http_handle.as_ref().map(|http| http.local_addr);
     let metrics = Arc::new(Metrics::new()?);
@@ -256,7 +270,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         map_hub: hub.clone(),
         logins: logins.clone(),
         login_ttl: config.login_ttl,
-        http_addr,
+        login_base,
         metrics,
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -308,6 +322,29 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     })
 }
 
+/// 一次性登录链接的基地址：用户的浏览器要能打开它。依次取 --public-url、
+/// OIDC 回调地址的 scheme+host（回调本就须浏览器可达）、HTTP 面监听地址
+/// （loopback 测试环境）。真实部署 HTTP 面在 nginx 之后监听 127.0.0.1，
+/// 直接用监听地址拼出的链接在用户浏览器里打不开。
+fn login_base_url(
+    public_url: Option<&str>,
+    redirect_uri: Option<&reqwest::Url>,
+    http_addr: SocketAddr,
+) -> String {
+    if let Some(url) = public_url
+        .map(|url| url.trim_end_matches('/'))
+        .filter(|url| !url.is_empty())
+    {
+        return url.to_string();
+    }
+    if let Some(uri) = redirect_uri
+        && uri.has_host()
+    {
+        return uri.origin().ascii_serialization();
+    }
+    format!("http://{http_addr}")
+}
+
 /// 每条已接受的连接登记进 LiveConnections（以 [`TrackedStream`] 包装，
 /// 连接结束自动反注册）后交给 tonic。
 struct TcpListenerStreamMapped {
@@ -354,7 +391,8 @@ struct CoordServiceImpl {
     map_hub: Arc<MapHub>,
     logins: Arc<LoginRegistry>,
     login_ttl: Duration,
-    http_addr: Option<SocketAddr>,
+    /// 一次性登录链接的基地址；None 表示未配置交互式登录的 HTTP 面。
+    login_base: Option<String>,
     metrics: Arc<Metrics>,
 }
 
@@ -562,7 +600,7 @@ impl Coord for CoordServiceImpl {
         if let Some(status) = Self::hello_reject_old_version(req.protocol_version) {
             return Err(status);
         }
-        let Some(http_addr) = self.http_addr else {
+        let Some(login_base) = self.login_base.as_deref() else {
             return Err(Status::unimplemented(
                 "此 Coordination Server 未配置交互式登录（OIDC）",
             ));
@@ -603,7 +641,7 @@ impl Coord for CoordServiceImpl {
             "interactive login began"
         );
         Ok(Response::new(BeginLoginResponse {
-            login_url: format!("http://{http_addr}/oidc/start/{}", started.login_id.0),
+            login_url: format!("{login_base}/oidc/start/{}", started.login_id.0),
             expires_unix,
         }))
     }
@@ -1216,6 +1254,37 @@ fn system_time_to_unix(t: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_base_url_prefers_public_url() {
+        let redirect: reqwest::Url = "https://other.example.com/oidc/callback".parse().unwrap();
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            login_base_url(Some("https://coord.example.com/"), Some(&redirect), listen),
+            "https://coord.example.com"
+        );
+    }
+
+    #[test]
+    fn login_base_url_derives_from_redirect_uri() {
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let redirect: reqwest::Url = "https://coord.example.com/oidc/callback".parse().unwrap();
+        assert_eq!(
+            login_base_url(None, Some(&redirect), listen),
+            "https://coord.example.com"
+        );
+        let redirect: reqwest::Url = "http://127.0.0.1:9180/oidc/callback".parse().unwrap();
+        assert_eq!(
+            login_base_url(None, Some(&redirect), listen),
+            "http://127.0.0.1:9180"
+        );
+    }
+
+    #[test]
+    fn login_base_url_falls_back_to_listen_addr() {
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(login_base_url(None, None, listen), "http://127.0.0.1:8080");
+    }
 
     #[test]
     fn endpoint_parsing_accepts_ip_port_and_rejects_garbage() {
