@@ -90,3 +90,67 @@ async fn oversized_line_is_rejected_instead_of_buffered() {
         "超限请求不应得到正常响应，实际：{response}"
     );
 }
+
+// #26：hzd 以 root 运行时，普通用户也要能连上 socket 做只读查询；
+// 是否允许具体请求由按调用方 uid 的授权决定，而不是靠文件权限一刀切。
+#[tokio::test]
+async fn socket_is_connectable_by_any_local_user() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            ipc::serve(
+                &socket,
+                handler(|_request: ipc::Request| async { Ok(json!({})) }),
+            )
+            .await
+        }
+    });
+    wait_for_socket(&socket).await;
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    server.abort();
+
+    assert_eq!(mode, 0o666, "socket 权限应为 0666，实际 {mode:o}");
+}
+
+// #26：socket 对所有本机用户开放后，越权由按调用方 uid 的授权兜住：
+// 只读查询任何人可做；注册、Policy、Auth Key、Node 管理等只允许 root 或 hzd 同一用户。
+#[test]
+fn read_only_methods_are_open_to_any_local_user() {
+    let (hzd_uid, someone) = (0, 501);
+    assert!(ipc::authorize("status", someone, hzd_uid).is_ok());
+    assert!(ipc::authorize("ping", someone, hzd_uid).is_ok());
+}
+
+#[test]
+fn state_changing_methods_need_root_or_the_daemon_user() {
+    let (hzd_uid, someone) = (0, 501);
+    for method in [
+        "up",
+        "login_poll",
+        "policy_push",
+        "policy_get",
+        "policy_rollback",
+        "authkey_create",
+        "authkey_revoke",
+        "node_list",
+        "node_rename",
+        "node_delete",
+        "node_revoke",
+    ] {
+        let error = ipc::authorize(method, someone, hzd_uid).expect_err(method);
+        assert!(
+            error.contains("sudo"),
+            "{method} 的拒绝提示应引导用 sudo：{error}"
+        );
+        assert!(
+            ipc::authorize(method, 0, hzd_uid).is_ok(),
+            "root 可执行 {method}"
+        );
+    }
+    // 开发/测试场景 hzd 以普通用户运行：同一用户可执行全部操作。
+    assert!(ipc::authorize("authkey_create", 501, 501).is_ok());
+}

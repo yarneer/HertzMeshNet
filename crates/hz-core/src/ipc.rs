@@ -66,6 +66,13 @@ pub async fn serve(socket_path: &Path, handler: Handler) -> anyhow::Result<()> {
     }
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+    // 任何本机用户都能连上（只读查询不需要 sudo）；能做什么由 authorize
+    // 按调用方 uid 判定，而不是靠文件权限一刀切。
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
+            .with_context(|| format!("failed to chmod {}", socket_path.display()))?;
+    }
     let _guard = SocketGuard {
         path: socket_path.to_path_buf(),
     };
@@ -92,7 +99,24 @@ impl Drop for SocketGuard {
     }
 }
 
+/// 任何本机用户都可发起的只读请求（#26）。其余请求以本 Node 的身份改动
+/// 状态或读取 Policy、Node 列表等管理信息，只允许 root 或与 hzd 同一用户。
+const READ_ONLY_METHODS: &[&str] = &["status", "ping"];
+
+/// 按调用方 uid 判定能否执行 `method`：只读请求放行；其余要求调用方是
+/// root 或与 hzd 同一用户（hzd 以普通用户运行的开发与测试场景）。
+pub fn authorize(method: &str, peer_uid: u32, daemon_uid: u32) -> Result<(), String> {
+    if READ_ONLY_METHODS.contains(&method) || peer_uid == 0 || peer_uid == daemon_uid {
+        Ok(())
+    } else {
+        Err(format!("`{method}` 需要管理员权限，请用 sudo 执行"))
+    }
+}
+
 async fn handle_connection(stream: UnixStream, handler: Handler) -> anyhow::Result<()> {
+    let peer_uid = stream.peer_cred()?.uid();
+    // SAFETY: geteuid 无副作用、不会失败。
+    let daemon_uid = unsafe { libc::geteuid() };
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -106,7 +130,11 @@ async fn handle_connection(stream: UnixStream, handler: Handler) -> anyhow::Resu
         let request: Request = serde_json::from_str(line.trim())
             .map_err(|error| anyhow!("malformed ipc request: {error}"))?;
         let id = request.id;
-        let response = match handler(request).await {
+        let outcome = match authorize(&request.method, peer_uid, daemon_uid) {
+            Ok(()) => handler(request).await,
+            Err(error) => Err(error),
+        };
+        let response = match outcome {
             Ok(result) => Response::Ok { id, result },
             Err(error) => Response::Error { id, error },
         };
