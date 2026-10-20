@@ -31,6 +31,14 @@ server {
     ssl_certificate_key /etc/hznet/tls/coord/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
 
+    # 只服务 coord 子域名。三个子域名同 IP，浏览器若凭证书复用本连接去请求
+    # auth/relay（HTTP/2 连接合并），443 的 SNI 分流已把整条连接交给这里；
+    # 421 Misdirected Request 让浏览器换一条新连接重试，而不是把请求错送给
+    # hz-coord（症状：Kanidm 登录页 404）。$host 已去掉端口并转小写。
+    if ($host != "coord.@DOMAIN@") {
+        return 421;
+    }
+
     # gRPC 面：路径前缀即 proto 的 package+service（hz.v1.Coord）。
     # TLS 已在 nginx 终止，向上游走明文 h2（grpc://）。
     location /hz.v1.Coord/ {

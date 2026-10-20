@@ -69,12 +69,37 @@ Relay 与 Kanidm 需要 TLS 透传，因为它们各自在进程内终止 TLS（
 sudo bash scripts/deploy/certs.sh --domain <域名> --account-email <你的邮箱>
 ```
 
-- HTTP-01 走 nginx 80 端口 webroot；一张证书三个 SAN（coord/relay/auth）。
-- 安装到 `/etc/hznet/tls/{coord,relay,auth}/`；续期 reload：nginx reload +
-  重启 hz-relay / kanidm（它们只在启动时读证书）。
+- HTTP-01 走 nginx 80 端口 webroot；coord / relay / auth **每个子域名各一张证书**，
+  证书里只有自身的名字。
+- 分别安装到 `/etc/hznet/tls/{coord,relay,auth}/`；续期时各自重载使用者：coord → nginx
+  reload，relay → 重启 hz-relay，auth → 重启 kanidm（后两者只在启动时读证书）。
 - 续期由 acme.sh 自带的定时任务自动完成（`crontab -l` 可见），无需人工干预；
   强制续期加 `--force`。
 - 测试环境可重生成占位证书：`sudo bash scripts/deploy/certs.sh --domain <域名> --self-signed`。
+
+为什么不用一张证书覆盖三个子域名：三个子域名解析到同一 IP，443 由 nginx 按 SNI 把**整条
+TCP 连接**分给 coord / relay / Kanidm。证书若同时覆盖 `auth.<域名>`，浏览器会复用已经
+连到 coord 的 HTTP/2 连接去请求 `auth.<域名>`（连接合并），请求被送进 hz-coord，表现为
+交互式登录时 Kanidm 登录页 404（如 `/ui/login/begin`），回调方向也可能落进 Kanidm。
+单域名证书让浏览器不再合并连接；另外 coord 的 TLS vhost 对 Host 不是 `coord.<域名>` 的
+请求返回 421（Misdirected Request），浏览器会换一条新连接重试，作为兜底。
+
+**已部署环境的迁移**（v0.1.3 及更早用 `certs.sh` 签过一张三 SAN 证书）：
+
+```sh
+cd <仓库目录> && git pull                       # 取到新版 certs.sh 与 nginx 模板
+sudo bash scripts/deploy/certs.sh --domain <域名> --account-email <你的邮箱>
+sudo sed "s/@DOMAIN@/<域名>/g" packaging/deploy/nginx/hznet-http.conf.template \
+  | sudo tee /etc/nginx/sites-available/hznet >/dev/null
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+- `certs.sh` 发现已安装的证书含其他子域名时，自动为每个子域名重签单域名证书并安装、
+  重载对应服务（Let's Encrypt 对同一组域名每周有签发次数限制，迁移只需执行一次）。
+- 第二步把 421 规则带进 nginx（`server-bootstrap.sh` 重跑也会重写该文件）。
+- 自检：`openssl s_client -connect coord.<域名>:443 -servername auth.<域名> </dev/null
+  2>/dev/null | openssl x509 -noout -ext subjectAltName` 应只列出 `auth.<域名>`；浏览器
+  需关闭已打开的标签页或重启，丢掉旧的合并连接。
 
 自检：
 
@@ -377,11 +402,13 @@ AC3 的三步（需要你自己的三台机器；Policy 以"dev 组可访问 db 
 | `hz up` 报连接 Coordination Server 失败 | `curl -fsS https://coord.<域名>/healthz`；不通看 `nginx -t`、`journalctl -u nginx`（SNI 分流按域名匹配，DNS 必须先生效）；证书过期看 §3 |
 | hz-coord 起不来，日志提 OIDC 发现文档 | OIDC 在启动时同步拉发现文档（`OidcClient::discover`）：确认 kanidm 已运行、正式证书已装、`/etc/default/hz-coord` 里 `--oidc-issuer` 指向 `https://auth.<域名>/oauth2/openid/hznet-coord` |
 | 交互式登录回调 404/被拒 | Kanidm 侧回调必须精确等于 `--oidc-redirect-uri`（`https://coord.<域名>/oidc/callback`）；重跑 §5 会重新 PATCH 回调 |
+| 打开登录链接后 Kanidm 登录页 404（如 `/ui/login/begin`），或换无痕窗口才能登录 | 证书仍是一张覆盖三个子域名的多 SAN 证书，浏览器把 auth 的请求合并进了 coord 的连接：按 §3「已部署环境的迁移」换成单域名证书并更新 nginx 配置，然后重启浏览器 |
+| `hz login` 打印的登录链接是 `http://127.0.0.1:…` | hz-coord 低于 v0.1.4，或 `/etc/default/hz-coord` 缺 `--public-url https://coord.<域名>`（v0.1.4 起登录链接按它拼接，缺省时取 `--oidc-redirect-uri` 的主机） |
 | 配置 Policy 后某台 Node 与所有 Node 都不通，`hz node list` 显示「归属 User：无（Tag 注册）」「Tags：无」 | 它是用 v0.1.4 之前签发的无 Tag Auth Key 注册的，Policy 覆盖不到；按 §6.5 处置 |
 | Node 注册成功但彼此不通 | `hz status` 看路径；Relayed Path 不通查 `journalctl -u hz-relay` 与 `/etc/default/hz-relay` 的 token 是否仍为 `@RELAY_TOKEN@`（重跑 §6.1）；直连不成立时确认安全组放行 UDP 3478（STUN） |
 | `*.hznet.internal` 解析失败 | 本机是否运行第三方 TUN 类工具（§8）；macOS 看 `/etc/resolver/hznet.internal`；`hzd` 停止时系统普通 DNS 应不受影响（FR-5 AC） |
 | STUN 发现的 Endpoint 是第三方工具的出口 | hzd 外层流量应绑物理网卡（FR-7）；确认没有把 hzd 的流量导入第三方 TUN 类网络工具的虚拟网卡 |
 | hzd 日志 `stun query failed server=198.18.x.x` 或连 coord/relay 失败 | 系统 DNS 被第三方工具接管：确认日志出现"改用引导 DNS"；引导 DNS 不可达时配置 `HZD_BOOTSTRAP_DNS`（§8） |
 | `hz status` 提示"流量被其他隧道接管"/"名字解析被接管" | 按安装手册第 10.4 节在对应工具中排除 HzNet 地址段、把域名后缀交给 HzNet 本地 DNS；macOS 强制接管路由的限制见 §8 |
-| 证书续期未生效 | `crontab -l` 有 acme.sh 任务；`~/.acme.sh/acme.sh --list`；手工 `--force`；reloadcmd 会 reload nginx 并重启 hz-relay/kanidm |
+| 证书续期未生效 | `crontab -l` 有 acme.sh 任务；`~/.acme.sh/acme.sh --list` 应列出三个子域名各一张；手工 `--force`；各证书的 reloadcmd 分别 reload nginx、重启 hz-relay、重启 kanidm |
 | 恢复后数据异常 | `restore.sh` 的 `.pre-restore.*` 旧库仍在；WAL 已随恢复清理，勿手工混拷 `hznet.db-wal` |

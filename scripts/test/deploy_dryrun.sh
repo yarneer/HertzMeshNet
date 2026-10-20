@@ -3,8 +3,8 @@
 # server-bootstrap.sh 的 --skip-packages --no-systemctl 路径（哑二进制代替
 # musl 产物），断言全部文件产物、三次 SNI 分流表与 nginx 配置可用性
 # （nginx -t 必须通过），再干跑 backup/restore/hz-bootstrap/upgrade 的文件
-# 操作路径。kanidm-init.sh 与 certs.sh 需要真实 Kanidm/ACME，不在干跑范围
-# （由 shellcheck 覆盖语法层）。
+# 操作路径，以及 certs.sh 的 --self-signed 路径。kanidm-init.sh 与 certs.sh 的
+# 正式证书路径需要真实 Kanidm/ACME，不在干跑范围（由 shellcheck 覆盖语法层）。
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -35,6 +35,15 @@ assert_absent() {
 assert_file() {
   if [ -f "$1" ]; then pass "file exists: $1"
   else fail "missing file: $1"; fi
+}
+# 每个子域名一张证书、SAN 只含自身：多 SAN 证书会让浏览器复用 coord 的连接
+# 请求 auth（三子域名同 IP），被 SNI 分流送错后端。
+assert_single_san() {
+  local sans
+  sans=$(openssl x509 -in "/etc/hznet/tls/$1/fullchain.pem" -noout -text \
+    | grep -o 'DNS:[^,[:space:]]*' | tr '\n' ' ')
+  if [ "${sans}" = "DNS:$1.dryrun.example " ]; then pass "$1 cert SAN only $1.dryrun.example"
+  else fail "$1 cert SAN = ${sans:-<none>} (expect only DNS:$1.dryrun.example)"; fi
 }
 
 echo "== 容器初始化（nginx + stream 模块、openssl、sqlite3、python3）"
@@ -105,11 +114,14 @@ assert_contains /etc/nginx/sites-enabled/hznet 'location /hz.v1.Coord/'
 assert_contains /etc/nginx/sites-enabled/hznet 'proxy_pass http://127.0.0.1:8080'
 assert_contains /etc/nginx/sites-enabled/hznet 'listen 127.0.0.1:8443 ssl http2'
 assert_contains /etc/nginx/sites-enabled/hznet 'acme-challenge'
+assert_contains /etc/nginx/sites-enabled/hznet 'if ($host != "coord.dryrun.example")'
+assert_contains /etc/nginx/sites-enabled/hznet 'return 421'
 
 echo "== 断言：占位证书与 Kanidm 配置"
 for sub in coord relay auth; do
   assert_file "/etc/hznet/tls/${sub}/fullchain.pem"
   assert_file "/etc/hznet/tls/${sub}/privkey.pem"
+  assert_single_san "${sub}"
 done
 assert_contains /etc/kanidm/server.toml 'domain = "auth.dryrun.example"'
 assert_contains /etc/kanidm/server.toml 'origin = "https://auth.dryrun.example"'
@@ -120,6 +132,19 @@ assert_file /var/lib/hz-coord/dist/darwin-arm64/hzd
 echo "== 断言：nginx -t"
 if nginx -t 2>/tmp/nginx-t.err; then pass "nginx -t OK"
 else fail "nginx -t failed"; cat /tmp/nginx-t.err >&2; fi
+
+echo "== 断言：coord vhost 对其他子域名的请求返回 421（浏览器换连接重试）"
+nginx
+code_for() {
+  curl -sk -o /dev/null -w '%{http_code}' --resolve "$1:8443:127.0.0.1" "https://$1:8443/healthz" || true
+}
+code=$(code_for auth.dryrun.example)
+if [ "${code}" = "421" ]; then pass "Host auth.dryrun.example on coord vhost -> 421"
+else fail "Host auth.dryrun.example on coord vhost -> ${code} (expect 421)"; fi
+code=$(code_for coord.dryrun.example)
+if [ "${code}" != "421" ]; then pass "Host coord.dryrun.example passes through (${code}, no backend in dryrun)"
+else fail "Host coord.dryrun.example unexpectedly 421"; fi
+nginx -s stop
 
 echo "== 幂等：再跑一次 server-bootstrap.sh"
 if /work/scripts/deploy/server-bootstrap.sh \
@@ -147,6 +172,15 @@ else fail "backup content wrong"; fi
 pass "restore.sh exit 0"
 if [ "$(sqlite3 /tmp/restored.db 'SELECT count(*) FROM node;')" = "1" ]; then pass "restored db content intact"
 else fail "restored db content wrong"; fi
+
+echo "== certs.sh --self-signed 干跑（每个子域名各一张占位证书）"
+rm -f /etc/hznet/tls/*/fullchain.pem
+/work/scripts/deploy/certs.sh --domain dryrun.example --self-signed --no-systemctl > /tmp/certs.log 2>&1
+pass "certs.sh --self-signed exit 0"
+for sub in coord relay auth; do
+  assert_single_san "${sub}"
+done
+assert_contains /tmp/certs.log 'systemctl reload nginx'
 
 echo "== hz-bootstrap.sh 干跑（hz-coord 用 JSON 桩替代）"
 cat > /usr/local/bin/hz-coord <<'SHIM'

@@ -168,23 +168,22 @@ ln -sfn /etc/nginx/sites-available/hznet /etc/nginx/sites-enabled/hznet
 rm -f /etc/nginx/sites-enabled/default
 
 echo "==> 证书目录与占位自签证书（正式证书由 certs.sh 换发）"
-need_placeholder=0
+# 每个子域名一张证书、SAN 只含自身：三个子域名同 IP，多 SAN 证书会让浏览器
+# 复用 coord 的连接去请求 auth，被 443 的 SNI 分流送错后端（runbook §3）。
+placeholder_made=0
 for sub in coord relay auth; do
   mkdir -p "/etc/hznet/tls/${sub}"
-  [ -f "/etc/hznet/tls/${sub}/fullchain.pem" ] || need_placeholder=1
-done
-if [ "${need_placeholder}" = "1" ]; then
-  tmp_cert="$(mktemp -d)"
+  [ -f "/etc/hznet/tls/${sub}/fullchain.pem" ] && continue
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "${tmp_cert}/privkey.pem" -out "${tmp_cert}/fullchain.pem" \
-    -days 30 -nodes -subj "/CN=coord.${DOMAIN}" \
-    -addext "subjectAltName=DNS:coord.${DOMAIN},DNS:relay.${DOMAIN},DNS:auth.${DOMAIN}" \
-    >/dev/null 2>&1 || die "生成占位证书失败"
-  for sub in coord relay auth; do
-    install -m 0644 "${tmp_cert}/fullchain.pem" "/etc/hznet/tls/${sub}/fullchain.pem"
-    install -m 0600 "${tmp_cert}/privkey.pem" "/etc/hznet/tls/${sub}/privkey.pem"
-  done
-  rm -rf "${tmp_cert}"
+    -keyout "/etc/hznet/tls/${sub}/privkey.pem" -out "/etc/hznet/tls/${sub}/fullchain.pem" \
+    -days 30 -nodes -subj "/CN=${sub}.${DOMAIN}" \
+    -addext "subjectAltName=DNS:${sub}.${DOMAIN}" \
+    >/dev/null 2>&1 || die "生成 ${sub} 占位证书失败"
+  chmod 0644 "/etc/hznet/tls/${sub}/fullchain.pem"
+  chmod 0600 "/etc/hznet/tls/${sub}/privkey.pem"
+  placeholder_made=1
+done
+if [ "${placeholder_made}" = "1" ]; then
   echo "    已生成 30 天占位证书（浏览器/客户端会告警，仅用于先把服务拉起）"
 fi
 
