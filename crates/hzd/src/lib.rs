@@ -111,6 +111,80 @@ impl EgressEpoch {
     }
 }
 
+/// 运行中路由自检的周期（#24：被删除/被占用的 HzNet 路由 10 秒内恢复）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+
+/// 最近一次运行中路由修复（#24），供 `hz status` 汇报（#25）。
+static LAST_ROUTE_REPAIR: StdMutex<Option<RouteRepairNote>> = StdMutex::new(None);
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RouteRepairNote {
+    /// Unix 秒。
+    at: u64,
+    cidr: String,
+    /// 修复前：`missing`（被删除）或占用它的网卡名。
+    previous: String,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// 周期检查 HzNet 路由，被删除或被其他网卡的同前缀路由占用时重新安装（#24）。
+/// 路由正常时只读不写、不打日志；自检本身出错只在错误变化时告警一次。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_route_guard(tun: Arc<Tun>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(ROUTE_CHECK_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await; // 跳过立即的首跳：setup 刚装好路由
+        let mut last_error: Option<String> = None;
+        loop {
+            tick.tick().await;
+            let tun = tun.clone();
+            let outcome = tokio::task::spawn_blocking(move || tun.check_and_repair_routes()).await;
+            match outcome {
+                Ok(Ok(repairs)) => {
+                    last_error = None;
+                    for repair in repairs {
+                        let previous = match &repair.previous {
+                            hz_core::tun::RouteHealth::TakenBy(iface) => iface.clone(),
+                            _ => "missing".to_string(),
+                        };
+                        if previous == "missing" {
+                            tracing::warn!(cidr = %repair.cidr, "HzNet 路由被删除，已重新安装");
+                        } else {
+                            tracing::warn!(
+                                cidr = %repair.cidr,
+                                taken_by = %previous,
+                                "HzNet 路由被其他网卡（{previous}）的同前缀路由占用，已夺回"
+                            );
+                        }
+                        *LAST_ROUTE_REPAIR.lock().expect("route repair poisoned") =
+                            Some(RouteRepairNote {
+                                at: unix_now(),
+                                cidr: repair.cidr,
+                                previous,
+                            });
+                    }
+                }
+                Ok(Err(error)) => {
+                    let text = error.to_string();
+                    if last_error.as_deref() != Some(text.as_str()) {
+                        tracing::warn!(error = %text, "HzNet 路由自检失败");
+                        last_error = Some(text);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "HzNet 路由自检任务异常"),
+            }
+        }
+    });
+}
+
 struct Daemon {
     state_dir: PathBuf,
     registration: StdMutex<Session>,
@@ -1422,6 +1496,7 @@ fn spawn_tun_bridge(
         match Tun::setup(&tun_config) {
             Ok(tun) => {
                 let device = tun.device();
+                spawn_route_guard(Arc::new(tun));
                 tokio::spawn({
                     let device = device.clone();
                     let cache = cache.clone();

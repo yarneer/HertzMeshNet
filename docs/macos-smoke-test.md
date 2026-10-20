@@ -144,6 +144,25 @@ Wi-Fi 与有线之间切换（或开关 Wi-Fi）后等待 10 秒内：
 - 日志出现 `physical egress interface changed`（from/to 各一张网卡）。
 - 切换后新建的外层连接正常：`hz ping <linux-node>` 仍通。
 
+## 9. 运行中路由自愈（#24）
+
+在 hzd 运行、与 Linux Node 互通的前提下（`<段>` 为 HzNet IPv4 段，默认
+`100.96.0.0/16`；`<utun>` 为 hzd 的 utun）：
+
+```bash
+sudo route -n delete -net <段>                       # 模拟路由被删除
+sleep 10; route -n get -net <段> | grep interface    # 应回到 <utun>
+sudo route -n add -net <段> 192.168.x.1              # 模拟被物理网关同前缀路由占用
+sleep 10; route -n get -net <段> | grep interface    # 应再次回到 <utun>
+```
+
+预期：
+
+- 两次都在 10 秒内恢复，`hz ping <linux-node>` 随即可通，无需重启 hzd。
+- 日志分别出现 `HzNet 路由被删除，已重新安装` 与 `HzNet 路由被其他网卡（en0）的
+  同前缀路由占用，已夺回`（`taken_by=en0`）。
+- 路由正常期间日志没有路由自检相关的输出。
+
 ## 记录
 
 执行人把每节的实际输出（命令 + 关键行）贴回本文件末尾或 issue #16，

@@ -35,7 +35,6 @@ pub struct TunConfig {
 /// 计算配置 hz0 需要的全部 `ip` 命令参数序列。
 /// 点对点 /32 + /128 地址，路由只挂 HzNet v4 段与 ULA /48。
 pub fn route_args(cfg: &TunConfig) -> Vec<Vec<String>> {
-    let ula48 = ula_prefix48(cfg.ipv6);
     vec![
         ip_args(&["link", "set", DEVICE_NAME, "mtu", &MTU.to_string(), "up"]),
         ip_args(&[
@@ -54,10 +53,76 @@ pub fn route_args(cfg: &TunConfig) -> Vec<Vec<String>> {
             DEVICE_NAME,
             "nodad",
         ]),
-        // replace 幂等：设备/路由残留（如快速重启）不会让 setup 失败。
+    ]
+    .into_iter()
+    .chain(linux_route_repair_args(cfg))
+    .collect()
+}
+
+/// Linux：安装（或夺回）HzNet 两个地址族路由的 `ip` 命令参数。replace 幂等：
+/// 路由缺失时新增，被其他网卡的同前缀路由占用时直接替换回 hz0。
+pub fn linux_route_repair_args(cfg: &TunConfig) -> Vec<Vec<String>> {
+    let ula48 = ula_prefix48(cfg.ipv6);
+    vec![
         ip_args(&["route", "replace", &cfg.v4_cidr, "dev", DEVICE_NAME]),
         ip_args(&["-6", "route", "replace", &ula48, "dev", DEVICE_NAME]),
     ]
+}
+
+/// HzNet 某个地址段路由的现状（#24 运行中自检）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteHealth {
+    /// 路由指向 HzNet 网卡。
+    Ours,
+    /// 路由不存在（被删除）。
+    Missing,
+    /// 同前缀路由被其他网卡占用（如第三方 TUN 类网络工具的排除路由）。
+    TakenBy(String),
+}
+
+/// 由路由当前所属网卡判定健康状态。
+pub fn route_health(owner: Option<&str>, ours: &str) -> RouteHealth {
+    match owner {
+        Some(iface) if iface == ours => RouteHealth::Ours,
+        Some(iface) => RouteHealth::TakenBy(iface.to_string()),
+        None => RouteHealth::Missing,
+    }
+}
+
+/// macOS `route -n get -net <段>` 输出 → 该段路由所属网卡。`destination` 必须
+/// 正是该段的网络地址；路由不存在时 route get 退回默认路由（destination:
+/// default），视为缺失。
+pub fn parse_route_get_owner(text: &str, network: &str) -> Option<String> {
+    let field = |name: &str| {
+        text.lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(name))
+            .map(|value| value.trim().to_string())
+    };
+    if field("destination:")? != network {
+        return None;
+    }
+    field("interface:")
+}
+
+/// 一次运行中路由修复：哪个段、修复前的状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRepair {
+    pub cidr: String,
+    pub previous: RouteHealth,
+}
+
+/// `ip route show exact <段>` 输出 → 该路由所属网卡（`dev` 之后的名字）；
+/// 空输出表示路由不存在。
+pub fn parse_ip_route_owner(text: &str) -> Option<String> {
+    let line = text.lines().find(|line| !line.trim().is_empty())?;
+    let mut fields = line.split_whitespace();
+    while let Some(field) = fields.next() {
+        if field == "dev" {
+            return fields.next().map(str::to_string);
+        }
+    }
+    None
 }
 
 fn ip_args(parts: &[&str]) -> Vec<String> {
@@ -128,7 +193,6 @@ static MAC_IFACE: OnceLock<String> = OnceLock::new();
 /// 点对点地址（本机地址兼任对端），路由只挂 HzNet v4 段与 ULA /48。
 #[cfg(target_os = "macos")]
 pub fn macos_config_args(cfg: &TunConfig, iface: &str) -> Vec<Vec<String>> {
-    let ula48 = ula_prefix48(cfg.ipv6);
     vec![
         cmd_args(
             "ifconfig",
@@ -139,9 +203,20 @@ pub fn macos_config_args(cfg: &TunConfig, iface: &str) -> Vec<Vec<String>> {
             "ifconfig",
             &[iface, "inet6", &format!("{}/128", cfg.ipv6), "add"],
         ),
-        // utun 名字每次创建都变（utun8→utun9→…），旧实例残留的同段路由会让
-        // add 报 File exists；先删后加保证幂等（delete 对不存在的路由报错，
-        // setup 里对 delete 一类命令容忍失败）。
+    ]
+    .into_iter()
+    .chain(macos_route_repair_args(cfg, iface))
+    .collect()
+}
+
+/// macOS：安装（或夺回）HzNet 两个地址族路由的命令参数。utun 名字每次创建
+/// 都变（utun8→utun9→…），旧实例残留或其他网卡占用的同段路由会让 add 报
+/// File exists；先删后加保证幂等（delete 对不存在的路由报错，调用方对
+/// delete 一类命令容忍失败）。
+#[cfg(target_os = "macos")]
+pub fn macos_route_repair_args(cfg: &TunConfig, iface: &str) -> Vec<Vec<String>> {
+    let ula48 = ula_prefix48(cfg.ipv6);
+    vec![
         cmd_args("route", &["-n", "delete", "-net", &cfg.v4_cidr]),
         cmd_args(
             "route",
@@ -153,6 +228,32 @@ pub fn macos_config_args(cfg: &TunConfig, iface: &str) -> Vec<Vec<String>> {
             &["-n", "add", "-inet6", &ula48, "-interface", iface],
         ),
     ]
+}
+
+/// macOS 命令中允许失败的一类：`route -n delete …` 清残留时路由本就不存在
+/// 是常态。其余命令失败都视为致命。
+#[cfg(target_os = "macos")]
+fn failure_tolerated(args: &[String]) -> bool {
+    args.first().is_some_and(|program| program == "route")
+        && args
+            .iter()
+            .skip(1)
+            .find(|arg| !arg.starts_with('-'))
+            .map(String::as_str)
+            == Some("delete")
+}
+
+/// 依次执行 macOS 命令，[`failure_tolerated`] 的那类失败忽略。
+#[cfg(target_os = "macos")]
+fn run_macos_cmds(commands: &[Vec<String>]) -> anyhow::Result<()> {
+    for args in commands {
+        if failure_tolerated(args) {
+            let _ = run_macos_cmd(args);
+        } else {
+            run_macos_cmd(args)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -222,6 +323,11 @@ fn run_macos_cmd(args: &[String]) -> anyhow::Result<()> {
 pub struct Tun {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     device: Arc<tun::AsyncDevice>,
+    /// 运行中路由自检（#24）需要的配置与网卡名（Linux 恒为 hz0）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    cfg: TunConfig,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    iface: String,
 }
 
 impl Tun {
@@ -245,6 +351,8 @@ impl Tun {
         );
         Ok(Self {
             device: Arc::new(device),
+            cfg: cfg.clone(),
+            iface: DEVICE_NAME.to_string(),
         })
     }
 
@@ -268,15 +376,7 @@ impl Tun {
         let iface = device
             .tun_name()
             .with_context(|| "query utun device name failed")?;
-        for args in macos_config_args(cfg, &iface) {
-            // route delete 清残留时路由本就不存在是常态，失败不致命；
-            // 其余命令失败仍视为 setup 失败。
-            if args.get(1).is_some_and(|sub| sub == "delete") {
-                let _ = run_macos_cmd(&args);
-            } else {
-                run_macos_cmd(&args)?;
-            }
-        }
+        run_macos_cmds(&macos_config_args(cfg, &iface))?;
         let _ = MAC_IFACE.set(iface.clone());
         tracing::info!(
             iface = %iface,
@@ -287,6 +387,8 @@ impl Tun {
         );
         Ok(Self {
             device: Arc::new(device),
+            cfg: cfg.clone(),
+            iface,
         })
     }
 
@@ -300,6 +402,65 @@ impl Tun {
     pub fn device(&self) -> Arc<tun::AsyncDevice> {
         self.device.clone()
     }
+
+    /// 运行中路由自检（#24）：查 HzNet 两个段的路由归属，任一不在 HzNet 网卡
+    /// 上就重新安装，返回本次修复了哪些段。路由正常时只读不写。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn check_and_repair_routes(&self) -> anyhow::Result<Vec<RouteRepair>> {
+        let ula48 = ula_prefix48(self.cfg.ipv6);
+        let mut repairs = Vec::new();
+        for (cidr, v6) in [(self.cfg.v4_cidr.clone(), false), (ula48, true)] {
+            let owner = query_route_owner(&cidr, v6)?;
+            let health = route_health(owner.as_deref(), &self.iface);
+            if health != RouteHealth::Ours {
+                repairs.push(RouteRepair {
+                    cidr,
+                    previous: health,
+                });
+            }
+        }
+        if !repairs.is_empty() {
+            #[cfg(target_os = "linux")]
+            for args in linux_route_repair_args(&self.cfg) {
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                run_ip(&refs)?;
+            }
+            #[cfg(target_os = "macos")]
+            run_macos_cmds(&macos_route_repair_args(&self.cfg, &self.iface))?;
+        }
+        Ok(repairs)
+    }
+}
+
+/// 查询某段路由当前所属网卡（None = 路由不存在）。
+#[cfg(target_os = "linux")]
+fn query_route_owner(cidr: &str, v6: bool) -> anyhow::Result<Option<String>> {
+    let mut args = Vec::new();
+    if v6 {
+        args.push("-6");
+    }
+    args.extend(["route", "show", "exact", cidr]);
+    let output = std::process::Command::new("ip")
+        .args(&args)
+        .output()
+        .with_context(|| format!("execute ip {}", args.join(" ")))?;
+    Ok(parse_ip_route_owner(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn query_route_owner(cidr: &str, v6: bool) -> anyhow::Result<Option<String>> {
+    let family = if v6 { "-inet6" } else { "-inet" };
+    let output = std::process::Command::new("route")
+        .args(["-n", "get", family, "-net", cidr])
+        .output()
+        .with_context(|| format!("execute route -n get {family} -net {cidr}"))?;
+    let network = cidr.split('/').next().unwrap_or(cidr);
+    Ok(parse_route_get_owner(
+        &String::from_utf8_lossy(&output.stdout),
+        network,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -321,6 +482,101 @@ fn run_ip(args: &[&str]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #24：运行中路由自检——解析路由归属、判定健康、生成修复命令。
+
+    #[test]
+    fn linux_route_owner_is_the_dev_of_the_exact_route() {
+        assert_eq!(
+            parse_ip_route_owner("100.96.0.0/16 dev hz0 scope link \n").as_deref(),
+            Some("hz0")
+        );
+        assert_eq!(
+            parse_ip_route_owner("10.213.0.0/16 via 192.168.3.1 dev eth0 proto static\n")
+                .as_deref(),
+            Some("eth0")
+        );
+        assert_eq!(parse_ip_route_owner(""), None, "空输出 = 路由已被删除");
+    }
+
+    #[test]
+    fn macos_route_get_owner_requires_the_exact_network_not_the_default_route() {
+        // 真实 `route -n get -net` 输出（本机实测）：HzNet 段被 en0 的排除路由占用、
+        // ULA 段落在别的 utun，以及路由不存在时退回默认路由。
+        let taken = "   route to: 10.213.0.0\ndestination: 10.213.0.0\n       mask: 255.255.0.0\n  interface: en0\n";
+        assert_eq!(
+            parse_route_get_owner(taken, "10.213.0.0").as_deref(),
+            Some("en0")
+        );
+        let v6 =
+            "   route to: fd7a:3548:1873::\ndestination: fd7a:3548:1873::\n  interface: utun0\n";
+        assert_eq!(
+            parse_route_get_owner(v6, "fd7a:3548:1873::").as_deref(),
+            Some("utun0")
+        );
+        let missing = "   route to: 10.213.0.0\ndestination: default\n       mask: default\n  interface: utun4\n";
+        assert_eq!(
+            parse_route_get_owner(missing, "10.213.0.0"),
+            None,
+            "退回默认路由 = HzNet 路由缺失"
+        );
+    }
+
+    #[test]
+    fn route_health_distinguishes_ours_missing_and_taken() {
+        assert_eq!(route_health(Some("hz0"), "hz0"), RouteHealth::Ours);
+        assert_eq!(route_health(None, "hz0"), RouteHealth::Missing);
+        assert_eq!(
+            route_health(Some("en0"), "utun9"),
+            RouteHealth::TakenBy("en0".to_string())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_route_delete_commands_may_fail_during_setup_and_repair() {
+        let args = macos_route_repair_args(&config(), "utun9");
+        let tolerated: Vec<bool> = args.iter().map(|a| failure_tolerated(a)).collect();
+        assert_eq!(tolerated, vec![true, false, true, false], "{args:?}");
+        for args in macos_config_args(&config(), "utun9") {
+            if args[0] == "ifconfig" {
+                assert!(!failure_tolerated(&args), "ifconfig 失败必须致命：{args:?}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_route_repair_deletes_then_adds_both_families_on_the_utun() {
+        let joined: Vec<String> = macos_route_repair_args(&config(), "utun9")
+            .iter()
+            .map(|a| a.join(" "))
+            .collect();
+        assert_eq!(
+            joined,
+            vec![
+                "route -n delete -net 100.96.0.0/16".to_string(),
+                "route -n add -net 100.96.0.0/16 -interface utun9".to_string(),
+                "route -n delete -inet6 fd12:3456:789a::/48".to_string(),
+                "route -n add -inet6 fd12:3456:789a::/48 -interface utun9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_route_repair_reinstalls_both_families_idempotently() {
+        let joined: Vec<String> = linux_route_repair_args(&config())
+            .iter()
+            .map(|a| a.join(" "))
+            .collect();
+        assert_eq!(
+            joined,
+            vec![
+                "route replace 100.96.0.0/16 dev hz0".to_string(),
+                "-6 route replace fd12:3456:789a::/48 dev hz0".to_string(),
+            ]
+        );
+    }
 
     fn config() -> TunConfig {
         TunConfig {
