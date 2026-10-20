@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+LimitNOFILE=65536
 EnvironmentFile=/etc/default/hz-coord
 ExecStart=/usr/local/bin/hz-coord serve $HZ_COORD_ARGS
 Restart=on-failure

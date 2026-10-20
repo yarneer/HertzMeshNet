@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+LimitNOFILE=65536
 EnvironmentFile=/etc/default/hzd
 ExecStart=/usr/local/bin/hzd
 Restart=always

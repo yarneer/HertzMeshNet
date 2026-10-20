@@ -84,20 +84,94 @@ impl ServeConfig {
 struct LiveConnections(StdMutex<Vec<std::net::TcpStream>>);
 
 impl LiveConnections {
-    fn track(&self, stream: &tokio::net::TcpStream) {
+    /// 登记连接，返回 dup 副本的描述符编号（失败为 None），
+    /// 供 [`TrackedStream`] 在连接结束时反注册。
+    fn track(&self, stream: &tokio::net::TcpStream) -> Option<i32> {
         use std::os::fd::{AsRawFd, FromRawFd};
         // dup 出独立描述符；tonic 继续持有原流，关闭动作只作用在副本上。
         let duplicate = unsafe { libc::dup(stream.as_raw_fd()) };
         if duplicate >= 0 {
             let raw = unsafe { std::net::TcpStream::from_raw_fd(duplicate) };
             self.0.lock().expect("live connections poisoned").push(raw);
+            Some(duplicate)
+        } else {
+            None
         }
+    }
+
+    /// 反注册并释放副本：retain 移出的元素随即 drop（关闭描述符）。
+    fn untrack(&self, fd: i32) {
+        use std::os::fd::AsRawFd;
+        self.0
+            .lock()
+            .expect("live connections poisoned")
+            .retain(|tracked| tracked.as_raw_fd() != fd);
     }
 
     fn close_all(&self) {
         for stream in self.0.lock().expect("live connections poisoned").drain(..) {
             let _ = stream.shutdown(Shutdown::Both);
         }
+    }
+}
+
+/// 交给 tonic 的连接包装：连接结束（tonic drop 流）时反注册登记表里的
+/// dup 副本。此前副本只进不出，每个连接漏一个描述符直至进程退出——
+/// 生产实测 1024 软上限约 3 小时耗尽（SQLite 打不开 WAL、HTTP 面卡死）。
+struct TrackedStream {
+    stream: tokio::net::TcpStream,
+    connections: Arc<LiveConnections>,
+    dup_fd: Option<i32>,
+}
+
+impl Drop for TrackedStream {
+    fn drop(&mut self) {
+        if let Some(fd) = self.dup_fd.take() {
+            self.connections.untrack(fd);
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for TrackedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for TrackedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+/// 保留 TcpStream 原生的连接信息（remote_addr 进 tracing）。
+impl tonic::transport::server::Connected for TrackedStream {
+    type ConnectInfo = <tokio::net::TcpStream as tonic::transport::server::Connected>::ConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        tonic::transport::server::Connected::connect_info(&self.stream)
     }
 }
 
@@ -234,7 +308,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     })
 }
 
-/// 每条已接受的连接登记进 LiveConnections 后原样交给 tonic。
+/// 每条已接受的连接登记进 LiveConnections（以 [`TrackedStream`] 包装，
+/// 连接结束自动反注册）后交给 tonic。
 struct TcpListenerStreamMapped {
     listener: tokio::net::TcpListener,
     connections: Arc<LiveConnections>,
@@ -250,7 +325,7 @@ impl TcpListenerStreamMapped {
 }
 
 impl tokio_stream::Stream for TcpListenerStreamMapped {
-    type Item = std::io::Result<tokio::net::TcpStream>;
+    type Item = std::io::Result<TrackedStream>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -260,8 +335,12 @@ impl tokio_stream::Stream for TcpListenerStreamMapped {
         let this = self.get_mut();
         match this.listener.poll_accept(cx) {
             std::task::Poll::Ready(Ok((stream, _))) => {
-                this.connections.track(&stream);
-                std::task::Poll::Ready(Some(Ok(stream)))
+                let dup_fd = this.connections.track(&stream);
+                std::task::Poll::Ready(Some(Ok(TrackedStream {
+                    stream,
+                    connections: this.connections.clone(),
+                    dup_fd,
+                })))
             }
             std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Some(Err(error))),
             std::task::Poll::Pending => std::task::Poll::Pending,

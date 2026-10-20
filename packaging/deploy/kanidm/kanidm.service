@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+LimitNOFILE=65536
 ExecStart=/usr/local/bin/kanidmd server -c /etc/kanidm/server.toml
 Restart=on-failure
 RestartSec=2

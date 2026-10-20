@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+LimitNOFILE=65536
 EnvironmentFile=/etc/default/hz-relay
 ExecStart=/usr/local/bin/hz-relay serve $HZ_RELAY_ARGS
 Restart=on-failure
