@@ -438,7 +438,8 @@ async fn status(json_output: bool) -> std::process::ExitCode {
             if let Ok(status) = serde_json::from_value::<NodeStatus>(result.clone())
                 && let Some(info) = status.info()
             {
-                result["conflicts"] = detect_conflicts(info, &result).to_json();
+                result["conflicts"] =
+                    serde_json::to_value(detect_conflicts(info, &result)).unwrap_or_default();
             }
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             std::process::ExitCode::SUCCESS
@@ -649,87 +650,112 @@ async fn ping(node: String) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Network Map 里的对端（hzd 状态结果的 peers 字段）；表格式展示
-/// Node Name / Node Address / 路径 / Endpoint / 最近握手（FR-12）。
+/// 发往 HzNet 的流量没有走 HzNet 网卡（#25）。
+#[derive(Debug, serde::Serialize)]
+struct RouteCapture {
+    /// 期望的本机源地址（本机 IPv4 Node Address）。
+    expected: IpAddr,
+    /// 系统实际选定的源地址。
+    source: IpAddr,
+    /// 持有实际源地址的网卡。
+    interface: Option<String>,
+    /// 需要在对方工具中排除的 HzNet 地址段（IPv4 段与 ULA /48）。
+    exclude: Vec<String>,
+}
+
+/// HzNet 域名后缀的解析被接管（#25）。
+#[derive(Debug, serde::Serialize)]
+struct DnsHijack {
+    /// 探测用的不存在的名字。
+    probe: String,
+    /// 解析到的 198.18.0.0/15 假地址。
+    answers: Vec<IpAddr>,
+}
+
 /// `hz status` 的冲突自检结果（#25）。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 struct Conflicts {
-    /// 发往 HzNet 的流量被其他隧道接管：(期望的本机 Node Address, 实际源地址, 所属网卡)。
-    route_capture: Option<(IpAddr, IpAddr, Option<String>)>,
-    /// 名字解析被接管：(探测名, 解析到的假地址)。
-    dns_hijack: Option<(String, Vec<IpAddr>)>,
+    route_capture: Option<RouteCapture>,
+    dns_hijack: Option<DnsHijack>,
 }
 
-impl Conflicts {
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "route_capture": self.route_capture.as_ref().map(|(expected, source, iface)| {
-                serde_json::json!({ "expected": expected, "source": source, "interface": iface })
-            }),
-            "dns_hijack": self.dns_hijack.as_ref().map(|(probe, answers)| {
-                serde_json::json!({ "probe": probe, "answers": answers })
-            }),
-        })
-    }
-}
-
-/// 冲突自检（#25）：(1) 对第一个对端的 IPv4 Node Address 做不发包的 UDP
-/// connect，系统选定的源地址若不是本机 Node Address，说明发往 HzNet 的流量
-/// 被其他隧道接管；(2) 系统解析一个不存在的 `*.<域名后缀>` 名字，若得到
-/// 198.18.0.0/15 假地址，说明名字解析被接管。
+/// 冲突自检（#25）：(1) 对 HzNet IPv4 段内的一个地址做不发包的 UDP connect，
+/// 系统选定的源地址若不是本机 Node Address，说明发往 HzNet 的流量没有走
+/// HzNet 网卡（不依赖是否有对端）；(2) 系统解析一个不存在的
+/// `*.<域名后缀>` 名字，若得到 198.18.0.0/15 假地址，说明名字解析被接管。
 fn detect_conflicts(info: &RegisteredInfo, result: &serde_json::Value) -> Conflicts {
     let mut conflicts = Conflicts::default();
-    let peer_v4 = result
-        .get("peers")
-        .and_then(|v| v.as_array())
-        .and_then(|peers| {
-            peers
-                .iter()
-                .find_map(|peer| peer.get("ipv4")?.as_str()?.parse::<IpAddr>().ok())
-        });
-    if let (Ok(expected), Some(peer)) = (info.ipv4.parse::<IpAddr>(), peer_v4)
+    let cidr = info
+        .network_cidr
+        .clone()
+        .unwrap_or_else(|| hz_core::tun::DEFAULT_V4_CIDR.to_string());
+    if let Ok(expected) = info.ipv4.parse::<IpAddr>()
+        && let Some(target) = probe_target(&cidr, expected)
         && let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
-        && socket.connect((peer, 9)).is_ok()
+        && socket.connect((target, 9)).is_ok()
         && let Ok(local) = socket.local_addr()
         && local.ip() != expected
     {
-        let iface = hz_core::netif::interface_with_addr(local.ip());
-        conflicts.route_capture = Some((expected, local.ip(), iface));
+        let mut exclude = vec![cidr.clone()];
+        if let Ok(ipv6) = info.ipv6.parse() {
+            exclude.push(hz_core::tun::ula_prefix48(ipv6));
+        }
+        conflicts.route_capture = Some(RouteCapture {
+            expected,
+            source: local.ip(),
+            interface: hz_core::netif::interface_with_addr(local.ip()),
+            exclude,
+        });
     }
     if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
         use std::net::ToSocketAddrs;
         let probe = format!("hz-selfcheck-{}.{suffix}", std::process::id());
         if let Ok(addrs) = (probe.as_str(), 0).to_socket_addrs() {
-            let fake: Vec<IpAddr> = addrs
+            let answers: Vec<IpAddr> = addrs
                 .map(|addr| addr.ip())
                 .filter(hz_core::outer_dns::is_fake_ip)
                 .collect();
-            if !fake.is_empty() {
-                conflicts.dns_hijack = Some((probe, fake));
+            if !answers.is_empty() {
+                conflicts.dns_hijack = Some(DnsHijack { probe, answers });
             }
         }
     }
     conflicts
 }
 
+/// HzNet IPv4 段内用于路由探测的地址：网络地址 +1，与本机地址相同时取 +2。
+fn probe_target(cidr: &str, own: IpAddr) -> Option<IpAddr> {
+    let network: std::net::Ipv4Addr = cidr.split('/').next()?.parse().ok()?;
+    let first = std::net::Ipv4Addr::from(u32::from(network).wrapping_add(1));
+    let pick = if IpAddr::V4(first) == own {
+        std::net::Ipv4Addr::from(u32::from(network).wrapping_add(2))
+    } else {
+        first
+    };
+    Some(IpAddr::V4(pick))
+}
+
 fn print_conflicts(conflicts: &Conflicts) {
-    if let Some((expected, source, iface)) = &conflicts.route_capture {
-        let iface = iface.as_deref().unwrap_or("未知网卡");
+    if let Some(capture) = &conflicts.route_capture {
+        let iface = capture.interface.as_deref().unwrap_or("未知网卡");
         println!(
-            "⚠ 发往 HzNet 的流量被其他隧道接管：实际源地址 {source}（{iface}），应为本机 Node Address {expected}。"
+            "⚠ 发往 HzNet 的流量没有走 HzNet 网卡：实际源地址 {}（{iface}），应为本机 Node Address {}；可能被第三方 TUN 类网络工具接管。",
+            capture.source, capture.expected
         );
         println!(
-            "  请在占用该网卡的网络工具中排除 HzNet 地址段（勿排除与 HzNet 完全相同的前缀，见安装手册\"共存\"一节）。"
+            "  请在该工具中排除 HzNet 地址段 {}（排除范围应更宽，勿与之完全相同，见安装手册第 10 节）；若刚发生路由修复，稍后重试 hz status。",
+            capture.exclude.join("、")
         );
     }
-    if let Some((probe, answers)) = &conflicts.dns_hijack {
-        let answers: Vec<String> = answers.iter().map(ToString::to_string).collect();
+    if let Some(hijack) = &conflicts.dns_hijack {
+        let answers: Vec<String> = hijack.answers.iter().map(ToString::to_string).collect();
         println!(
-            "⚠ 名字解析被接管：{probe} 被解析为 {}（198.18.0.0/15 假地址），网内名字将无法使用。",
+            "⚠ 名字解析被第三方 TUN 类网络工具接管：{} 被解析为 {}（198.18.0.0/15 假地址），网内名字将无法使用。",
+            hijack.probe,
             answers.join(", ")
         );
         println!(
-            "  请在接管 DNS 的网络工具中把 HzNet 域名后缀交给 HzNet 本地 DNS 解析，或直接使用 Node Address。"
+            "  请在该工具中把 HzNet 域名后缀交给 HzNet 本地 DNS 解析，或直接使用 Node Address。"
         );
     }
 }
@@ -755,11 +781,13 @@ fn print_diagnostics(result: &serde_json::Value) {
             .to_string()
     };
     if let Some(repair) = diagnostics.get("route_repair").filter(|v| !v.is_null()) {
-        let previous = text(repair, "previous");
-        let cause = if previous == "missing" {
-            "被删除".to_string()
-        } else {
-            format!("被 {previous} 占用")
+        let cause = match repair
+            .get("previous")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<hz_core::tun::RouteHealth>(v).ok())
+        {
+            Some(hz_core::tun::RouteHealth::TakenBy(iface)) => format!("被 {iface} 占用"),
+            _ => "被删除".to_string(),
         };
         println!(
             "最近一次路由修复：{} HzNet 路由 {}{cause}，已自动恢复",
@@ -776,6 +804,8 @@ fn print_diagnostics(result: &serde_json::Value) {
     }
 }
 
+/// Network Map 里的对端（hzd 状态结果的 peers 字段）；表格式展示
+/// Node Name / Node Address / 路径 / Endpoint / 最近握手（FR-12）。
 fn print_peers(result: &serde_json::Value) {
     let Some(peers) = result.get("peers").and_then(|v| v.as_array()) else {
         return;

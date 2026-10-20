@@ -209,7 +209,29 @@ fn bootstrap_fallback_is_recorded_for_status_reporting() {
     let resolver =
         OuterResolver::with_system_lookup(vec![bootstrap.addr], system_returning("198.18.2.39"));
     resolver.resolve("relay.example.com", 443).unwrap();
-    let (at, host) = resolver.last_fallback().expect("回退应被记录");
-    assert_eq!(host, "relay.example.com");
-    assert!(at > 1_700_000_000, "记录时间应为 Unix 秒：{at}");
+    let fallback = resolver.last_fallback().expect("回退应被记录");
+    assert_eq!(fallback.host, "relay.example.com");
+    assert!(
+        fallback.at > 1_700_000_000,
+        "记录时间应为 Unix 秒：{}",
+        fallback.at
+    );
+}
+
+// 审查 (b)1：#23 只针对"返回假地址"。系统 DNS 单纯失败（断网、NXDOMAIN）时
+// 不改问引导 DNS、也不记为回退，只沿用缓存。
+#[test]
+fn system_dns_failure_is_not_treated_as_hijack() {
+    let bootstrap = spawn_bootstrap_dns(Ipv4Addr::new(203, 0, 113, 7));
+    let resolver = OuterResolver::with_system_lookup(vec![bootstrap.addr], |_, _| {
+        Err(io::Error::other("temporary failure in name resolution"))
+    });
+
+    assert!(resolver.resolve("relay.example.com", 443).is_err());
+    assert_eq!(
+        bootstrap.queries.load(Ordering::SeqCst),
+        0,
+        "不应询问引导 DNS"
+    );
+    assert!(resolver.last_fallback().is_none(), "不应记为引导 DNS 回退");
 }

@@ -210,6 +210,37 @@ hz status
 2. **把 HzNet 域名后缀交给 HzNet 的本地 DNS 解析**，不要让它分配假地址。本地 DNS 地址是 HzNet 段内的保留地址（默认 `100.96.0.53`；改过地址段时为该段网络地址末位换成 53，macOS 上可在 `/etc/resolver/hznet.internal` 中看到）。很多工具支持按域名指定上游 DNS，或把某些域名加入假地址的例外列表。
 3. 只加一条"直连"规则通常**不够**：直连意味着由该工具从物理网卡把流量重新发出，而物理网卡到不了 HzNet。
 
+#### 配置示例
+
+以下以 HzNet 段 `10.213.0.0/16`、ULA 段 `fd7a:3548:1873::/48`、本地 DNS `10.213.0.53`、域名后缀 `hznet.internal` 为例，按你的实际值替换；`hz status` 的冲突提示会给出需要排除的地址段。
+
+**INI 风格配置**（`[General]` 段里的排除路由与跳过代理列表、`[Host]` 段里的按域名指定 DNS；在原有值后追加，不要删除原有内容）：
+
+```ini
+[General]
+tun-excluded-routes = <原有内容>, 10.0.0.0/8, fd00::/8
+skip-proxy = <原有内容>, 10.0.0.0/8, *.hznet.internal
+
+[Host]
+*.hznet.internal = server:10.213.0.53
+```
+
+**YAML 风格配置**（TUN 的排除地址、假地址例外列表与按域名指定 DNS）：
+
+```yaml
+tun:
+  route-exclude-address:
+    - 10.0.0.0/8
+    - fd00::/8
+dns:
+  fake-ip-filter:
+    - "+.hznet.internal"
+  nameserver-policy:
+    "+.hznet.internal": 10.213.0.53
+```
+
+不同工具、不同版本的字段名可能略有差异，以其文档为准；要点是三件事：排除比 HzNet 段更宽的范围、HzNet 域名后缀不分配假地址、并交给 HzNet 本地 DNS 解析。
+
 配置改完后需要断开再重新连接该工具，排除规则才会生效；之后用 `hz status` 确认没有冲突提示。
 
 ### 10.5 已知限制（macOS）

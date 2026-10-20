@@ -123,52 +123,50 @@ struct RouteRepairNote {
     /// Unix 秒。
     at: u64,
     cidr: String,
-    /// 修复前：`missing`（被删除）或占用它的网卡名。
-    previous: String,
+    /// 修复前的状态：被删除或被某网卡占用。
+    previous: hz_core::tun::RouteHealth,
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
-}
-
-/// 周期检查 HzNet 路由，被删除或被其他网卡的同前缀路由占用时重新安装（#24）。
+/// 周期（及物理出口变化时）检查 HzNet 路由，被删除或被其他网卡的同前缀
+/// 路由占用时重新安装（#24）。
 /// 路由正常时只读不写、不打日志；自检本身出错只在错误变化时告警一次。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn spawn_route_guard(tun: Arc<Tun>) {
+fn spawn_route_guard(tun: Arc<Tun>, mut egress: tokio::sync::watch::Receiver<u64>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(ROUTE_CHECK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // 跳过立即的首跳：setup 刚装好路由
+        let mut egress_open = true;
         let mut last_error: Option<String> = None;
         loop {
-            tick.tick().await;
+            // 周期检查；物理出口变化（网络变化恢复递增出口代数）时立即检查。
+            tokio::select! {
+                _ = tick.tick() => {}
+                changed = egress.changed(), if egress_open => {
+                    egress_open = changed.is_ok();
+                }
+            }
             let tun = tun.clone();
             let outcome = tokio::task::spawn_blocking(move || tun.check_and_repair_routes()).await;
             match outcome {
                 Ok(Ok(repairs)) => {
                     last_error = None;
                     for repair in repairs {
-                        let previous = match &repair.previous {
-                            hz_core::tun::RouteHealth::TakenBy(iface) => iface.clone(),
-                            _ => "missing".to_string(),
-                        };
-                        if previous == "missing" {
-                            tracing::warn!(cidr = %repair.cidr, "HzNet 路由被删除，已重新安装");
-                        } else {
-                            tracing::warn!(
+                        match &repair.previous {
+                            hz_core::tun::RouteHealth::TakenBy(iface) => tracing::warn!(
                                 cidr = %repair.cidr,
-                                taken_by = %previous,
-                                "HzNet 路由被其他网卡（{previous}）的同前缀路由占用，已夺回"
-                            );
+                                taken_by = %iface,
+                                "HzNet 路由被其他网卡（{iface}）的同前缀路由占用，已夺回"
+                            ),
+                            _ => {
+                                tracing::warn!(cidr = %repair.cidr, "HzNet 路由被删除，已重新安装")
+                            }
                         }
                         *LAST_ROUTE_REPAIR.lock().expect("route repair poisoned") =
                             Some(RouteRepairNote {
-                                at: unix_now(),
+                                at: hz_core::outer_dns::unix_now(),
                                 cidr: repair.cidr,
-                                previous,
+                                previous: repair.previous,
                             });
                     }
                 }
@@ -356,9 +354,7 @@ async fn handle_request(
                 .clone();
             value["diagnostics"] = serde_json::json!({
                 "route_repair": route_repair,
-                "dns_fallback": hz_core::outer_dns::global()
-                    .last_fallback()
-                    .map(|(at, host)| serde_json::json!({ "at": at, "host": host })),
+                "dns_fallback": hz_core::outer_dns::global().last_fallback(),
             });
             value["policy"] = serde_json::json!({
                 "version": daemon.policy_gate.version(),
@@ -868,6 +864,7 @@ async fn start_dataplane(
         &daemon.map_cache,
         &daemon.policy_gate,
         daemon.probes.clone(),
+        daemon.egress_epoch.receiver(),
     );
     spawn_map_task(
         daemon.clone(),
@@ -1059,11 +1056,10 @@ fn spawn_relay_supervisor(
     });
 }
 
-/// STUN 服务器地址：显式 HZD_STUN_ADDR 优先，否则从 HZD_RELAY_ADDR 的主机
-/// 推导（FR-8：STUN 与 Relay 同主机，UDP 3478）。地址可以是主机名或 IP；
-/// SocketAddr::parse 只认 IP 字面量，主机名必须走 DNS（启动时一次阻塞解析，
-/// 与 coord_probe_target 同一先例），解析失败显式告警而不是静默禁用 STUN。
-fn stun_server_addr() -> Option<SocketAddr> {
+/// STUN 服务器的 `host:port`：显式 HZD_STUN_ADDR 优先，否则从 HZD_RELAY_ADDR
+/// 的主机推导（FR-8：STUN 与 Relay 同主机，UDP 3478）。地址可以是主机名或 IP，
+/// 每轮查询前经 [`resolve_stun`] 解析。
+fn stun_server_target() -> Option<String> {
     let raw = std::env::var("HZD_STUN_ADDR").ok().or_else(|| {
         let relay = std::env::var("HZD_RELAY_ADDR").ok()?;
         let host_port = relay
@@ -1076,11 +1072,21 @@ fn stun_server_addr() -> Option<SocketAddr> {
             .unwrap_or(host_port);
         Some(format!("{host}:3478"))
     })?;
-    // 经外层解析器：系统 DNS 被接管返回假地址时改问引导 DNS（#23）。
-    match hz_core::outer_dns::resolve_host_port(&raw) {
-        Ok(addrs) => addrs.into_iter().next(),
+    Some(raw)
+}
+
+/// 每轮解析 STUN 地址：经外层解析器（系统 DNS 返回假地址时改问引导 DNS，
+/// 失败沿用缓存，#23），在阻塞线程池里做，不占用异步 worker。
+async fn resolve_stun(target: &str) -> Option<SocketAddr> {
+    let owned = target.to_string();
+    match tokio::task::spawn_blocking(move || hz_core::outer_dns::resolve_host_port(&owned)).await {
+        Ok(Ok(addrs)) => addrs.into_iter().next(),
+        Ok(Err(error)) => {
+            tracing::warn!(%target, %error, "STUN 服务器地址解析失败");
+            None
+        }
         Err(error) => {
-            tracing::warn!(%raw, %error, "STUN 服务器地址解析失败");
+            tracing::warn!(%target, %error, "STUN 地址解析任务异常");
             None
         }
     }
@@ -1096,8 +1102,8 @@ fn spawn_endpoint_collector(
     engine: Arc<SocketEngine>,
     coord_addr: String,
 ) {
-    let stun_server = stun_server_addr();
-    if stun_server.is_none() {
+    let stun_target = stun_server_target();
+    if stun_target.is_none() {
         tracing::debug!("no stun server configured (HZD_STUN_ADDR / HZD_RELAY_ADDR)");
     }
     tokio::spawn(async move {
@@ -1110,7 +1116,7 @@ fn spawn_endpoint_collector(
                 &punch,
                 &engine,
                 &coord_addr,
-                stun_server,
+                stun_target.as_deref(),
             )
             .await;
         }
@@ -1126,8 +1132,12 @@ async fn collect_and_report(
     punch: &Arc<StdMutex<PunchCounters>>,
     engine: &Arc<SocketEngine>,
     coord_addr: &str,
-    stun_server: Option<SocketAddr>,
+    stun_target: Option<&str>,
 ) {
+    let stun_server = match stun_target {
+        Some(target) => resolve_stun(target).await,
+        None => None,
+    };
     let stun_mapped = match stun_server {
         Some(server) => match engine.stun_query(server).await {
             Ok(mapped) => {
@@ -1165,7 +1175,7 @@ fn spawn_net_recovery(daemon: &Arc<Daemon>, engine: Arc<SocketEngine>, coord_add
     let coord_addr = coord_addr.to_string();
     tokio::spawn(async move {
         let mut events = netwatch::spawn();
-        let stun_server = stun_server_addr();
+        let stun_target = stun_server_target();
         let mut handled = netwatch::egress_snapshot();
         while let Some(event) = events.recv().await {
             let current = netwatch::egress_snapshot();
@@ -1191,10 +1201,10 @@ fn spawn_net_recovery(daemon: &Arc<Daemon>, engine: Arc<SocketEngine>, coord_add
                     &punch,
                     &engine,
                     &coord_addr,
-                    stun_server,
+                    stun_target.as_deref(),
                 )
                 .await;
-                let stun_reached = stun_server.is_none()
+                let stun_reached = stun_target.is_none()
                     || own_slot
                         .lock()
                         .expect("own endpoints poisoned")
@@ -1472,6 +1482,7 @@ fn spawn_tun_bridge(
     cache: &Arc<NetworkMapCache>,
     gate: &Arc<InboundGate>,
     probes: Arc<ping::Probes>,
+    egress: tokio::sync::watch::Receiver<u64>,
 ) {
     let (to_tunnel_tx, to_tunnel_rx) = mpsc::channel::<Vec<u8>>(256);
     tokio::spawn({
@@ -1507,7 +1518,7 @@ fn spawn_tun_bridge(
         match Tun::setup(&tun_config) {
             Ok(tun) => {
                 let device = tun.device();
-                spawn_route_guard(Arc::new(tun));
+                spawn_route_guard(Arc::new(tun), egress.clone());
                 tokio::spawn({
                     let device = device.clone();
                     let cache = cache.clone();
@@ -1611,7 +1622,7 @@ fn spawn_tun_bridge(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (cache, gate);
+        let _ = (cache, gate, egress);
         spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
     }
 }

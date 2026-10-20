@@ -124,10 +124,10 @@ async fn status_exits_quietly_when_stdout_reader_is_gone() {
     );
 }
 
-// #25：hz status 的冲突自检。假 hzd 给出本机 Node Address 与对端地址，
-// hz 对对端地址做不发包的 UDP connect 读出系统选定的源地址：对端用
-// 127.0.0.1 时源地址必为 127.0.0.1，本机 Node Address 设成别的地址即可
-// 确定性地构造"流量被其他隧道接管"。
+// #25：hz status 的冲突自检。假 hzd 给出本机 Node Address 与 HzNet 段，hz 对
+// 段内地址做不发包的 UDP connect 读出系统选定的源地址：段为 127.0.0.0/8 时
+// 源地址必为 127.0.0.1，本机 Node Address 设成别的地址即可确定性地构造
+// "流量没有走 HzNet 网卡"。
 async fn status_output(status: serde_json::Value, args: &[&str]) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("hzd.sock");
@@ -158,7 +158,9 @@ async fn status_output(status: serde_json::Value, args: &[&str]) -> (bool, Strin
     )
 }
 
-fn registered(own_v4: &str, peer_v4: &str) -> serde_json::Value {
+/// 已注册状态夹具。HzNet 段设为 127.0.0.0/8：探测地址落在回环上，系统选定
+/// 的源地址必为 127.0.0.1，与本机 Node Address 比较的结果因此确定。
+fn registered(own_v4: &str) -> serde_json::Value {
     serde_json::json!({
         "registered": true,
         "node_id": "n-self",
@@ -166,17 +168,21 @@ fn registered(own_v4: &str, peer_v4: &str) -> serde_json::Value {
         "ipv4": own_v4,
         "ipv6": "fd7a:3548:1873::2",
         "tags": [],
+        "network_cidr": "127.0.0.0/8",
         "dns_suffix": "invalid",
-        "peers": [{ "name": "srv", "ipv4": peer_v4, "ipv6": "fd7a:3548:1873::1", "path": "direct" }],
+        "peers": [{ "name": "srv", "ipv4": "127.0.0.9", "ipv6": "fd7a:3548:1873::1", "path": "direct" }],
     })
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_warns_when_hznet_traffic_leaves_from_another_interface() {
-    let (ok, out) = status_output(registered("10.213.0.2", "127.0.0.1"), &["status"]).await;
+    let (ok, out) = status_output(registered("10.213.0.2"), &["status"]).await;
 
     assert!(ok, "{out}");
-    assert!(out.contains("被其他隧道接管"), "应提示流量被接管：{out}");
+    assert!(
+        out.contains("第三方 TUN 类网络工具接管"),
+        "应提示流量被接管：{out}"
+    );
     assert!(out.contains("127.0.0.1"), "应给出实际源地址：{out}");
     assert!(
         out.contains("10.213.0.2"),
@@ -186,16 +192,18 @@ async fn status_warns_when_hznet_traffic_leaves_from_another_interface() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_stays_quiet_when_traffic_uses_the_node_address() {
-    let (ok, out) = status_output(registered("127.0.0.1", "127.0.0.1"), &["status"]).await;
+    let (ok, out) = status_output(registered("127.0.0.1"), &["status"]).await;
 
     assert!(ok, "{out}");
-    assert!(!out.contains("被其他隧道接管"), "无冲突时不应提示：{out}");
+    assert!(
+        !out.contains("没有走 HzNet 网卡"),
+        "无冲突时不应提示：{out}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_json_carries_structured_conflicts() {
-    let (ok, out) =
-        status_output(registered("10.213.0.2", "127.0.0.1"), &["status", "--json"]).await;
+    let (ok, out) = status_output(registered("10.213.0.2"), &["status", "--json"]).await;
 
     assert!(ok, "{out}");
     let value: serde_json::Value = serde_json::from_str(&out).expect("--json 输出应为 JSON");
@@ -211,9 +219,13 @@ async fn status_json_carries_structured_conflicts() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_reports_recent_route_repair_and_dns_fallback() {
-    let mut status = registered("127.0.0.1", "127.0.0.1");
+    let mut status = registered("127.0.0.1");
     status["diagnostics"] = serde_json::json!({
-        "route_repair": { "at": 1760900000, "cidr": "10.213.0.0/16", "previous": "en0" },
+        "route_repair": {
+            "at": 1760900000,
+            "cidr": "10.213.0.0/16",
+            "previous": { "state": "taken_by", "interface": "en0" },
+        },
         "dns_fallback": { "at": 1760900100, "host": "relay.example.com" },
     });
 
@@ -233,11 +245,38 @@ async fn status_reports_recent_route_repair_and_dns_fallback() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_omits_diagnostics_section_when_nothing_happened() {
-    let (ok, out) = status_output(registered("127.0.0.1", "127.0.0.1"), &["status"]).await;
+    let (ok, out) = status_output(registered("127.0.0.1"), &["status"]).await;
 
     assert!(ok, "{out}");
     assert!(
         !out.contains("最近一次"),
         "未发生过修复/回退时不显示：{out}"
+    );
+}
+
+// 审查 (c)2/(a)2：探测不依赖对端（按 HzNet 地址段取探测地址），提示与 JSON
+// 给出需要在对方工具中排除的地址段（IPv4 段 + ULA /48）。
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_is_detected_without_peers_and_names_ranges_to_exclude() {
+    let mut status = registered("10.213.0.2");
+    status["peers"] = serde_json::json!([]);
+
+    let (ok, out) = status_output(status.clone(), &["status"]).await;
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("第三方 TUN 类网络工具接管"),
+        "无对端时也应检测：{out}"
+    );
+    assert!(
+        out.contains("127.0.0.0/8") && out.contains("fd7a:3548:1873::/48"),
+        "应给出需排除的地址段：{out}"
+    );
+
+    let (_, json) = status_output(status, &["status", "--json"]).await;
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["conflicts"]["route_capture"]["exclude"],
+        serde_json::json!(["127.0.0.0/8", "fd7a:3548:1873::/48"]),
+        "{json}"
     );
 }

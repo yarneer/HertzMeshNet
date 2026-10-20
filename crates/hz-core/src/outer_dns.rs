@@ -38,15 +38,24 @@ pub fn is_fake_ip(ip: &IpAddr) -> bool {
     a == 198 && (b == 18 || b == 19)
 }
 
+/// 一次回退到引导 DNS 的记录，供 `hz status` 汇报（#25）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DnsFallback {
+    /// Unix 秒。
+    pub at: u64,
+    pub host: String,
+}
+
 pub struct OuterResolver {
     bootstrap: BootstrapSource,
     system: SystemLookup,
     /// 每个域名最近一次有效解析结果：所有来源都失败时兜底。
     last_good: Mutex<HashMap<String, Vec<IpAddr>>>,
     /// 已就"改用引导 DNS"告警过的域名：每个域名只记一次，避免刷屏。
-    warned: Mutex<HashSet<String>>,
-    /// 最近一次回退到引导 DNS：(Unix 秒, 域名)，供 `hz status` 汇报（#25）。
-    last_fallback: Mutex<Option<(u64, String)>>,
+    warned_fallback: Mutex<HashSet<String>>,
+    /// 正在沿用缓存的域名：连续失败期间只告警一次，解析恢复后清除。
+    warned_stale: Mutex<HashSet<String>>,
+    last_fallback: Mutex<Option<DnsFallback>>,
 }
 
 impl OuterResolver {
@@ -55,17 +64,22 @@ impl OuterResolver {
     where
         F: Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync + 'static,
     {
+        Self::build(Box::new(move || bootstrap.clone()), Box::new(system))
+    }
+
+    fn build(bootstrap: BootstrapSource, system: SystemLookup) -> Self {
         Self {
-            bootstrap: Box::new(move || bootstrap.clone()),
-            system: Box::new(system),
+            bootstrap,
+            system,
             last_good: Mutex::new(HashMap::new()),
-            warned: Mutex::new(HashSet::new()),
+            warned_fallback: Mutex::new(HashSet::new()),
+            warned_stale: Mutex::new(HashSet::new()),
             last_fallback: Mutex::new(None),
         }
     }
 
-    /// 解析 `host:port`。IP 字面量直接返回；系统 DNS 给出真实地址即用之，
-    /// 否则（失败或全是假地址）改问引导 DNS；仍失败则沿用最近一次有效结果。
+    /// 解析 `host:port`。IP 字面量直接返回；系统 DNS 给出真实地址即用之；
+    /// 全是 198.18.0.0/15 假地址时改问引导 DNS；失败则沿用最近一次有效结果。
     /// 阻塞调用，异步上下文请经 `spawn_blocking`。
     pub fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -74,11 +88,14 @@ impl OuterResolver {
         let ips = match self.resolve_ips(host) {
             Ok(ips) => {
                 self.lock_last_good().insert(host.to_string(), ips.clone());
+                lock(&self.warned_stale).remove(host);
                 ips
             }
             Err(error) => match self.lock_last_good().get(host).cloned() {
                 Some(cached) => {
-                    tracing::warn!(%host, %error, "外层域名解析失败，沿用最近一次有效结果");
+                    if lock(&self.warned_stale).insert(host.to_string()) {
+                        tracing::warn!(%host, %error, "外层域名解析失败，沿用最近一次有效结果");
+                    }
                     cached
                 }
                 None => return Err(error),
@@ -91,50 +108,35 @@ impl OuterResolver {
     }
 
     fn resolve_ips(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        let system = (self.system)(host, 0);
-        if let Ok(addrs) = &system {
-            let real: Vec<IpAddr> = addrs
-                .iter()
-                .map(SocketAddr::ip)
-                .filter(|ip| !is_fake_ip(ip))
-                .collect();
-            if !real.is_empty() {
-                return Ok(real);
+        let answers: Vec<IpAddr> = (self.system)(host, 0)?.iter().map(SocketAddr::ip).collect();
+        if answers.is_empty() || answers.iter().any(|ip| !is_fake_ip(ip)) {
+            let real: Vec<IpAddr> = answers.into_iter().filter(|ip| !is_fake_ip(ip)).collect();
+            if real.is_empty() {
+                return Err(io::Error::other(format!("{host} 未解析出任何地址")));
             }
+            return Ok(real);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or_default();
-        *self.last_fallback.lock().expect("last_fallback poisoned") = Some((now, host.to_string()));
-        if self
-            .warned
-            .lock()
-            .expect("warned poisoned")
-            .insert(host.to_string())
-        {
-            match &system {
-                Ok(addrs) => tracing::warn!(
-                    %host,
-                    fake = ?addrs.iter().map(SocketAddr::ip).collect::<Vec<_>>(),
-                    "系统 DNS 返回 198.18.0.0/15 假地址（DNS 被其他网络工具接管），改用引导 DNS"
-                ),
-                Err(error) => tracing::warn!(%host, %error, "系统 DNS 解析失败，改用引导 DNS"),
-            }
+        *lock(&self.last_fallback) = Some(DnsFallback {
+            at: unix_now(),
+            host: host.to_string(),
+        });
+        if lock(&self.warned_fallback).insert(host.to_string()) {
+            tracing::warn!(
+                %host,
+                fake = ?answers,
+                "系统 DNS 返回 198.18.0.0/15 假地址（DNS 被第三方 TUN 类网络工具接管），改用引导 DNS"
+            );
         }
         self.query_bootstrap(host)
     }
 
-    /// 最近一次回退到引导 DNS 的时间（Unix 秒）与域名；从未回退时为 None。
-    pub fn last_fallback(&self) -> Option<(u64, String)> {
-        self.last_fallback
-            .lock()
-            .expect("last_fallback poisoned")
-            .clone()
+    /// 最近一次回退到引导 DNS；从未回退时为 None。
+    pub fn last_fallback(&self) -> Option<DnsFallback> {
+        lock(&self.last_fallback).clone()
     }
 
     fn lock_last_good(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<IpAddr>>> {
-        self.last_good.lock().expect("last_good poisoned")
+        lock(&self.last_good)
     }
 
     fn query_bootstrap(&self, host: &str) -> io::Result<Vec<IpAddr>> {
@@ -161,19 +163,30 @@ impl OuterResolver {
 /// DNS），网络切换后 DHCP 下发的 DNS 变化也能跟上。
 pub fn global() -> &'static OuterResolver {
     static RESOLVER: OnceLock<OuterResolver> = OnceLock::new();
-    RESOLVER.get_or_init(|| OuterResolver {
-        bootstrap: Box::new(|| {
-            let configured = std::env::var("HZD_BOOTSTRAP_DNS").ok();
-            bootstrap_servers(configured.as_deref(), &system_nameservers())
-        }),
-        system: Box::new(|host, port| {
-            use std::net::ToSocketAddrs;
-            Ok((host, port).to_socket_addrs()?.collect())
-        }),
-        last_good: Mutex::new(HashMap::new()),
-        warned: Mutex::new(HashSet::new()),
-        last_fallback: Mutex::new(None),
+    RESOLVER.get_or_init(|| {
+        OuterResolver::build(
+            Box::new(|| {
+                let configured = std::env::var("HZD_BOOTSTRAP_DNS").ok();
+                bootstrap_servers(configured.as_deref(), &system_nameservers())
+            }),
+            Box::new(|host, port| {
+                use std::net::ToSocketAddrs;
+                Ok((host, port).to_socket_addrs()?.collect())
+            }),
+        )
     })
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().expect("outer_dns mutex poisoned")
+}
+
+/// 当前 Unix 秒。
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// 解析 `host:port` 或 `[ipv6]:port` 形式的外层地址（经 [`global`]）。阻塞调用。

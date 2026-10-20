@@ -69,8 +69,11 @@ pub fn linux_route_repair_args(cfg: &TunConfig) -> Vec<Vec<String>> {
     ]
 }
 
-/// HzNet 某个地址段路由的现状（#24 运行中自检）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// HzNet 某个地址段路由的现状（#24 运行中自检）。序列化为
+/// `{"state":"missing"}` / `{"state":"taken_by","interface":"en0"}`，经 hzd
+/// 状态应答交给 `hz status` 展示（#25）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", content = "interface", rename_all = "snake_case")]
 pub enum RouteHealth {
     /// 路由指向 HzNet 网卡。
     Ours,
@@ -78,6 +81,13 @@ pub enum RouteHealth {
     Missing,
     /// 同前缀路由被其他网卡占用（如第三方 TUN 类网络工具的排除路由）。
     TakenBy(String),
+}
+
+/// 一次运行中路由修复：哪个段、修复前的状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRepair {
+    pub cidr: String,
+    pub previous: RouteHealth,
 }
 
 /// 由路由当前所属网卡判定健康状态。
@@ -103,13 +113,6 @@ pub fn parse_route_get_owner(text: &str, network: &str) -> Option<String> {
         return None;
     }
     field("interface:")
-}
-
-/// 一次运行中路由修复：哪个段、修复前的状态。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteRepair {
-    pub cidr: String,
-    pub previous: RouteHealth,
 }
 
 /// `ip route show exact <段>` 输出 → 该路由所属网卡（`dev` 之后的名字）；
@@ -178,7 +181,7 @@ pub fn remove_secondary_addr(_addr: &Ipv4Addr) -> anyhow::Result<()> {
 }
 
 /// ULA /48 前缀 = 本机 ULA 地址的前三组。
-fn ula_prefix48(addr: Ipv6Addr) -> String {
+pub fn ula_prefix48(addr: Ipv6Addr) -> String {
     let segments = addr.segments();
     format!("{:x}:{:x}:{:x}::/48", segments[0], segments[1], segments[2])
 }
@@ -444,6 +447,14 @@ fn query_route_owner(cidr: &str, v6: bool) -> anyhow::Result<Option<String>> {
         .args(&args)
         .output()
         .with_context(|| format!("execute ip {}", args.join(" ")))?;
+    // 命令失败不能当作"路由缺失"，否则会在路由正常时写路由表。
+    if !output.status.success() {
+        bail!(
+            "ip {} 失败：{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(parse_ip_route_owner(&String::from_utf8_lossy(
         &output.stdout,
     )))
@@ -456,6 +467,14 @@ fn query_route_owner(cidr: &str, v6: bool) -> anyhow::Result<Option<String>> {
         .args(["-n", "get", family, "-net", cidr])
         .output()
         .with_context(|| format!("execute route -n get {family} -net {cidr}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 连默认路由都没有时 route get 报 not in table：该段确实无路由。
+        if stderr.contains("not in table") {
+            return Ok(None);
+        }
+        bail!("route -n get {family} -net {cidr} 失败：{}", stderr.trim());
+    }
     let network = cidr.split('/').next().unwrap_or(cidr);
     Ok(parse_route_get_owner(
         &String::from_utf8_lossy(&output.stdout),
@@ -519,6 +538,18 @@ mod tests {
             parse_route_get_owner(missing, "10.213.0.0"),
             None,
             "退回默认路由 = HzNet 路由缺失"
+        );
+    }
+
+    #[test]
+    fn route_health_json_shape_is_the_contract_hz_status_reads() {
+        assert_eq!(
+            serde_json::to_value(RouteHealth::Missing).unwrap(),
+            serde_json::json!({ "state": "missing" })
+        );
+        assert_eq!(
+            serde_json::to_value(RouteHealth::TakenBy("en0".to_string())).unwrap(),
+            serde_json::json!({ "state": "taken_by", "interface": "en0" })
         );
     }
 

@@ -161,13 +161,27 @@ pub fn physical_egress() -> Option<String> {
 /// 都须在 connect(2)/发包之前生效）。返回绑定的网卡名；探测或设置失败时
 /// 返回 None，外层流量退回系统路由并记录告警（此时与第三方 TUN 类网络
 /// 工具的共存不成立）。
+/// 外层 socket 绑定成功的日志：每次连接（含引导 DNS 查询）都会绑定，
+/// 只在绑定的网卡变化时记 info，其余记 debug，避免刷屏。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn log_bound(iface: &str) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().expect("egress log poisoned");
+    if last.as_deref() == Some(iface) {
+        tracing::debug!(%iface, "outer traffic bound to physical egress");
+    } else {
+        tracing::info!(%iface, "outer traffic bound to physical egress");
+        *last = Some(iface.to_string());
+    }
+}
+
 pub fn bind_to_physical_egress<S: AsFd>(socket: &S) -> Option<String> {
     let iface = physical_egress()?;
     #[cfg(target_os = "linux")]
     {
         match socket2::SockRef::from(socket).bind_device(Some(iface.as_bytes())) {
             Ok(()) => {
-                tracing::info!(%iface, "outer traffic bound to physical egress");
+                log_bound(&iface);
                 Some(iface)
             }
             Err(error) => {
@@ -180,7 +194,7 @@ pub fn bind_to_physical_egress<S: AsFd>(socket: &S) -> Option<String> {
     {
         match bound_if_auto(socket, &iface) {
             Ok(()) => {
-                tracing::info!(%iface, "outer traffic bound to physical egress");
+                log_bound(&iface);
                 Some(iface)
             }
             Err(error) => {
