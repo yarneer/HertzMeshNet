@@ -250,7 +250,7 @@ wait_status n1 "d.get('expired') is True" "n1：到期后 status 应显示已过
   docker_exec sh -c "tail -20 $ART/hz-node-n1.log; tail -20 $WORK_DIR/coord.log" 2>/dev/null
   exit 1
 }
-pass "n1：hz status 已过期（已过期，请重新执行 hz up 登录）"
+pass "n1：hz status 已过期（已过期，请执行 hz login 重新登录）"
 
 N1_STATUS_OUT=$(hz_cli n1 status 2>/dev/null)
 grep -q "已过期" <<<"$N1_STATUS_OUT" \

@@ -371,13 +371,16 @@ async fn handle_request(
             ping_peer(&daemon, target).await
         }
         "up" => {
-            let coord_addr = request
-                .params
-                .get("coord_addr")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .or_else(|| std::env::var("HZD_COORD_ADDR").ok())
-                .unwrap_or_else(|| DEFAULT_COORD_ADDR.to_string());
+            let registered = daemon
+                .coord_addr
+                .lock()
+                .expect("coord addr poisoned")
+                .clone();
+            let coord_addr = up_coord_addr(
+                request.params.get("coord_addr").and_then(|v| v.as_str()),
+                registered.as_deref(),
+                std::env::var("HZD_COORD_ADDR").ok().as_deref(),
+            );
 
             match request.params.get("auth_key").and_then(|v| v.as_str()) {
                 Some(auth_key) => {
@@ -594,6 +597,18 @@ async fn handle_request(
     }
 }
 
+/// `hz up` / `hz login` 连接的 Coordination Server：显式 --coord → 注册时记下的
+/// 地址（已注册含已过期的 Node 重新登录不应换服务器）→ hzd 的 HZD_COORD_ADDR
+/// → 内置默认地址。空串视同未提供。
+fn up_coord_addr(requested: Option<&str>, registered: Option<&str>, env: Option<&str>) -> String {
+    [requested, registered, env]
+        .into_iter()
+        .flatten()
+        .find(|addr| !addr.is_empty())
+        .unwrap_or(DEFAULT_COORD_ADDR)
+        .to_string()
+}
+
 /// Policy / Admin 管理 rpc 需要 hzd 已注册（拿注册时记下的 Coordination Server 地址）。
 fn daemon_coord_addr(daemon: &Daemon) -> Result<String, String> {
     daemon
@@ -709,7 +724,8 @@ fn spawn_login_poller(
         let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
             if tokio::time::Instant::now() >= deadline {
-                let error = "登录等待超时（10 分钟），请重新执行 hz up".to_string();
+                let error = "登录等待超时（10 分钟），请重新执行 hz login（已加入 HzNet）或 hz up"
+                    .to_string();
                 tracing::error!(%error, "interactive login polling gave up");
                 *daemon.login.lock().expect("login poisoned") = LoginProgress::Failed { error };
                 return;
@@ -1969,4 +1985,35 @@ fn save_registration(
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod up_coord_addr_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_coord_wins() {
+        assert_eq!(
+            up_coord_addr(Some("https://a"), Some("https://reg"), Some("https://env")),
+            "https://a"
+        );
+    }
+
+    #[test]
+    fn registered_addr_beats_env() {
+        assert_eq!(
+            up_coord_addr(None, Some("https://reg"), Some("https://env")),
+            "https://reg"
+        );
+    }
+
+    #[test]
+    fn env_then_default_when_unregistered() {
+        assert_eq!(
+            up_coord_addr(None, None, Some("https://env")),
+            "https://env"
+        );
+        assert_eq!(up_coord_addr(None, Some(""), Some("")), DEFAULT_COORD_ADDR);
+        assert_eq!(up_coord_addr(None, None, None), DEFAULT_COORD_ADDR);
+    }
 }

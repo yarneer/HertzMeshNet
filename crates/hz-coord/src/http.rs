@@ -165,15 +165,15 @@ pub async fn serve_http(listen: SocketAddr, state: Arc<HttpState>) -> anyhow::Re
 fn take_error_page(error: TakeError) -> Response {
     match error {
         TakeError::NotFound => Html(
-            "<h1>登录链接不存在或已被使用</h1><p>请回到服务器重新执行 hz up 生成新的登录链接。</p>",
+            "<h1>登录链接不存在或已被使用</h1><p>请回到该设备重新执行 hz login（已加入 HzNet）或 hz up（尚未加入）生成新的登录链接。</p>",
         )
         .into_response(),
         TakeError::Expired => {
-            Html("<h1>登录链接已过期</h1><p>请回到服务器重新执行 hz up 生成新的登录链接。</p>")
+            Html("<h1>登录链接已过期</h1><p>请回到该设备重新执行 hz login（已加入 HzNet）或 hz up（尚未加入）生成新的登录链接。</p>")
                 .into_response()
         }
         TakeError::AlreadyUsed => {
-            Html("<h1>该登录链接已被使用</h1><p>一次性链接不可重复使用，请重新执行 hz up。</p>")
+            Html("<h1>该登录链接已被使用</h1><p>一次性链接不可重复使用，请回到该设备重新执行 hz login（已加入 HzNet）或 hz up（尚未加入）。</p>")
                 .into_response()
         }
     }

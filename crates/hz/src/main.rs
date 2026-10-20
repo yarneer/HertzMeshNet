@@ -26,13 +26,13 @@ enum Command {
         /// Auth Key 明文（hz-coord bootstrap 签发）；缺省时走交互式登录
         #[arg(long)]
         auth_key: Option<String>,
-        /// Coordination Server 地址（默认读 HZD_COORD_ADDR，再退到内置占位地址）
+        /// Coordination Server 地址（缺省由 hzd 决定：注册时记下的地址，其次 hzd 的 HZD_COORD_ADDR，再退到内置占位地址）
         #[arg(long)]
         coord: Option<String>,
     },
     /// 重新交互式登录（已注册的 Node 重新归属到登录的 User，身份不变）
     Login {
-        /// Coordination Server 地址（默认读 HZD_COORD_ADDR，再退到内置占位地址）
+        /// Coordination Server 地址（缺省用注册时记下的地址）
         #[arg(long)]
         coord: Option<String>,
     },
@@ -453,7 +453,7 @@ async fn status(json_output: bool) -> std::process::ExitCode {
                 if result.get("revoked").and_then(|v| v.as_bool()) == Some(true) {
                     println!("已吊销：本 Node 已被 Admin 吊销，无法通信；重新加入需以新身份注册");
                 } else {
-                    println!("已过期，请重新执行 hz up 登录");
+                    println!("已过期，请执行 hz login 重新登录");
                 }
                 print_identity(&info);
                 if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
@@ -491,10 +491,16 @@ async fn up(auth_key: Option<String>, coord: Option<String>) -> std::process::Ex
     if let Some(auth_key) = auth_key {
         params["auth_key"] = serde_json::Value::String(auth_key);
     }
+    let registered = if coord.is_none() {
+        hzd_registered(&socket).await
+    } else {
+        None
+    };
+    if let Some(hint) = coord_hint(coord.is_some(), registered) {
+        eprintln!("{hint}");
+    }
     if let Some(coord) = coord {
         params["coord_addr"] = serde_json::Value::String(coord);
-    } else if std::env::var_os("HZD_COORD_ADDR").is_none() {
-        eprintln!("未指定 --coord 且未设置 HZD_COORD_ADDR，将尝试默认地址 {DEFAULT_COORD_ADDR}");
     }
     let request = Request::new(2, "up", params);
     let response = match ipc::request(&socket, request).await {
@@ -530,6 +536,27 @@ async fn up(auth_key: Option<String>, coord: Option<String>) -> std::process::Ex
     }
 }
 
+/// hzd 是否已注册（含已过期）；问不到时 None。
+async fn hzd_registered(socket: &std::path::Path) -> Option<bool> {
+    match ipc::request(socket, Request::new(1, "status", serde_json::json!({}))).await {
+        Ok(Response::Ok { result, .. }) => serde_json::from_value::<NodeStatus>(result)
+            .ok()
+            .map(|status| !matches!(status, NodeStatus::Unregistered)),
+        _ => None,
+    }
+}
+
+/// 未指定 --coord 时的地址提示。连接由 hzd 发起：已注册的 Node 用注册时记下的
+/// 地址（不提示）；未注册的用 hzd 自己的 HZD_COORD_ADDR，hz 进程的环境变量
+/// 与此无关。registered 为 None（问不到 hzd）时不提示，交给随后的错误。
+fn coord_hint(coord_given: bool, registered: Option<bool>) -> Option<String> {
+    (!coord_given && registered == Some(false)).then(|| {
+        format!(
+            "未指定 --coord：hzd 将连接其配置的 HZD_COORD_ADDR，未配置时使用默认地址 {DEFAULT_COORD_ADDR}"
+        )
+    })
+}
+
 /// 交互式登录（FR-2）：打印一次性链接，然后等 hzd 轮询到登录结果。
 async fn interactive_login(begin: serde_json::Value) -> std::process::ExitCode {
     let login_url = begin
@@ -550,7 +577,7 @@ async fn interactive_login(begin: serde_json::Value) -> std::process::ExitCode {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
     loop {
         if tokio::time::Instant::now() >= deadline {
-            eprintln!("等待登录超时，请重新执行 hz up");
+            eprintln!("等待登录超时，请重新执行 hz login（已加入 HzNet）或 hz up");
             return std::process::ExitCode::FAILURE;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -896,6 +923,19 @@ fn print_identity(info: &RegisteredInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coord_hint_only_for_unregistered_without_coord() {
+        assert!(coord_hint(false, Some(false)).is_some());
+        let hint = coord_hint(false, Some(false)).unwrap();
+        assert!(hint.contains("hzd"), "{hint}");
+        assert!(hint.contains(DEFAULT_COORD_ADDR), "{hint}");
+        // 已注册：hzd 用注册时记下的地址，不打印。
+        assert_eq!(coord_hint(false, Some(true)), None);
+        // 显式 --coord、或问不到 hzd 状态：不打印。
+        assert_eq!(coord_hint(true, Some(false)), None);
+        assert_eq!(coord_hint(false, None), None);
+    }
 
     #[test]
     fn expiry_parsing_supports_relative_days_and_rfc3339() {
