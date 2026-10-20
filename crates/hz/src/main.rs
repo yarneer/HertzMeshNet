@@ -3,6 +3,7 @@ use hz_core::coord_client::DEFAULT_COORD_ADDR;
 use hz_core::ipc::{self, Request, Response};
 use hz_core::paths;
 use hz_core::status::{NodeStatus, RegisteredInfo};
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -433,7 +434,12 @@ async fn status(json_output: bool) -> std::process::ExitCode {
         }
     };
     match response {
-        Response::Ok { result, .. } if json_output => {
+        Response::Ok { mut result, .. } if json_output => {
+            if let Ok(status) = serde_json::from_value::<NodeStatus>(result.clone())
+                && let Some(info) = status.info()
+            {
+                result["conflicts"] = detect_conflicts(info, &result).to_json();
+            }
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             std::process::ExitCode::SUCCESS
         }
@@ -462,6 +468,8 @@ async fn status(json_output: bool) -> std::process::ExitCode {
                     println!("网内域名后缀：{suffix}");
                 }
                 print_peers(&result);
+                print_conflicts(&detect_conflicts(&info, &result));
+                print_diagnostics(&result);
                 std::process::ExitCode::SUCCESS
             }
             Err(error) => {
@@ -643,6 +651,131 @@ async fn ping(node: String) -> std::process::ExitCode {
 
 /// Network Map 里的对端（hzd 状态结果的 peers 字段）；表格式展示
 /// Node Name / Node Address / 路径 / Endpoint / 最近握手（FR-12）。
+/// `hz status` 的冲突自检结果（#25）。
+#[derive(Debug, Default)]
+struct Conflicts {
+    /// 发往 HzNet 的流量被其他隧道接管：(期望的本机 Node Address, 实际源地址, 所属网卡)。
+    route_capture: Option<(IpAddr, IpAddr, Option<String>)>,
+    /// 名字解析被接管：(探测名, 解析到的假地址)。
+    dns_hijack: Option<(String, Vec<IpAddr>)>,
+}
+
+impl Conflicts {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "route_capture": self.route_capture.as_ref().map(|(expected, source, iface)| {
+                serde_json::json!({ "expected": expected, "source": source, "interface": iface })
+            }),
+            "dns_hijack": self.dns_hijack.as_ref().map(|(probe, answers)| {
+                serde_json::json!({ "probe": probe, "answers": answers })
+            }),
+        })
+    }
+}
+
+/// 冲突自检（#25）：(1) 对第一个对端的 IPv4 Node Address 做不发包的 UDP
+/// connect，系统选定的源地址若不是本机 Node Address，说明发往 HzNet 的流量
+/// 被其他隧道接管；(2) 系统解析一个不存在的 `*.<域名后缀>` 名字，若得到
+/// 198.18.0.0/15 假地址，说明名字解析被接管。
+fn detect_conflicts(info: &RegisteredInfo, result: &serde_json::Value) -> Conflicts {
+    let mut conflicts = Conflicts::default();
+    let peer_v4 = result
+        .get("peers")
+        .and_then(|v| v.as_array())
+        .and_then(|peers| {
+            peers
+                .iter()
+                .find_map(|peer| peer.get("ipv4")?.as_str()?.parse::<IpAddr>().ok())
+        });
+    if let (Ok(expected), Some(peer)) = (info.ipv4.parse::<IpAddr>(), peer_v4)
+        && let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && socket.connect((peer, 9)).is_ok()
+        && let Ok(local) = socket.local_addr()
+        && local.ip() != expected
+    {
+        let iface = hz_core::netif::interface_with_addr(local.ip());
+        conflicts.route_capture = Some((expected, local.ip(), iface));
+    }
+    if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
+        use std::net::ToSocketAddrs;
+        let probe = format!("hz-selfcheck-{}.{suffix}", std::process::id());
+        if let Ok(addrs) = (probe.as_str(), 0).to_socket_addrs() {
+            let fake: Vec<IpAddr> = addrs
+                .map(|addr| addr.ip())
+                .filter(hz_core::outer_dns::is_fake_ip)
+                .collect();
+            if !fake.is_empty() {
+                conflicts.dns_hijack = Some((probe, fake));
+            }
+        }
+    }
+    conflicts
+}
+
+fn print_conflicts(conflicts: &Conflicts) {
+    if let Some((expected, source, iface)) = &conflicts.route_capture {
+        let iface = iface.as_deref().unwrap_or("未知网卡");
+        println!(
+            "⚠ 发往 HzNet 的流量被其他隧道接管：实际源地址 {source}（{iface}），应为本机 Node Address {expected}。"
+        );
+        println!(
+            "  请在占用该网卡的网络工具中排除 HzNet 地址段（勿排除与 HzNet 完全相同的前缀，见安装手册\"共存\"一节）。"
+        );
+    }
+    if let Some((probe, answers)) = &conflicts.dns_hijack {
+        let answers: Vec<String> = answers.iter().map(ToString::to_string).collect();
+        println!(
+            "⚠ 名字解析被接管：{probe} 被解析为 {}（198.18.0.0/15 假地址），网内名字将无法使用。",
+            answers.join(", ")
+        );
+        println!(
+            "  请在接管 DNS 的网络工具中把 HzNet 域名后缀交给 HzNet 本地 DNS 解析，或直接使用 Node Address。"
+        );
+    }
+}
+
+/// hzd 汇报的最近一次运行中路由修复（#24）与引导 DNS 回退（#23）。
+fn print_diagnostics(result: &serde_json::Value) {
+    let Some(diagnostics) = result.get("diagnostics") else {
+        return;
+    };
+    let when = |event: &serde_json::Value| {
+        event
+            .get("at")
+            .and_then(|v| v.as_i64())
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+            .map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "时间未知".to_string())
+    };
+    let text = |event: &serde_json::Value, key: &str| {
+        event
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    if let Some(repair) = diagnostics.get("route_repair").filter(|v| !v.is_null()) {
+        let previous = text(repair, "previous");
+        let cause = if previous == "missing" {
+            "被删除".to_string()
+        } else {
+            format!("被 {previous} 占用")
+        };
+        println!(
+            "最近一次路由修复：{} HzNet 路由 {}{cause}，已自动恢复",
+            when(repair),
+            text(repair, "cidr")
+        );
+    }
+    if let Some(fallback) = diagnostics.get("dns_fallback").filter(|v| !v.is_null()) {
+        println!(
+            "最近一次引导 DNS 回退：{} 系统 DNS 对 {} 返回假地址或失败，已改用引导 DNS",
+            when(fallback),
+            text(fallback, "host")
+        );
+    }
+}
+
 fn print_peers(result: &serde_json::Value) {
     let Some(peers) = result.get("peers").and_then(|v| v.as_array()) else {
         return;

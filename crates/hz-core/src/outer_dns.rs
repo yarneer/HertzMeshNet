@@ -45,6 +45,8 @@ pub struct OuterResolver {
     last_good: Mutex<HashMap<String, Vec<IpAddr>>>,
     /// 已就"改用引导 DNS"告警过的域名：每个域名只记一次，避免刷屏。
     warned: Mutex<HashSet<String>>,
+    /// 最近一次回退到引导 DNS：(Unix 秒, 域名)，供 `hz status` 汇报（#25）。
+    last_fallback: Mutex<Option<(u64, String)>>,
 }
 
 impl OuterResolver {
@@ -58,6 +60,7 @@ impl OuterResolver {
             system: Box::new(system),
             last_good: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashSet::new()),
+            last_fallback: Mutex::new(None),
         }
     }
 
@@ -99,6 +102,11 @@ impl OuterResolver {
                 return Ok(real);
             }
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        *self.last_fallback.lock().expect("last_fallback poisoned") = Some((now, host.to_string()));
         if self
             .warned
             .lock()
@@ -115,6 +123,14 @@ impl OuterResolver {
             }
         }
         self.query_bootstrap(host)
+    }
+
+    /// 最近一次回退到引导 DNS 的时间（Unix 秒）与域名；从未回退时为 None。
+    pub fn last_fallback(&self) -> Option<(u64, String)> {
+        self.last_fallback
+            .lock()
+            .expect("last_fallback poisoned")
+            .clone()
     }
 
     fn lock_last_good(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<IpAddr>>> {
@@ -156,6 +172,7 @@ pub fn global() -> &'static OuterResolver {
         }),
         last_good: Mutex::new(HashMap::new()),
         warned: Mutex::new(HashSet::new()),
+        last_fallback: Mutex::new(None),
     })
 }
 

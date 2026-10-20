@@ -1553,6 +1553,14 @@ assert_suite_fakedns() {
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
   ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
   ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
+
+  note "断言 5：hz status 汇报引导 DNS 回退（#25）"
+  local status_out; status_out=$(hz_cli "$a" status)
+  if grep -q "最近一次引导 DNS 回退.*hz.test" <<<"$status_out"; then
+    pass "hz status 显示引导 DNS 回退（$(grep '最近一次引导 DNS 回退' <<<"$status_out")）"
+  else
+    fail "hz status 未显示引导 DNS 回退：$status_out"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1604,4 +1612,12 @@ assert_suite_routeheal() {
   wait_for_log "$ART_DIR/hz-node-$a.log" "taken_by=eth0" "$a 记录占用网卡 eth0" 5 || return 1
   owner=$(ip netns exec "$ns" ip route show exact "$cidr")
   [[ $owner == *"dev hz0"* ]] && pass "路由已回到 hz0（$owner）" || fail "路由未回到 hz0（$owner）"
+
+  note "断言 3：hz status 汇报最近一次路由修复（#25）"
+  local status_out; status_out=$(hz_cli "$a" status)
+  if grep -q "最近一次路由修复.*被 eth0 占用" <<<"$status_out"; then
+    pass "hz status 显示路由修复（$(grep '最近一次路由修复' <<<"$status_out")）"
+  else
+    fail "hz status 未显示路由修复：$status_out"
+  fi
 }

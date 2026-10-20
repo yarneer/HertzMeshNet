@@ -349,6 +349,17 @@ async fn handle_request(
                 serde_json::to_value(peers_view(&daemon)).map_err(|e| e.to_string())?;
             value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
             value["revoked"] = serde_json::json!(*daemon.revoked.lock().expect("revoked poisoned"));
+            // #25：最近一次运行中路由修复与引导 DNS 回退，供 hz status 汇报。
+            let route_repair = LAST_ROUTE_REPAIR
+                .lock()
+                .expect("route repair poisoned")
+                .clone();
+            value["diagnostics"] = serde_json::json!({
+                "route_repair": route_repair,
+                "dns_fallback": hz_core::outer_dns::global()
+                    .last_fallback()
+                    .map(|(at, host)| serde_json::json!({ "at": at, "host": host })),
+            });
             value["policy"] = serde_json::json!({
                 "version": daemon.policy_gate.version(),
                 "dropped": daemon.policy_gate.dropped(),

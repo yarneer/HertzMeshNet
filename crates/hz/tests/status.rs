@@ -123,3 +123,121 @@ async fn status_exits_quietly_when_stdout_reader_is_gone() {
         output.status
     );
 }
+
+// #25：hz status 的冲突自检。假 hzd 给出本机 Node Address 与对端地址，
+// hz 对对端地址做不发包的 UDP connect 读出系统选定的源地址：对端用
+// 127.0.0.1 时源地址必为 127.0.0.1，本机 Node Address 设成别的地址即可
+// 确定性地构造"流量被其他隧道接管"。
+async fn status_output(status: serde_json::Value, args: &[&str]) -> (bool, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            ipc::serve(
+                &socket,
+                ipc::handler(move |_request: ipc::Request| {
+                    let status = status.clone();
+                    async move { Ok(status) }
+                }),
+            )
+            .await
+        }
+    });
+    wait_for_socket(&socket).await;
+    let output = hz_binary()
+        .env("HZD_SOCK_PATH", &socket)
+        .args(args)
+        .output()
+        .unwrap();
+    server.abort();
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string()
+            + &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn registered(own_v4: &str, peer_v4: &str) -> serde_json::Value {
+    serde_json::json!({
+        "registered": true,
+        "node_id": "n-self",
+        "name": "mac",
+        "ipv4": own_v4,
+        "ipv6": "fd7a:3548:1873::2",
+        "tags": [],
+        "dns_suffix": "invalid",
+        "peers": [{ "name": "srv", "ipv4": peer_v4, "ipv6": "fd7a:3548:1873::1", "path": "direct" }],
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_warns_when_hznet_traffic_leaves_from_another_interface() {
+    let (ok, out) = status_output(registered("10.213.0.2", "127.0.0.1"), &["status"]).await;
+
+    assert!(ok, "{out}");
+    assert!(out.contains("被其他隧道接管"), "应提示流量被接管：{out}");
+    assert!(out.contains("127.0.0.1"), "应给出实际源地址：{out}");
+    assert!(
+        out.contains("10.213.0.2"),
+        "应给出期望的本机 Node Address：{out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_stays_quiet_when_traffic_uses_the_node_address() {
+    let (ok, out) = status_output(registered("127.0.0.1", "127.0.0.1"), &["status"]).await;
+
+    assert!(ok, "{out}");
+    assert!(!out.contains("被其他隧道接管"), "无冲突时不应提示：{out}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_json_carries_structured_conflicts() {
+    let (ok, out) =
+        status_output(registered("10.213.0.2", "127.0.0.1"), &["status", "--json"]).await;
+
+    assert!(ok, "{out}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("--json 输出应为 JSON");
+    assert_eq!(
+        value["conflicts"]["route_capture"]["source"], "127.0.0.1",
+        "{out}"
+    );
+    assert_eq!(
+        value["conflicts"]["route_capture"]["expected"], "10.213.0.2",
+        "{out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reports_recent_route_repair_and_dns_fallback() {
+    let mut status = registered("127.0.0.1", "127.0.0.1");
+    status["diagnostics"] = serde_json::json!({
+        "route_repair": { "at": 1760900000, "cidr": "10.213.0.0/16", "previous": "en0" },
+        "dns_fallback": { "at": 1760900100, "host": "relay.example.com" },
+    });
+
+    let (ok, out) = status_output(status, &["status"]).await;
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("10.213.0.0/16") && out.contains("en0"),
+        "应显示路由修复：{out}"
+    );
+    assert!(
+        out.contains("relay.example.com") && out.contains("引导 DNS"),
+        "应显示引导 DNS 回退：{out}"
+    );
+    assert!(out.contains("2025-10-19"), "时间应格式化为日期：{out}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_omits_diagnostics_section_when_nothing_happened() {
+    let (ok, out) = status_output(registered("127.0.0.1", "127.0.0.1"), &["status"]).await;
+
+    assert!(ok, "{out}");
+    assert!(
+        !out.contains("最近一次"),
+        "未发生过修复/回退时不显示：{out}"
+    );
+}

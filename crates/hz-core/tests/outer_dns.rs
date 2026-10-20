@@ -197,3 +197,19 @@ fn host_port_strings_resolve_including_bracketed_ipv6() {
         "缺端口应报错"
     );
 }
+
+#[test]
+fn bootstrap_fallback_is_recorded_for_status_reporting() {
+    let bootstrap = spawn_bootstrap_dns(Ipv4Addr::new(203, 0, 113, 7));
+    let resolver =
+        OuterResolver::with_system_lookup(vec![bootstrap.addr], system_returning("124.70.70.12"));
+    resolver.resolve("coord.example.com", 443).unwrap();
+    assert_eq!(resolver.last_fallback(), None, "未回退时不应有记录");
+
+    let resolver =
+        OuterResolver::with_system_lookup(vec![bootstrap.addr], system_returning("198.18.2.39"));
+    resolver.resolve("relay.example.com", 443).unwrap();
+    let (at, host) = resolver.last_fallback().expect("回退应被记录");
+    assert_eq!(host, "relay.example.com");
+    assert!(at > 1_700_000_000, "记录时间应为 Unix 秒：{at}");
+}

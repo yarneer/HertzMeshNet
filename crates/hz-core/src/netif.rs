@@ -71,6 +71,50 @@ pub(crate) fn pick_egress(
         .map(|r| r.iface.clone())
 }
 
+/// 持有地址 `ip` 的本机网卡名（getifaddrs）。用于 `hz status` 指出 HzNet
+/// 流量实际从哪张网卡发出（#25）。
+#[cfg(unix)]
+pub fn interface_with_addr(ip: std::net::IpAddr) -> Option<String> {
+    use std::ffi::CStr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs 成功时链表由 freeifaddrs 释放；遍历只读其中字段。
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return None;
+        }
+        let mut found = None;
+        let mut cursor = head;
+        while !cursor.is_null() {
+            let entry = &*cursor;
+            cursor = entry.ifa_next;
+            if entry.ifa_addr.is_null() {
+                continue;
+            }
+            let family = i32::from((*entry.ifa_addr).sa_family);
+            let addr = if family == libc::AF_INET {
+                let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                std::net::IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+            } else if family == libc::AF_INET6 {
+                let sin6 = &*(entry.ifa_addr as *const libc::sockaddr_in6);
+                std::net::IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr))
+            } else {
+                continue;
+            };
+            if addr == ip {
+                found = Some(
+                    CStr::from_ptr(entry.ifa_name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                break;
+            }
+        }
+        libc::freeifaddrs(head);
+        found
+    }
+}
+
 /// 当前物理出口网卡。探测不到（无路由表、全是虚拟网卡）返回 None。
 pub fn physical_egress() -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -283,6 +327,16 @@ fn le_hex_to_ipv4(text: &str) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_with_addr_finds_the_loopback_interface() {
+        let iface = interface_with_addr("127.0.0.1".parse().unwrap());
+        assert!(
+            matches!(iface.as_deref(), Some("lo") | Some("lo0")),
+            "127.0.0.1 应属于回环网卡：{iface:?}"
+        );
+        assert_eq!(interface_with_addr("192.0.2.123".parse().unwrap()), None);
+    }
 
     #[test]
     fn virtual_names_are_excluded_by_prefix() {
