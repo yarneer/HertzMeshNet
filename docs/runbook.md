@@ -233,12 +233,14 @@ curl -fsSL https://coord.<域名>/install.sh | sudo sh
 
 launchd 不继承 shell 环境变量，且 install.sh 生成的 plist 只带
 `HZD_COORD_ADDR`，需要手工补 Relay 地址（`/Library/LaunchDaemons/com.hznet.hzd.plist`
-的 `EnvironmentVariables` 字典里加一项）：
+的 `EnvironmentVariables` 字典里加一项；之后重跑 install.sh 升级会保留这一项）：
 
 ```sh
 sudo /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables:HZD_RELAY_ADDR string https://relay.<域名>' \
   /Library/LaunchDaemons/com.hznet.hzd.plist
 sudo launchctl bootout system/com.hznet.hzd 2>/dev/null || true
+# 旧 hzd 退出前要先恢复 DNS 配置，等它从 launchd 卸载完再加载，否则 bootstrap 报 I/O 错误
+while sudo launchctl print system/com.hznet.hzd >/dev/null 2>&1; do sleep 1; done
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist
 sudo hz up --auth-key <Auth Key>
 ```

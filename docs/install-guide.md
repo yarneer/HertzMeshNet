@@ -133,13 +133,17 @@ sudo hz up
 默认安装只写 `HZD_COORD_ADDR`。你的部署如果用独立 Relay 域名（runbook §1 的三子域名形态），把 Relay 地址加进配置并重启，否则跨 NAT 的流量没有中转路径：
 
 - Linux：在 `/etc/default/hzd` 追加 `HZD_RELAY_ADDR=<relay 地址>`，然后 `sudo systemctl restart hzd`。
-- macOS：在 plist 的 `EnvironmentVariables` 段加同样的键值，然后 `sudo launchctl bootout system/com.hznet.hzd && sudo launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist`。
+- macOS：在 plist 的 `EnvironmentVariables` 段加同样的键值，然后 `sudo launchctl bootout system/com.hznet.hzd`，等几秒（旧 `hzd` 退出前要先恢复 DNS 配置）再 `sudo launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist`。
 
 Relay 使用私有 CA 时还要加 `HZD_RELAY_CA_PATH=<PEM 路径>`。细节见 [runbook.md](runbook.md) §6.3 与 §6.4。
 
 ## 7. 升级
 
 重跑安装命令即可。脚本检测到 `hzd` 在运行会替换二进制并重启服务；注册身份保留在状态目录（Linux `/var/lib/hzd`，macOS `/Library/Application Support/hzd`），升级后无需重新注册。手动安装的机器重复第 3 节的步骤后 `sudo systemctl restart hzd`。
+
+升级会保留你在第 6 节加过的配置：Linux 保留 `/etc/default/hzd` 里已有的变量，macOS 保留 plist `EnvironmentVariables` 里已有的键（`HZD_RELAY_ADDR`、`HZD_STUN_ADDR`、`HZD_BOOTSTRAP_DNS` 等），只把 `HZD_COORD_ADDR` 换成本次安装命令的值。0.1.3 及更早版本的脚本升级时会整份重写这两个文件，用这些版本升级过的机器请检查 Relay 等配置是否还在，缺了按第 6 节补回。
+
+macOS 上脚本会等旧 `hzd` 完全退出（它退出前要先恢复 DNS 配置，通常几秒）再重新加载服务，并确认新 `hzd` 已在运行才报告「已启动」。等待超时或加载失败时脚本报错退出，按提示的命令查看日志并手动加载，或见第 9 节。
 
 ## 8. 卸载
 
@@ -167,6 +171,25 @@ sudo rm -rf "/Library/Application Support/hzd" /Library/Logs/hzd.log /etc/resolv
 
 - **提示「需要 root」**：安装与 `hz up` 都要 root，用 `sudo`。
 - **`hz status` 报「无法连接 hzd」**：`hzd` 没在运行。Linux 用 `systemctl status hzd`、macOS 用 `sudo tail /Library/Logs/hzd.log` 查原因。
+- **`hz status` 报 Permission denied，同时 `hz up` 报 Connection refused**：`hzd` 没在运行，留下的是旧版本退出时未清理的 `/var/run/hzd.sock`（新版 `hzd` 启动时会自行删除重建，无需手动处理）。常见于升级过程中服务被卸载后没重新加载。检查并恢复：
+
+  macOS：
+
+  ```sh
+  sudo launchctl print system/com.hznet.hzd | grep -E 'state|pid'   # 报「Could not find service」即未加载
+  sudo tail -n 50 /Library/Logs/hzd.log
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist
+  ```
+
+  Linux：
+
+  ```sh
+  systemctl status hzd
+  sudo journalctl -u hzd -n 50
+  sudo systemctl enable --now hzd
+  ```
+
+  恢复后 `hz status` 应正常输出。若 `bootstrap` 报 `Bootstrap failed: 5: Input/output error`，说明旧进程还没退出完，等几秒再执行一次。
 - **安装脚本报「未获知服务器地址」**：脚本是从 GitHub 下载的原件，按第 2 节带上 `HZNET_COORD_URL` 与 `HZNET_COORD_ADDR` 再运行。
 - **注册时报「Auth Key 已使用」或「Auth Key 已过期」**：一次性 Key 只能用一次，过期 Key 向签发人重新要一把。
 - **`hz` 命令提示「需要管理员权限，请用 sudo 执行」**：`hz status`、`hz ping` 是只读查询，普通用户即可执行；`hz up`、`hz login`、Policy、Auth Key 与 Node 管理会以本 Node 的身份改动状态，需要 `sudo`。

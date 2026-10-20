@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # FR-13 验收：全新 debian:bookworm 容器执行一条安装命令，hzd/hz 落盘、
 # systemd 单元与 /etc/default/hzd 就位，手动按单元 ExecStart 拉起 hzd 后
-# `hz up --auth-key` 加入 HzNet；再验幂等重装与 sha256 防篡改负路径。
+# `hz up --auth-key` 加入 HzNet；再验幂等重装（保留已有变量）与 sha256 防篡改负路径。
 # 用法：install_docker.sh <dist_dir>，其中 <dist_dir>/<平台>/{hzd,hz,hz-coord}
 # 是 musl 构建产物（平台按 Docker VM 架构自动选择）。
 set -euo pipefail
@@ -98,8 +98,15 @@ STATUS_OUT=$(docker exec "$NODE" /usr/local/bin/hz status)
 grep -q "已加入 HzNet" <<<"$STATUS_OUT"
 echo "PASS: hz status 显示已加入 HzNet"
 
+# 模拟用户按安装手册第 6 节补过 Relay 地址：重装（升级）后应原样保留，
+# HZD_COORD_ADDR 仍只有一行
+docker exec "$NODE" sh -c 'echo HZD_RELAY_ADDR=https://relay.example:8443 >> /etc/default/hzd'
 docker exec "$NODE" sh -c "curl -fsSL http://coord:$HTTP_PORT/install.sh | sh" >/dev/null
 echo "PASS: 重复执行 install.sh 幂等（RC=0）"
+docker exec "$NODE" grep -qx 'HZD_RELAY_ADDR=https://relay.example:8443' /etc/default/hzd
+[ "$(docker exec "$NODE" grep -c '^HZD_COORD_ADDR=' /etc/default/hzd)" = 1 ]
+docker exec "$NODE" grep -q "^HZD_COORD_ADDR=http://coord:$GRPC_PORT\$" /etc/default/hzd
+echo "PASS: 重装保留 /etc/default/hzd 中已有的 HZD_RELAY_ADDR"
 
 cp "$DIST_DIR/$PLATFORM/hz" "$SCRATCH/hz.bak"
 printf x >> "$DIST_DIR/$PLATFORM/hz"
