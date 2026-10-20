@@ -176,6 +176,14 @@ async fn create_auth_key(
     client: &mut CoordClient<Channel>,
     keys: &NodeKeys,
 ) -> Result<hz_proto::AdminCreateAuthKeyResponse, Status> {
+    create_auth_key_with_tags(client, keys, vec!["ci".to_owned()]).await
+}
+
+async fn create_auth_key_with_tags(
+    client: &mut CoordClient<Channel>,
+    keys: &NodeKeys,
+    tags: Vec<String>,
+) -> Result<hz_proto::AdminCreateAuthKeyResponse, Status> {
     let (nonce, signature) = signed_challenge(client, keys, "admin-op").await;
     client
         .admin_create_auth_key(AdminCreateAuthKeyRequest {
@@ -186,7 +194,7 @@ async fn create_auth_key(
             challenge_signature: signature,
             expires_unix: hz_coord::store::unix_now() + 3600,
             single_use: false,
-            tags: vec![],
+            tags,
         })
         .await
         .map(|response| response.into_inner())
@@ -412,6 +420,59 @@ async fn permission_matrix_three_operators_six_ops() {
         .find(|n| n.node_id == fleet.bob_node.node_id)
         .expect("已吊销的行仍对 Admin 可见");
     assert!(bob_row.revoked, "吊销行必须带 revoked 标记");
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+/// 无 Tag 的 Auth Key 会注册出既无归属也无 Tag 的 Node（Policy 覆盖不到）：
+/// 签发时即拒绝，旧版 hz 也绕不过。
+#[tokio::test]
+async fn admin_create_auth_key_requires_a_tag() {
+    let (handle, store, addr) = start_server().await;
+    let mut client = connect(addr).await;
+    let fleet = fleet(&mut client, &store).await;
+
+    let status = create_auth_key_with_tags(&mut client, &fleet.alice, vec![])
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument, "{status}");
+    assert!(status.message().contains("Tag"), "{status}");
+
+    handle.shutdown();
+    handle.terminated().await;
+}
+
+/// Node 要么归属 User、要么带 Tag（GLOSSARY）：带 Tag 的 Node 经交互式登录
+/// 归属到 User 后 Tag 清空。
+#[tokio::test]
+async fn login_binding_clears_tags() {
+    let (handle, store, addr) = start_server().await;
+    let mut client = connect(addr).await;
+    let user_id = store.upsert_user("carol", false).await.unwrap();
+    let key = auth_key(&store, &["edge"]).await;
+    let keys = node_keys();
+    let info = register_fresh_auth_key(&mut client, &keys, "node-edge", &key).await;
+    assert_eq!(info.tags, vec!["edge".to_string()]);
+
+    let record = store
+        .bind_node_to_user(
+            keys.machine.verifying_key().as_bytes(),
+            &keys.node_public,
+            "node-edge",
+            &user_id,
+            hz_coord::store::unix_now() + 3600,
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.owner_user.as_deref(), Some("carol"));
+    assert!(record.tags.is_empty(), "返回值仍带 Tag：{:?}", record.tags);
+    let stored = store
+        .node_by_machine_key(keys.machine.verifying_key().as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.tags.is_empty(), "库里仍带 Tag：{:?}", stored.tags);
 
     handle.shutdown();
     handle.terminated().await;

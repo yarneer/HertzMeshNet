@@ -151,6 +151,7 @@ else fail "restored db content wrong"; fi
 echo "== hz-bootstrap.sh 干跑（hz-coord 用 JSON 桩替代）"
 cat > /usr/local/bin/hz-coord <<'SHIM'
 #!/usr/bin/env bash
+echo "$*" > /tmp/hzcoord-args
 echo '{"auth_key":"hzkey_dryrun_1","expires_at_unix":4102444800,"admin":"ops","relay_token":"relaytok_dryrun_1"}'
 SHIM
 chmod +x /usr/local/bin/hz-coord
@@ -159,6 +160,8 @@ pass "hz-bootstrap.sh exit 0"
 assert_contains /etc/default/hz-relay 'HZ_RELAY_TOKEN=relaytok_dryrun_1'
 assert_absent  /etc/default/hz-relay '@RELAY_TOKEN@'
 assert_contains /tmp/hzboot.log 'hzkey_dryrun_1'
+assert_contains /tmp/hzcoord-args '--tag server'
+assert_contains /tmp/hzboot.log 'Tags：server'
 
 echo "== upgrade.sh 干跑"
 /work/scripts/deploy/upgrade.sh --dist /tmp/dist2 --no-systemctl > /tmp/upgrade.log 2>&1

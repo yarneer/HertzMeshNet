@@ -94,8 +94,8 @@ enum Command {
         /// 一次性 Key（默认可重复使用直至过期）
         #[arg(long)]
         once: bool,
-        /// 预绑定 Tag，可多次出现
-        #[arg(long = "tag")]
+        /// 预绑定 Tag（必填，可多次出现）：Auth Key 注册的 Node 不归属 User，身份即其 Tag
+        #[arg(long = "tag", required = true)]
         tags: Vec<String>,
         /// 同时把该名字的 User 落库为 Admin（无需 Kanidm 即可种出第一个 Admin）
         #[arg(long)]
@@ -353,6 +353,9 @@ async fn run_bootstrap(
     issue_relay_token: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    if !crate::admin::has_tag(&tags) {
+        anyhow::bail!(crate::admin::MISSING_TAG_MESSAGE);
+    }
     let expires_at_unix = parse_expiry(&auth_key_expiry)?;
     let store = Store::open_with_range(
         &db,
@@ -439,6 +442,20 @@ fn parse_expiry(text: &str) -> anyhow::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_requires_a_tag() {
+        let base = [
+            "hz-coord",
+            "bootstrap",
+            "--db",
+            "x.db",
+            "--auth-key-expiry",
+            "1d",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--tag", "server"])).is_ok());
+    }
 
     #[test]
     fn grpc_addr_defaults_to_https_host_of_public_url() {

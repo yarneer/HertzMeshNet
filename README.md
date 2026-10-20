@@ -129,7 +129,7 @@ hz status                                     # 本机状态与 Network Map
 hz ping db-1                                  # 对端时延与当前路径
 ping db-1.hznet.internal                      # 网内名字解析
 hz policy push policy.toml                    # 整份替换 Policy（TOML）
-hz authkey create --expiry 7d --once          # 签发一次性 Auth Key（需 Admin）
+hz authkey create --expiry 7d --once --tag db  # 签发一次性 Auth Key（需 Admin，至少一个 Tag）
 ```
 
 支持平台：Linux x86_64 / aarch64（systemd），macOS arm64（launchd）。安装脚本 `https://coord.<域名>/install.sh` 按平台下发二进制并注册系统服务。

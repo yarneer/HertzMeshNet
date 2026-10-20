@@ -85,13 +85,26 @@ pub async fn node_by_id(store: &Store, node_id: &str) -> Result<NodeRecord, Stat
         .ok_or_else(|| Status::not_found(format!("Node {node_id} 不存在")))
 }
 
-/// 签发 Auth Key：过期时刻必填且须在未来。
+/// 无 Tag 的 Auth Key 会注册出既不归属 User、也不带 Tag 的 Node，Policy 覆盖
+/// 不到它（GLOSSARY：Node 要么归属一个 User，要么带一个或多个 Tag）。
+pub const MISSING_TAG_MESSAGE: &str = "Auth Key 必须至少绑定一个 Tag（--tag，如 --tag server）：\
+     无 Tag 的 Key 注册出的 Node 既不归属 User 也没有 Tag，Policy 无法覆盖它";
+
+/// 至少一个非空 Tag。
+pub fn has_tag(tags: &[String]) -> bool {
+    tags.iter().any(|tag| !tag.trim().is_empty())
+}
+
+/// 签发 Auth Key：过期时刻必填且须在未来，至少绑定一个 Tag。
 pub async fn create_auth_key(
     store: &Store,
     expires_unix: i64,
     single_use: bool,
     tags: &[String],
 ) -> Result<(String, String), Status> {
+    if !has_tag(tags) {
+        return Err(Status::invalid_argument(MISSING_TAG_MESSAGE));
+    }
     if expires_unix <= crate::store::unix_now() {
         return Err(Status::invalid_argument(
             "Auth Key 的过期时间必须晚于当前时刻",

@@ -786,8 +786,8 @@ import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=10)
 db.execute("INSERT OR IGNORE INTO users (id, name, is_admin) VALUES ('u-alice', 'alice', 1)")
 db.execute("INSERT OR IGNORE INTO users (id, name, is_admin) VALUES ('u-bob', 'bob', 0)")
-db.execute("UPDATE nodes SET user_id = 'u-alice' WHERE name = 'hznodea'")
-db.execute("UPDATE nodes SET user_id = 'u-bob' WHERE name = 'hznodeb'")
+db.execute("UPDATE nodes SET user_id = 'u-alice', tags = '[]' WHERE name = 'hznodea'")
+db.execute("UPDATE nodes SET user_id = 'u-bob', tags = '[]' WHERE name = 'hznodeb'")
 db.commit()
 PY
 
@@ -1278,13 +1278,13 @@ assert_suite_admin_revoke() {
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=10)
 db.execute("INSERT OR IGNORE INTO users (id, name, is_admin) VALUES ('u-bob', 'bob', 0)")
-db.execute("UPDATE nodes SET user_id = (SELECT id FROM users WHERE name = 'alice') WHERE name = 'hznodea'")
-db.execute("UPDATE nodes SET user_id = (SELECT id FROM users WHERE name = 'bob') WHERE name = 'hznodeb'")
+db.execute("UPDATE nodes SET user_id = (SELECT id FROM users WHERE name = 'alice'), tags = '[]' WHERE name = 'hznodea'")
+db.execute("UPDATE nodes SET user_id = (SELECT id FROM users WHERE name = 'bob'), tags = '[]' WHERE name = 'hznodeb'")
 db.commit()
 PY
 
   note "断言 1：alice 名下的 a 可签发 Auth Key（FR-11 AC）"
-  if out=$(hz_cli "$a" authkey create --expiry 7d 2>&1); then
+  if out=$(hz_cli "$a" authkey create --expiry 7d --tag ci 2>&1); then
     if [[ $out == *"仅此一次显示"* && $out == *"Key ID："* ]]; then
       pass "a：hz authkey create 成功并提示仅此一次显示"
     else
@@ -1296,13 +1296,13 @@ PY
   fi
 
   note "断言 2/3：普通 User 与带 Tag 的 Node 签发被拒"
-  rc=0; out=$(hz_cli "$b" authkey create --expiry 7d 2>&1) || rc=$?
+  rc=0; out=$(hz_cli "$b" authkey create --expiry 7d --tag ci 2>&1) || rc=$?
   if (( rc != 0 )) && [[ $out == *"需要 Admin 权限"* ]]; then
     pass "b（普通 User）：签发被拒（需要 Admin 权限）"
   else
     fail "b：签发应被拒（rc=${rc}）：$out"
   fi
-  rc=0; out=$(hz_cli "$d" authkey create --expiry 7d 2>&1) || rc=$?
+  rc=0; out=$(hz_cli "$d" authkey create --expiry 7d --tag ci 2>&1) || rc=$?
   if (( rc != 0 )) && [[ $out == *"带 Tag"* ]]; then
     pass "d（带 Tag 的 Node）：管理操作被拒"
   else

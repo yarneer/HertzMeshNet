@@ -60,7 +60,7 @@ docker exec -d "$COORD" sh -c "$COORD_BIN serve \
   --dist-dir /dist --public-url http://coord:$HTTP_PORT --public-grpc-addr http://coord:$GRPC_PORT \
   --metrics-listen off > /tmp/coord.log 2>&1"
 
-BOOTSTRAP=$(docker exec "$COORD" "$COORD_BIN" bootstrap --db /data/coord.db --auth-key-expiry 1d --json)
+BOOTSTRAP=$(docker exec "$COORD" "$COORD_BIN" bootstrap --db /data/coord.db --auth-key-expiry 1d --tag ci --json)
 AUTH_KEY=$(printf '%s' "$BOOTSTRAP" | sed -n 's/.*"auth_key":"\([^"]*\)".*/\1/p')
 [ -n "$AUTH_KEY" ] || { echo "bootstrap 未返回 auth_key：$BOOTSTRAP" >&2; exit 1; }
 

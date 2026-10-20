@@ -83,10 +83,10 @@ sudo sh install.sh
 **用 Auth Key。** 管理员先在自己已加入的机器上签发（需要 Admin）：
 
 ```sh
-sudo hz authkey create --expiry 7d --once
+sudo hz authkey create --expiry 7d --once --tag server
 ```
 
-输出是 `auth_key`（明文只显示这一次）和 `key_id`（吊销时用，记下来）。`--once` 表示用一次即作废；`--tag <名字>` 可预绑定 Tag。然后在目标机器上：
+输出是 `auth_key`（明文只显示这一次）和 `key_id`（吊销时用，记下来）。`--once` 表示用一次即作废；`--tag <名字>` 必填（可多次）：用 Auth Key 注册的 Node 不归属任何 User，身份就是它的 Tag，Policy 以 `tag:<名字>` 引用它。要让机器归属到某个人，用下面的交互式登录。然后在目标机器上：
 
 ```sh
 sudo hz up --auth-key <auth_key>

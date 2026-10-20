@@ -584,6 +584,15 @@ impl Coord for CoordServiceImpl {
             })?;
 
         tracing::info!(node_id = %record.id, name = %record.name, "node registered");
+        if !crate::admin::has_tag(&record.tags) {
+            // v0.1.4 之前签发的无 Tag Key 仍可用（兼容），但注册出的 Node 既无
+            // 归属也无 Tag，Policy 覆盖不到它；处置见 runbook。
+            tracing::warn!(
+                node_id = %record.id,
+                name = %record.name,
+                "node registered with a tagless auth key: no owner and no tag, policy cannot cover it"
+            );
+        }
         let range = self.store.range_fields();
         Ok(Response::new(RegisterResponse {
             node: Some(node_info_from(record)),

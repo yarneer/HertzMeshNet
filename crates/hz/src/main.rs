@@ -68,8 +68,8 @@ enum AuthkeyCommand {
         /// 一次性 Key（用一次即作废）
         #[arg(long)]
         once: bool,
-        /// 预绑定 Tag，可多次出现
-        #[arg(long = "tag")]
+        /// 预绑定 Tag（必填，可多次出现）：Auth Key 注册的 Node 不归属 User，身份即其 Tag
+        #[arg(long = "tag", required = true)]
         tags: Vec<String>,
     },
     /// 吊销一把 Auth Key（需要 Admin；之后不可再用于注册）
@@ -923,6 +923,13 @@ fn print_identity(info: &RegisteredInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authkey_create_requires_a_tag() {
+        let base = ["hz", "authkey", "create", "--expiry", "7d"];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--tag", "db"])).is_ok());
+    }
 
     #[test]
     fn coord_hint_only_for_unregistered_without_coord() {

@@ -361,7 +361,7 @@ start_coord() {
     relay_args=()
     if [[ $HZ_RELAY == 1 && $first == 1 ]]; then relay_args=(--relay-token); fi
     ip netns exec "$WAN_NS" "$BIN_DIR/hz-coord" bootstrap --db "$db" \
-      --auth-key-expiry 1d --json ${relay_args[@]+"${relay_args[@]}"} > "$ART_DIR/key-$name.json" || die "bootstrap $name 失败"
+      --auth-key-expiry 1d --tag ci --json ${relay_args[@]+"${relay_args[@]}"} > "$ART_DIR/key-$name.json" || die "bootstrap $name 失败"
     first=0
   done < <(reg_list)
   ip netns exec "$WAN_NS" setsid "$BIN_DIR/hz-coord" serve --db "$db" --listen 0.0.0.0:443 \

@@ -166,10 +166,14 @@ kanidm group add-members hznet_admins <某人>
 ### 6.1 服务器本机引导
 
 ```sh
-sudo bash scripts/deploy/hz-bootstrap.sh --admin <与 §5 相同的登录名> --expiry 365d
+sudo bash scripts/deploy/hz-bootstrap.sh --admin <与 §5 相同的登录名> --expiry 365d --tag server
 ```
 
 - 签出第一把 Auth Key 并把名为 `<登录名>` 的 User 落库为 Admin；
+- Auth Key 必须带至少一个 Tag（`--tag` 可多次，缺省 `server`）：用 Auth Key 注册的
+  Node 不归属任何 User，身份就是它的 Tag，Policy 以 `tag:<名字>` 引用。要让某台机器
+  归属到 Admin 本人（才能在它上面执行 `hz policy push` 等管理操作），在该机器上用
+  `sudo hz login` 交互式登录，登录后它只归属 User、不再带 Tag；
 - 首次运行同时签发 Relay Token 回填 `/etc/default/hz-relay` 并重启 hz-relay；
   重复执行只签新 Auth Key，不重签 Relay Token。
 - Auth Key 与 Relay Token 都只显示一次，立即保存。
@@ -219,6 +223,36 @@ macOS 的详细冒烟步骤（utun、路由、launchd、DNS）见
 走交互式登录：打印登录链接 → 浏览器完成 Kanidm OIDC 登录 → Node 获得授权
 （FR-2）。Node 接入后用 `hz policy push <file.toml>`（Admin 名下 Node）配置
 访问规则，即可按 Policy 互访。
+
+### 6.5 从 v0.1.3 及更早版本升级：无 Tag 的 Auth Key 与 Node
+
+v0.1.4 起签发 Auth Key 必须带 Tag（`hz authkey create`、`hz-coord bootstrap`、
+`hz-bootstrap.sh`；服务端也拒绝无 Tag 的签发请求）。此前签发的无 Tag Key 会注册出
+既不归属 User、也不带 Tag 的 Node（`hz node list` 里「归属 User」为「无（Tag 注册）」
+且「Tags」为「无」），Policy 的任何规则都覆盖不到它：配置了 Policy 后它与所有 Node
+互不可达。
+
+兼容处理：已签发的无 Tag Key 在过期或吊销前仍可注册（hz-coord 每次记一条
+`node registered with a tagless auth key` 告警日志），已有的此类 Node 照常运行。
+建议升级后逐项处理：
+
+1. 找出仍有效的无 Tag Key 并吊销（Key ID 在签发时显示过；找不到时在服务器上查库）：
+
+   ```sh
+   sudo sqlite3 /var/lib/hz-coord/hznet.db \
+     "SELECT id, datetime(expires_at_unix, 'unixepoch') FROM auth_keys
+      WHERE tags = '[]' AND expires_at_unix > strftime('%s', 'now')
+        AND (single_use = 0 OR used_at_unix IS NULL);"
+   sudo hz authkey revoke <Key ID>
+   ```
+
+2. 找出无归属也无 Tag 的 Node：在 Admin 名下的机器上执行 `hz node list`，看「归属 User」
+   为「无（Tag 注册）」且「Tags」为「无」的行。按用途二选一：
+   - 属于某个人的机器：在该机器上执行 `sudo hz login`，登录后归属到登录的 User，
+     Node Name、Node Address 不变；
+   - 无人值守的服务器：Admin 签发带 Tag 的新 Key（`sudo hz authkey create --expiry 7d
+     --once --tag <名字>`），Admin 先 `hz node delete <Node ID>` 删掉旧记录，再在该机器上
+     `sudo hz up --auth-key <新 Key>` 重新注册（Node Address 可能变化）。
 
 ## 7. 日常运维
 
@@ -343,6 +377,7 @@ AC3 的三步（需要你自己的三台机器；Policy 以"dev 组可访问 db 
 | `hz up` 报连接 Coordination Server 失败 | `curl -fsS https://coord.<域名>/healthz`；不通看 `nginx -t`、`journalctl -u nginx`（SNI 分流按域名匹配，DNS 必须先生效）；证书过期看 §3 |
 | hz-coord 起不来，日志提 OIDC 发现文档 | OIDC 在启动时同步拉发现文档（`OidcClient::discover`）：确认 kanidm 已运行、正式证书已装、`/etc/default/hz-coord` 里 `--oidc-issuer` 指向 `https://auth.<域名>/oauth2/openid/hznet-coord` |
 | 交互式登录回调 404/被拒 | Kanidm 侧回调必须精确等于 `--oidc-redirect-uri`（`https://coord.<域名>/oidc/callback`）；重跑 §5 会重新 PATCH 回调 |
+| 配置 Policy 后某台 Node 与所有 Node 都不通，`hz node list` 显示「归属 User：无（Tag 注册）」「Tags：无」 | 它是用 v0.1.4 之前签发的无 Tag Auth Key 注册的，Policy 覆盖不到；按 §6.5 处置 |
 | Node 注册成功但彼此不通 | `hz status` 看路径；Relayed Path 不通查 `journalctl -u hz-relay` 与 `/etc/default/hz-relay` 的 token 是否仍为 `@RELAY_TOKEN@`（重跑 §6.1）；直连不成立时确认安全组放行 UDP 3478（STUN） |
 | `*.hznet.internal` 解析失败 | 本机是否运行第三方 TUN 类工具（§8）；macOS 看 `/etc/resolver/hznet.internal`；`hzd` 停止时系统普通 DNS 应不受影响（FR-5 AC） |
 | STUN 发现的 Endpoint 是第三方工具的出口 | hzd 外层流量应绑物理网卡（FR-7）；确认没有把 hzd 的流量导入第三方 TUN 类网络工具的虚拟网卡 |

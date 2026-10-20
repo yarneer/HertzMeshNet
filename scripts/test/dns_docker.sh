@@ -100,8 +100,8 @@ docker run -d --name "$COORD" --network "$NETWORK" \
     apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping dnsutils python3 >/dev/null
     cargo build --release -p hz-coord -p hzd -p hz 2>&1 | tail -3
     cp /target/release/hz-coord /target/release/hzd /target/release/hz /out/
-    /out/hz-coord bootstrap --db /tmp/hz.db --auth-key-expiry 1d --json > /tmp/key1.json
-    /out/hz-coord bootstrap --db /tmp/hz.db --auth-key-expiry 1d --json > /tmp/key2.json
+    /out/hz-coord bootstrap --db /tmp/hz.db --auth-key-expiry 1d --tag ci --json > /tmp/key1.json
+    /out/hz-coord bootstrap --db /tmp/hz.db --auth-key-expiry 1d --tag ci --json > /tmp/key2.json
     exec /out/hz-coord serve --db /tmp/hz.db --listen 0.0.0.0:443
   ' >/dev/null 2>&1
 

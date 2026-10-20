@@ -2,21 +2,23 @@
 # 首次引导（docs/runbook.md §6）：种第一个 Admin、签第一把 Auth Key；若
 # /etc/default/hz-relay 仍是 Relay Token 占位符，则顺带签发 Relay Token 回填
 # 并重启 hz-relay。Auth Key 与 Relay Token 都只在签发时显示一次。
-# 用法：hz-bootstrap.sh [--admin <名字>] [--expiry 90d] [--once] [--no-systemctl]
+# 用法：hz-bootstrap.sh [--admin <名字>] [--tag <名字>]... [--expiry 90d] [--once] [--no-systemctl]
 # 部署脚本依赖 bash；被 /bin/sh（Debian 的 dash 等）执行时在 set -o pipefail
 # 前给出明确指引，而不是 "Illegal option -o pipefail"。
 [ -n "${BASH_VERSION:-}" ] || { echo "本脚本需要 bash 运行：sudo bash $0 <参数>" >&2; exit 1; }
 set -euo pipefail
 
 ADMIN=""
+TAGS=()
 EXPIRY="90d"
 ONCE=0
 NO_SYSTEMCTL=0
 
 usage() {
   cat >&2 <<'USAGE'
-用法: hz-bootstrap.sh [--admin <名字>] [--expiry 90d] [--once] [--no-systemctl]
+用法: hz-bootstrap.sh [--admin <名字>] [--tag <名字>]... [--expiry 90d] [--once] [--no-systemctl]
 说明: --admin 与 kanidm-init.sh 的 --admin-name 一致时，该 User 名下 Node 可远程管理；
+      --tag 是这把 Auth Key 注册出的 Node 的身份（可多次，缺省 server），Policy 以 tag:<名字> 引用；
       重复执行会签发新的 Auth Key（旧 Key 不受影响）；Relay Token 已回填过则不再重签。
 USAGE
   exit 1
@@ -26,6 +28,7 @@ die() { echo "hz-bootstrap: ${1}" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --admin) ADMIN="${2:?--admin 需要值}" ; shift 2 ;;
+    --tag) TAGS+=("${2:?--tag 需要值}") ; shift 2 ;;
     --expiry) EXPIRY="${2:?--expiry 需要值}" ; shift 2 ;;
     --once) ONCE=1 ; shift ;;
     --no-systemctl) NO_SYSTEMCTL=1 ; shift ;;
@@ -62,7 +65,10 @@ if [ -f "${RELAY_ENV}" ] && grep -q '@RELAY_TOKEN@' "${RELAY_ENV}"; then
   NEED_TOKEN=1
 fi
 
+# Auth Key 必须带 Tag：无 Tag 的 Key 注册出的 Node 既不归属 User 也没有 Tag，Policy 覆盖不到。
+[ "${#TAGS[@]}" -gt 0 ] || TAGS=(server)
 args=(--db "${DB}" --auth-key-expiry "${EXPIRY}" --json)
+for tag in "${TAGS[@]}"; do args+=(--tag "${tag}"); done
 [ -n "${ADMIN}" ] && args+=(--admin "${ADMIN}")
 [ "${ONCE}" = "1" ] && args+=(--once)
 [ "${NEED_TOKEN}" = "1" ] && args+=(--relay-token)
@@ -88,6 +94,8 @@ expires_human=$(python3 -c "import datetime; print(datetime.datetime.fromtimesta
 echo ""
 echo "引导完成。以下凭据仅此一次显示，请立即保存："
 printf 'Auth Key（%s 前有效）：%s\n' "${expires_human}" "${auth_key}"
+tags_joined=$(IFS=,; echo "${TAGS[*]}")
+printf 'Tags：%s（用这把 Key 注册的 Node 以此为身份）\n' "${tags_joined}"
 if [ -n "${ADMIN}" ]; then
   printf '已落库为 Admin 的 User：%s\n' "${ADMIN}"
 fi

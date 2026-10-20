@@ -766,7 +766,8 @@ impl Store {
         let mut tx = self.begin_write().await?;
         if let Some(mut existing) = node_by_machine_key(&mut tx, machine_key_pub).await? {
             sqlx::query(
-                "UPDATE nodes SET node_key_pub = ?1, user_id = ?2, expires_at_unix = ?3 WHERE id = ?4",
+                // 归属 User 与带 Tag 互斥（GLOSSARY）：带 Tag 的 Node 经登录归属后清空 Tag。
+                "UPDATE nodes SET node_key_pub = ?1, user_id = ?2, expires_at_unix = ?3, tags = '[]' WHERE id = ?4",
             )
             .bind(node_key_pub)
             .bind(user_id)
@@ -779,6 +780,7 @@ impl Store {
             self.notify_change();
             existing.node_key_pub = node_key_pub.to_vec();
             existing.expires_at_unix = Some(expires_at_unix);
+            existing.tags.clear();
             existing.owner_user = Some(
                 sqlx::query("SELECT name FROM users WHERE id = ?1")
                     .bind(user_id)
