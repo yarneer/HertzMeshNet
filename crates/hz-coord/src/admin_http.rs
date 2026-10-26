@@ -3,8 +3,9 @@
 //! 会话只发给 Kanidm `hznet_admins`（[`crate::oidc::UserClaims::is_admin`]，
 //! 与 GLOSSARY 的 Admin 是同一件事）。没有第二套管理员口令。
 //! Node / Auth Key / Policy / 健康 / 备份 REST 加在 [`api_router`]，外层门禁
-//! 已经挡住没有会话的请求。浏览器页面加在 [`browser_entry`] 旁边；未登录走
-//! 重定向，`/admin/api` 走 JSON 401。领域逻辑仍用 [`crate::admin`]，不在这里复制。
+//! 已经挡住没有会话的请求。浏览器壳在 [`browser_entry`]（静态文件见
+//! [`crate::admin_ui`]）：未登录走重定向，`/admin/api` 走 JSON 401。领域逻辑
+//! 仍用 [`crate::admin`]，不在这里复制。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -226,15 +227,36 @@ async fn api_not_found() -> Response {
     not_found()
 }
 
-/// `/admin` 与 `/admin/`。未登录去 `/admin/login`；已登录留给静态页（#44）。
+/// `/admin` 与 `/admin/`。未登录去 `/admin/login`；已登录返回静态壳。
 pub(crate) async fn browser_entry(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
 ) -> Response {
-    if session_from(&state, &headers).is_some() {
-        return (StatusCode::NOT_FOUND, "Admin Console 页面尚未提供").into_response();
-    }
-    Redirect::temporary("/admin/login").into_response()
+    gated(&state, &headers, crate::admin_ui::index())
+}
+
+pub(crate) async fn console_css(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> Response {
+    gated(&state, &headers, crate::admin_ui::css())
+}
+
+pub(crate) async fn console_js(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> Response {
+    gated(&state, &headers, crate::admin_ui::js())
+}
+
+fn login_redirect(state: &HttpState, headers: &HeaderMap) -> Option<Response> {
+    session_from(state, headers)
+        .is_none()
+        .then(|| Redirect::temporary("/admin/login").into_response())
+}
+
+fn gated(state: &HttpState, headers: &HeaderMap, response: Response) -> Response {
+    login_redirect(state, headers).unwrap_or(response)
 }
 
 pub(crate) async fn login(State(state): State<Arc<HttpState>>) -> Response {
@@ -575,7 +597,12 @@ mod tests {
             .unwrap();
         assert_api_error(missing, 401, UNAUTHENTICATED, UNAUTHENTICATED_MESSAGE).await;
 
-        for path in ["/admin", "/admin/"] {
+        for path in [
+            "/admin",
+            "/admin/",
+            "/admin/console.css",
+            "/admin/console.js",
+        ] {
             let response = client.get(format!("{base}{path}")).send().await.unwrap();
             assert_eq!(response.status(), 307, "{path}");
             assert_eq!(response.headers()["location"], "/admin/login");
@@ -638,8 +665,72 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(page.status(), 404);
-        assert!(page.text().await.unwrap().contains("尚未提供"));
+        assert_eq!(page.status(), 200);
+        assert!(
+            page.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert_eq!(page.headers()["cache-control"], "no-store");
+        let html = page.text().await.unwrap();
+        for needle in [
+            "href=\"#nodes\">Nodes",
+            "href=\"#keys\">Auth Keys",
+            "href=\"#ops\">健康与运维",
+            "href=\"#policy\">Policy",
+            "href=\"#wizard\">部署向导",
+            "<p>即将就绪</p>",
+            "/admin/console.css",
+            "/admin/console.js",
+        ] {
+            assert!(html.contains(needle), "{needle} missing");
+        }
+        assert_eq!(html.matches("<p>即将就绪</p>").count(), 5);
+
+        let bare = client
+            .get(format!("{base}/admin"))
+            .header("cookie", cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), 200);
+        assert!(bare.text().await.unwrap().contains("Admin Console"));
+
+        let css = client
+            .get(format!("{base}/admin/console.css"))
+            .header("cookie", cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(css.status(), 200);
+        assert!(
+            css.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/css")
+        );
+        assert!(css.text().await.unwrap().contains("nav a"));
+
+        let js = client
+            .get(format!("{base}/admin/console.js"))
+            .header("cookie", cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(js.status(), 200);
+        assert!(
+            js.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        assert!(
+            js.text()
+                .await
+                .unwrap()
+                .contains("fetch(\"/admin/api/me\")")
+        );
 
         let replay = client
             .get(format!("{base}/admin/oidc/callback"))

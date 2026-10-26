@@ -3,6 +3,7 @@
 pub mod addr;
 pub mod admin;
 pub mod admin_http;
+pub mod admin_ui;
 pub mod authkey;
 pub mod challenge;
 pub mod cli;
