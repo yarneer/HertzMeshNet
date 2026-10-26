@@ -23,6 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 
+use crate::admin_http::{ConsoleState, OpsConfig};
 use crate::authkey;
 use crate::challenge::{CHALLENGE_TTL, Challenge, ChallengeCache};
 use crate::http::{DistConfig, DistState, HttpHandle, HttpState, serve_http};
@@ -61,6 +62,8 @@ pub struct ServeConfig {
     pub login_ttl: Duration,
     /// 交互式登录授予的 Node 有效期（默认 90 天）。
     pub login_node_ttl_secs: i64,
+    /// Admin Console 备份脚本、数据库路径、备份目录与证书目录。
+    pub ops: OpsConfig,
 }
 
 impl ServeConfig {
@@ -78,6 +81,7 @@ impl ServeConfig {
             public_url: None,
             login_ttl: LOGIN_TTL,
             login_node_ttl_secs: LOGIN_NODE_TTL_SECS,
+            ops: OpsConfig::default(),
         }
     }
 }
@@ -220,6 +224,8 @@ impl ServeHandle {
 pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     let store = config.store;
     let hub = Arc::new(MapHub::new());
+    // 健康页与 /metrics 读同一份计数；HTTP 面先于指标监听拉起，所以先建好。
+    let metrics = Arc::new(Metrics::new()?);
 
     let dist_state = match config.dist {
         Some(dist_config) => Some(Arc::new(DistState::build(&dist_config)?)),
@@ -243,6 +249,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
             login_node_ttl_secs: config.login_node_ttl_secs,
             dist: dist_state,
             admin: crate::admin_http::AdminGate::default(),
+            console: ConsoleState::with_runtime(config.ops.clone(), hub.clone(), metrics.clone()),
         });
         let http = serve_http(http_listen, http_state).await?;
         let base = login_base_url(
@@ -259,7 +266,6 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         None => (None, None),
     };
     let http_addr = http_handle.as_ref().map(|http| http.local_addr);
-    let metrics = Arc::new(Metrics::new()?);
     let metrics_handle = match config.metrics_listen {
         Some(listen) => Some(serve_metrics(listen, hub.clone(), metrics.clone()).await?),
         None => None,

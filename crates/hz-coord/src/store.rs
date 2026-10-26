@@ -47,6 +47,7 @@ pub enum NodeScope {
 }
 
 /// 管理列表的一行：Node 的身份字段 + 吊销标记（不含数据面字段）。
+/// `created_at_unix` / `revoked_at_unix` 是注册与吊销时刻，Admin Console 用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedNode {
     pub node_id: String,
@@ -57,6 +58,8 @@ pub struct ListedNode {
     pub owner_user: Option<String>,
     pub expires_at_unix: Option<i64>,
     pub revoked: bool,
+    pub revoked_at_unix: Option<i64>,
+    pub created_at_unix: i64,
 }
 
 /// 改名的失败（成功返回更新后的记录）。
@@ -592,7 +595,8 @@ impl Store {
 
     pub async fn list_nodes(&self, scope: &NodeScope) -> anyhow::Result<Vec<ListedNode>> {
         let base = "SELECT n.id, n.name, n.ipv4, n.ipv6, n.tags, u.name AS owner_user,
-                    n.expires_at_unix, (n.revoked_at_unix IS NOT NULL) AS revoked
+                    n.expires_at_unix, n.revoked_at_unix, n.created_at_unix,
+                    (n.revoked_at_unix IS NOT NULL) AS revoked
              FROM nodes n LEFT JOIN users u ON u.id = n.user_id";
         let rows = match scope {
             NodeScope::All => sqlx::query(base).fetch_all(&self.pool).await?,
@@ -616,6 +620,8 @@ impl Store {
                 owner_user: row.try_get("owner_user").ok().flatten(),
                 expires_at_unix: row.get("expires_at_unix"),
                 revoked: row.get::<i64, _>("revoked") != 0,
+                revoked_at_unix: row.get("revoked_at_unix"),
+                created_at_unix: row.get("created_at_unix"),
             })
             .collect())
     }
