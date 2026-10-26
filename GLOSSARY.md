@@ -54,6 +54,10 @@ _Avoid_: WireGuard Key, Session Key, Public Key（未加限定时）
 私有云上集中部署的控制面，负责 Node 的注册、身份认证与网络信息分发；不转发 Node 之间的业务流量。
 _Avoid_: Control Server, Controller, Master, 服务端
 
+**Admin Console**:
+给 Admin 使用的浏览器界面，用来管理 HzNet（Node 列表、Auth Key、健康状态、有限的运维操作）。
+_Avoid_: Dashboard, Portal, Web UI
+
 **Relay**:
 带公网入口的中转服务，在两个 Node 无法直连时代为转发已加密的流量。
 _Avoid_: DERP, TURN, Proxy, 中继服务器（作为别名可接受，但代码与文档用 Relay）
