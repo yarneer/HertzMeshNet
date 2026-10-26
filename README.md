@@ -152,3 +152,10 @@ All MVP feature tickets (registration, data plane, NAT traversal, Map streaming,
 | [docs/runbook.md](docs/runbook.md) | 云主机部署与运维手册 / Cloud deployment & operations runbook |
 | [docs/mvp-tasks.md](docs/mvp-tasks.md) | 任务分解与进度 / Task breakdown & progress |
 | [GLOSSARY.md](GLOSSARY.md) | 术语表（中英）/ Terminology (bilingual) |
+
+## 许可证 · License
+
+Copyright 2026 Xin Li (yarneer)
+
+本仓库以 [Apache License 2.0](LICENSE) 授权。
+Licensed under the [Apache License, Version 2.0](LICENSE).

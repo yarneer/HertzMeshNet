@@ -13,6 +13,7 @@ members = [
 version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 hz-core = { path = "crates/hz-core" }

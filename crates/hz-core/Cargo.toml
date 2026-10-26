@@ -3,6 +3,7 @@ name = "hz-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 hz-proto.workspace = true
