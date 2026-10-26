@@ -26,6 +26,9 @@ enum Command {
         /// Auth Key 明文（hz-coord bootstrap 签发）；缺省时走交互式登录
         #[arg(long)]
         auth_key: Option<String>,
+        /// 短邀请码（#55，形如 HZ-XXXX-XXXX）；与 --auth-key 二选一
+        #[arg(long)]
+        invite: Option<String>,
         /// Coordination Server 地址（缺省由 hzd 决定：注册时记下的地址，其次 hzd 的 HZD_COORD_ADDR，再退到内置占位地址）
         #[arg(long)]
         coord: Option<String>,
@@ -46,6 +49,11 @@ enum Command {
         #[command(subcommand)]
         command: AuthkeyCommand,
     },
+    /// 邀请码管理（#55：短码邀请同事装机；需要 Admin）
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
+    },
     /// Node 管理（FR-11：列表 / 改名 / 删除 / 吊销）
     Node {
         #[command(subcommand)]
@@ -55,6 +63,35 @@ enum Command {
     Ping {
         /// 对端 Node Name 或 node id
         node: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InviteCommand {
+    /// 生成邀请码（明文仅显示一次；口头或 IM 转述给同事）
+    Create {
+        /// 邀请码有效期（如 15m、1h；默认 15m）
+        #[arg(long)]
+        ttl: Option<String>,
+        /// 最大使用次数（团队批量装机可调大；默认 1）
+        #[arg(long)]
+        uses: Option<i64>,
+        /// 带 Tag 的无主邀请（与 --for-user 二选一）
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// 有主邀请：注册出的 Node 归属该 User（与 --tag 二选一）
+        #[arg(long)]
+        for_user: Option<String>,
+        /// 有主邀请的 Node 有效期天数（默认 90）
+        #[arg(long)]
+        node_ttl_days: Option<i64>,
+    },
+    /// 列出邀请码（含使用计数与吊销状态）
+    List,
+    /// 吊销邀请码
+    Revoke {
+        /// 邀请 id（hz invite list 里查）
+        invite_id: String,
     },
 }
 
@@ -128,10 +165,15 @@ async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Status { json } => status(json).await,
-        Command::Up { auth_key, coord } => up(auth_key, coord).await,
-        Command::Login { coord } => up(None, coord).await,
+        Command::Up {
+            auth_key,
+            invite,
+            coord,
+        } => up(auth_key, invite, coord).await,
+        Command::Login { coord } => up(None, None, coord).await,
         Command::Policy { command } => policy(command).await,
         Command::Authkey { command } => authkey(command).await,
+        Command::Invite { command } => invite(command).await,
         Command::Node { command } => node(command).await,
         Command::Ping { node } => ping(node).await,
     }
@@ -196,6 +238,132 @@ async fn policy(command: PolicyCommand) -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         PolicyCommand::Get => print_policy(&result),
+    }
+}
+
+/// 邀请码子命令（#55）：统一经本地 hzd 转发，Admin 权限在服务端判定。
+async fn invite(command: InviteCommand) -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = match &command {
+        InviteCommand::Create {
+            ttl,
+            uses,
+            tags,
+            for_user,
+            node_ttl_days,
+        } => {
+            let ttl_secs = match ttl {
+                Some(text) => match parse_duration_secs(text) {
+                    Ok(secs) => secs,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                None => 900,
+            };
+            if for_user.is_some() && !tags.is_empty() {
+                eprintln!("--for-user 与 --tag 只能二选一");
+                return std::process::ExitCode::FAILURE;
+            }
+            Request::new(
+                14,
+                "invite_create",
+                serde_json::json!({
+                    "ttl_secs": ttl_secs,
+                    "max_uses": uses.unwrap_or(1),
+                    "tags": tags,
+                    "owner_name": for_user,
+                    "node_ttl_days": node_ttl_days,
+                }),
+            )
+        }
+        InviteCommand::List => Request::new(15, "invite_list", serde_json::json!({})),
+        InviteCommand::Revoke { invite_id } => Request::new(
+            16,
+            "invite_revoke",
+            serde_json::json!({ "invite_id": invite_id }),
+        ),
+    };
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match response {
+        Response::Ok { result, .. } => {
+            print_invite_result(&command, &result);
+            std::process::ExitCode::SUCCESS
+        }
+        Response::Error { error, .. } => {
+            eprintln!("{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_invite_result(command: &InviteCommand, result: &serde_json::Value) {
+    match command {
+        InviteCommand::Create { .. } => {
+            println!("邀请码（仅此一次显示，请立即转述给对方）：");
+            println!("{}", result["invite_code"].as_str().unwrap_or("?"));
+            println!("对方装机后执行：hz up --invite <上面的码>");
+        }
+        InviteCommand::List => {
+            if let Some(list) = result["invites"].as_array() {
+                println!(
+                    "{:<12} {:<20} {:<10} {:<10} {:<10} {:<6}",
+                    "id", "过期时刻", "已用/上限", "归属", "Tag", "状态"
+                );
+                for item in list {
+                    let revoked =
+                        item["revoked_at_unix"].is_u64() || item["revoked_at_unix"].is_i64();
+                    let status = if revoked { "已吊销" } else { "有效" };
+                    let expiry = chrono::DateTime::from_timestamp(
+                        item["expires_at_unix"].as_i64().unwrap_or_default(),
+                        0,
+                    )
+                    .map(|t| t.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "?".into());
+                    println!(
+                        "{:<12} {:<20} {}/{}{:>8} {:<12} {}",
+                        item["invite_id"].as_str().unwrap_or("?"),
+                        expiry,
+                        item["use_count"].as_i64().unwrap_or_default(),
+                        item["max_uses"].as_i64().unwrap_or_default(),
+                        "",
+                        item["owner_name"]
+                            .as_str()
+                            .or_else(|| item["tags"]
+                                .as_array()
+                                .and_then(|t| t.iter().filter_map(|v| v.as_str()).next())
+                                .map(|_| "…"))
+                            .unwrap_or("-"),
+                        status,
+                    );
+                }
+            }
+        }
+        InviteCommand::Revoke { .. } => println!("已吊销"),
+    }
+}
+
+/// 解析 15m / 1h / 30s 一类的短时长。
+fn parse_duration_secs(text: &str) -> Result<i64, String> {
+    let trimmed = text.trim();
+    let (num, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
+    let value: i64 = num
+        .parse()
+        .map_err(|_| format!("无法解析时长：{text}（形如 15m、1h、30s）"))?;
+    match unit {
+        "s" => Ok(value),
+        "m" => Ok(value * 60),
+        "h" => Ok(value * 3600),
+        "d" => Ok(value * 86400),
+        _ => Err(format!("未知时间单位：{unit}（支持 s/m/h/d）")),
     }
 }
 
@@ -485,11 +653,22 @@ async fn status(json_output: bool) -> std::process::ExitCode {
     }
 }
 
-async fn up(auth_key: Option<String>, coord: Option<String>) -> std::process::ExitCode {
+async fn up(
+    auth_key: Option<String>,
+    invite: Option<String>,
+    coord: Option<String>,
+) -> std::process::ExitCode {
+    if auth_key.is_some() && invite.is_some() {
+        eprintln!("--auth-key 与 --invite 只能二选一");
+        return std::process::ExitCode::FAILURE;
+    }
     let socket = paths::socket_path();
     let mut params = serde_json::json!({});
     if let Some(auth_key) = auth_key {
         params["auth_key"] = serde_json::Value::String(auth_key);
+    }
+    if let Some(invite) = invite {
+        params["invite_code"] = serde_json::Value::String(invite);
     }
     let registered = if coord.is_none() {
         hzd_registered(&socket).await

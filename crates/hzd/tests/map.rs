@@ -41,7 +41,7 @@ async fn daemon_subscribes_to_map_and_lists_peers_after_up() {
 
     // 先注册第二个 Node，hzd 的 Network Map 里就应当能看到它。
     let other_dir = tempfile::tempdir().unwrap();
-    let other = register_with_auth_key(other_dir.path(), &auth_key, "node-b", &coord_addr)
+    let other = register_with_auth_key(other_dir.path(), &auth_key, None, "node-b", &coord_addr)
         .await
         .unwrap();
 

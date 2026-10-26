@@ -13,7 +13,8 @@ use ed25519_dalek::Signer;
 use hyper_util::rt::TokioIo;
 use hz_proto::coord_client::CoordClient;
 use hz_proto::{
-    AdminCreateAuthKeyRequest, AdminRevokeAuthKeyRequest, BeginLoginRequest, DeleteNodeRequest,
+    AdminCreateAuthKeyRequest, AdminCreateInviteRequest, AdminListInvitesRequest,
+    AdminRevokeAuthKeyRequest, AdminRevokeInviteRequest, BeginLoginRequest, DeleteNodeRequest,
     HelloRequest, ListNodesRequest, LoginStatusRequest, PROTOCOL_VERSION, PolicyGetRequest,
     PolicyPushRequest, PolicyRollbackRequest, RegisterAuthKeyRequest, RenameNodeRequest,
     ReportEndpointsRequest, RevokeNodeRequest, StreamMapRequest,
@@ -34,6 +35,7 @@ pub const DEFAULT_COORD_ADDR: &str = "https://coord.hznet.internal:443";
 pub async fn register_with_auth_key(
     state_dir: &Path,
     auth_key: &str,
+    invite_code: Option<&str>,
     hostname: &str,
     coord_addr: &str,
 ) -> anyhow::Result<RegisteredInfo> {
@@ -59,6 +61,7 @@ pub async fn register_with_auth_key(
             challenge_nonce: nonce,
             challenge_signature: signature.to_vec(),
             auth_key: auth_key.to_owned(),
+            invite_code: invite_code.map(str::to_string),
             node_key_pub: keys.node_public().to_vec(),
         })
         .await
@@ -425,6 +428,20 @@ pub struct IssuedAuthKey {
     pub key_id: String,
 }
 
+pub struct IssuedInvite {
+    pub invite_code: String,
+}
+
+pub struct InviteSummary {
+    pub invite_id: String,
+    pub expires_at_unix: i64,
+    pub max_uses: i64,
+    pub use_count: i64,
+    pub tags: Vec<String>,
+    pub owner_name: Option<String>,
+    pub revoked: bool,
+}
+
 /// 管理列表的一行（服务端 AdminNodeInfo 的对应物）。
 /// Serialize 供 hzd 原样透传给 `hz node list --json`。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -472,6 +489,93 @@ pub async fn admin_create_auth_key(
 }
 
 /// 吊销 Auth Key（仅 Admin）。
+pub async fn admin_create_invite(
+    state_dir: &Path,
+    coord_addr: &str,
+    ttl_secs: i64,
+    max_uses: i64,
+    tags: &[String],
+    owner_name: Option<String>,
+    node_ttl_days: Option<i64>,
+) -> anyhow::Result<IssuedInvite> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .admin_create_invite(AdminCreateInviteRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            ttl_secs,
+            max_uses,
+            tags: tags.to_vec(),
+            owner_name,
+            node_ttl_days,
+        })
+        .await?;
+    Ok(IssuedInvite {
+        invite_code: response.into_inner().invite_code,
+    })
+}
+
+pub async fn admin_list_invites(
+    state_dir: &Path,
+    coord_addr: &str,
+) -> anyhow::Result<Vec<InviteSummary>> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    let response = client
+        .admin_list_invites(AdminListInvitesRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+        })
+        .await?;
+    Ok(response
+        .into_inner()
+        .invites
+        .into_iter()
+        .map(|info| InviteSummary {
+            invite_id: info.invite_id,
+            expires_at_unix: info.expires_at_unix,
+            max_uses: info.max_uses,
+            use_count: info.use_count,
+            tags: info.tags,
+            owner_name: info.owner_name,
+            revoked: info.revoked_at_unix.is_some(),
+        })
+        .collect())
+}
+
+pub async fn admin_revoke_invite(
+    state_dir: &Path,
+    coord_addr: &str,
+    invite_id: &str,
+) -> anyhow::Result<()> {
+    let keys = KeyStore::load_or_create(state_dir)?;
+    let channel = connect(coord_addr).await?;
+    let mut client = CoordClient::new(channel);
+    let (nonce, signature) = signed_challenge(&mut client, &keys, &local_hostname()).await?;
+    client
+        .admin_revoke_invite(AdminRevokeInviteRequest {
+            protocol_version: PROTOCOL_VERSION,
+            machine_key_pub: keys.machine_public().to_vec(),
+            hostname: local_hostname(),
+            challenge_nonce: nonce,
+            challenge_signature: signature,
+            invite_id: invite_id.to_owned(),
+        })
+        .await?;
+    Ok(())
+}
+
 pub async fn admin_revoke_auth_key(
     state_dir: &Path,
     coord_addr: &str,

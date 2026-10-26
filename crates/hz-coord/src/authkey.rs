@@ -16,6 +16,32 @@ pub fn generate_plaintext() -> String {
     format!("{PREFIX}{}", B64URL.encode(bytes))
 }
 
+/// 邀请码（#55）：`HZ-XXXX-XXXX`，8 字符取自 32 位无歧义字母表（去
+/// 0/O/1/I/L），约 40 bit 熵——可口头转述、可对抗配合限速的在线爆破。
+const INVITE_PREFIX: &str = "HZ-";
+const INVITE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+pub fn generate_invite_code() -> String {
+    let mut bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    let body: String = bytes
+        .iter()
+        .map(|b| INVITE_ALPHABET[(*b as usize) % INVITE_ALPHABET.len()] as char)
+        .collect();
+    format!("{INVITE_PREFIX}{}-{}", &body[..4], &body[4..])
+}
+
+/// 规范化：去 HZ- 前缀、去连字符、大写——生成与校验共用同一形再哈希，
+/// 用户输入大小写或连字符差异都能命中。
+pub fn normalize_invite(code: &str) -> String {
+    code.trim()
+        .strip_prefix(INVITE_PREFIX)
+        .unwrap_or(code.trim())
+        .replace(['-', ' '], "")
+        .replace('\t', "")
+        .to_uppercase()
+}
+
 /// Relay 呈给 Coordination Server 的长启用期共享令牌；库里同样只存 sha256。
 pub fn generate_relay_token() -> String {
     let mut bytes = [0u8; KEY_RANDOM_BYTES];

@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use hz_core::coord_client::{
     DEFAULT_COORD_ADDR, LoginPoll, PunchCounters, StartedLogin, admin_create_auth_key,
-    admin_revoke_auth_key, begin_interactive_login, delete_node, list_nodes, local_hostname,
-    open_network_map_stream, policy_get, policy_push, policy_rollback, poll_login_status,
-    register_with_auth_key, rename_node, report_endpoints, revoke_node,
+    admin_create_invite, admin_list_invites, admin_revoke_auth_key, admin_revoke_invite,
+    begin_interactive_login, delete_node, list_nodes, local_hostname, open_network_map_stream,
+    policy_get, policy_push, policy_rollback, poll_login_status, register_with_auth_key,
+    rename_node, report_endpoints, revoke_node,
 };
 use hz_core::endpoint::{self, DiscoveredEndpoint};
 use hz_core::ipc::{self, Handler};
@@ -382,11 +383,26 @@ async fn handle_request(
                 std::env::var("HZD_COORD_ADDR").ok().as_deref(),
             );
 
-            match request.params.get("auth_key").and_then(|v| v.as_str()) {
+            let invite_code = request
+                .params
+                .get("invite_code")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            match request
+                .params
+                .get("auth_key")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| invite_code.clone())
+            {
                 Some(auth_key) => {
+                    // 邀请码与 Auth Key 共用同一通道：有 invite 时 auth_key 传空串，
+                    // 服务端按 invite_code 字段优先走短码核销。
+                    let auth_key = if invite_code.is_some() { "" } else { &auth_key };
                     let info = register_with_auth_key(
                         &daemon.state_dir,
                         auth_key,
+                        invite_code.as_deref(),
                         &local_hostname(),
                         &coord_addr,
                     )
@@ -528,6 +544,81 @@ async fn handle_request(
                 .await
                 .map_err(|error| format!("{error:#}"))?;
             Ok(serde_json::json!({}))
+        }
+        "invite_create" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let ttl_secs = request
+                .params
+                .get("ttl_secs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(900);
+            let max_uses = request
+                .params
+                .get("max_uses")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1);
+            let tags: Vec<String> = request
+                .params
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let owner_name = request
+                .params
+                .get("owner_name")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let node_ttl_days = request.params.get("node_ttl_days").and_then(|v| v.as_i64());
+            let issued = admin_create_invite(
+                &daemon.state_dir,
+                &coord_addr,
+                ttl_secs,
+                max_uses,
+                &tags,
+                owner_name,
+                node_ttl_days,
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({ "invite_code": issued.invite_code }))
+        }
+        "invite_list" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let invites = admin_list_invites(&daemon.state_dir, &coord_addr)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            let items: Vec<serde_json::Value> = invites
+                .into_iter()
+                .map(|summary| {
+                    serde_json::json!({
+                        "invite_id": summary.invite_id,
+                        "expires_at_unix": summary.expires_at_unix,
+                        "max_uses": summary.max_uses,
+                        "use_count": summary.use_count,
+                        "tags": summary.tags,
+                        "owner_name": summary.owner_name,
+                        "revoked": summary.revoked,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "invites": items }))
+        }
+        "invite_revoke" => {
+            let coord_addr = daemon_coord_addr(&daemon)?;
+            let invite_id = request
+                .params
+                .get("invite_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "缺少 invite_id".to_string())?;
+            admin_revoke_invite(&daemon.state_dir, &coord_addr, invite_id)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(serde_json::json!({ "revoked": invite_id }))
         }
         "node_list" => {
             let coord_addr = daemon_coord_addr(&daemon)?;

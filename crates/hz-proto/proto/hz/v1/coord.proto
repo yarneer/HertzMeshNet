@@ -36,6 +36,9 @@ service Coord {
   rpc AdminCreateAuthKey(AdminCreateAuthKeyRequest) returns (AdminCreateAuthKeyResponse);
   // 吊销 Auth Key（仅 Admin）：吊销后不可再用于注册。
   rpc AdminRevokeAuthKey(AdminRevokeAuthKeyRequest) returns (AdminRevokeAuthKeyResponse);
+  rpc AdminCreateInvite(AdminCreateInviteRequest) returns (AdminCreateInviteResponse);
+  rpc AdminListInvites(AdminListInvitesRequest) returns (AdminListInvitesResponse);
+  rpc AdminRevokeInvite(AdminRevokeInviteRequest) returns (AdminRevokeInviteResponse);
   // 列出 Node（Admin 看全部含已吊销；普通 User 只看自己名下）。
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   // 改名（Admin 任意 Node；普通 User 仅自己名下）：新名规范化后须唯一。
@@ -63,6 +66,8 @@ message RegisterAuthKeyRequest {
   bytes challenge_signature = 2;
   string auth_key = 3;
   bytes node_key_pub = 4;
+  // 短邀请码（#55）：设置时忽略 auth_key，按邀请的归属/Tag/有效期注册。
+  optional string invite_code = 5;
 }
 
 message RegisterResponse {
@@ -310,6 +315,68 @@ message AdminRevokeAuthKeyRequest {
 }
 
 message AdminRevokeAuthKeyResponse {}
+// —— 邀请码管理（#55）——
+
+message AdminCreateInviteRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  // 邀请码有效期（秒），默认 900（15 分钟）。
+  int64 ttl_secs = 6;
+  // 最大使用次数，默认 1。
+  int64 max_uses = 7;
+  // 带 Tag 的无主邀请（与 owner_name 二选一）。
+  repeated string tags = 8;
+  // 有主邀请：注册出的 Node 归属该 User（与 tags 二选一）。
+  optional string owner_name = 9;
+  // 有主邀请的 Node 有效期（天），默认 90。
+  optional int64 node_ttl_days = 10;
+}
+
+message AdminCreateInviteResponse {
+  // 明文邀请码（HZ-XXXX-XXXX），仅此一次返回。
+  string invite_code = 1;
+  string invite_id = 2;
+}
+
+message AdminListInvitesRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+}
+
+message InviteInfo {
+  string invite_id = 1;
+  int64 created_at_unix = 2;
+  int64 expires_at_unix = 3;
+  int64 max_uses = 4;
+  int64 use_count = 5;
+  repeated string tags = 6;
+  optional string owner_name = 7;
+  optional int64 node_ttl_days = 8;
+  string created_by = 9;
+  optional int64 last_used_at_unix = 10;
+  optional int64 revoked_at_unix = 11;
+}
+
+message AdminListInvitesResponse {
+  repeated InviteInfo invites = 1;
+}
+
+message AdminRevokeInviteRequest {
+  uint32 protocol_version = 1;
+  bytes machine_key_pub = 2;
+  string hostname = 3;
+  bytes challenge_nonce = 4;
+  bytes challenge_signature = 5;
+  string invite_id = 6;
+}
+
+message AdminRevokeInviteResponse {}
 
 message ListNodesRequest {
   uint32 protocol_version = 1;

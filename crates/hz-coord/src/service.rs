@@ -9,13 +9,15 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION;
 use hz_proto::coord_server::{Coord, CoordServer};
 use hz_proto::{
-    AdminCreateAuthKeyRequest, AdminCreateAuthKeyResponse, AdminNodeInfo,
-    AdminRevokeAuthKeyRequest, AdminRevokeAuthKeyResponse, BeginLoginRequest, BeginLoginResponse,
-    DeleteNodeRequest, DeleteNodeResponse, HelloRequest, HelloResponse, ListNodesRequest,
-    ListNodesResponse, LoginStatusRequest, LoginStatusResponse, NetworkMapMessage,
-    PolicyGetRequest, PolicyGetResponse, PolicyPushRequest, PolicyPushResponse,
-    PolicyRollbackRequest, PolicyRollbackResponse, PolicyVersionInfo, RegisterAuthKeyRequest,
-    RegisterResponse, RelayCheckRequest, RelayCheckResponse, RenameNodeRequest, RenameNodeResponse,
+    AdminCreateAuthKeyRequest, AdminCreateAuthKeyResponse, AdminCreateInviteRequest,
+    AdminCreateInviteResponse, AdminListInvitesRequest, AdminListInvitesResponse, AdminNodeInfo,
+    AdminRevokeAuthKeyRequest, AdminRevokeAuthKeyResponse, AdminRevokeInviteRequest,
+    AdminRevokeInviteResponse, BeginLoginRequest, BeginLoginResponse, DeleteNodeRequest,
+    DeleteNodeResponse, HelloRequest, HelloResponse, ListNodesRequest, ListNodesResponse,
+    LoginStatusRequest, LoginStatusResponse, NetworkMapMessage, PolicyGetRequest,
+    PolicyGetResponse, PolicyPushRequest, PolicyPushResponse, PolicyRollbackRequest,
+    PolicyRollbackResponse, PolicyVersionInfo, RegisterAuthKeyRequest, RegisterResponse,
+    RelayCheckRequest, RelayCheckResponse, RenameNodeRequest, RenameNodeResponse,
     ReportEndpointsRequest, ReportEndpointsResponse, RevokeNodeRequest, RevokeNodeResponse,
     StreamMapRequest,
 };
@@ -268,6 +270,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     let service = CoordServiceImpl {
         store: store.clone(),
         challenges: ChallengeCache::new(),
+        invite_throttle: Default::default(),
         map_hub: hub.clone(),
         logins: logins.clone(),
         login_ttl: config.login_ttl,
@@ -389,6 +392,8 @@ impl tokio_stream::Stream for TcpListenerStreamMapped {
 struct CoordServiceImpl {
     store: Store,
     challenges: ChallengeCache,
+    /// 邀请码爆破限速（#55）：按对端地址的失败滑动窗口。
+    invite_throttle: std::sync::Mutex<std::collections::HashMap<String, Vec<i64>>>,
     map_hub: Arc<MapHub>,
     logins: Arc<LoginRegistry>,
     login_ttl: Duration,
@@ -398,6 +403,27 @@ struct CoordServiceImpl {
 }
 
 impl CoordServiceImpl {
+    /// 失败滑动窗口（#55）：每对端地址 60 秒内 10 次失败后熔断。
+    fn invite_throttled(&self, caller: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut table = self
+            .invite_throttle
+            .lock()
+            .expect("invite throttle poisoned");
+        let window = table.entry(caller.to_string()).or_default();
+        window.retain(|ts| now - *ts < 60);
+        window.len() >= 10
+    }
+
+    fn record_invite_failure(&self, caller: &str) {
+        let now = chrono::Utc::now().timestamp();
+        let mut table = self
+            .invite_throttle
+            .lock()
+            .expect("invite throttle poisoned");
+        table.entry(caller.to_string()).or_default().push(now);
+    }
+
     fn hello_reject_old_version(protocol_version: u32) -> Option<Status> {
         (protocol_version < MIN_SUPPORTED_PROTOCOL_VERSION).then(|| {
             Status::failed_precondition(format!(
@@ -511,6 +537,10 @@ impl Coord for CoordServiceImpl {
         &self,
         request: Request<RegisterAuthKeyRequest>,
     ) -> Result<Response<RegisterResponse>, Status> {
+        let caller = request
+            .remote_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         let req = request.into_inner();
 
         let nonce: [u8; 32] = req
@@ -563,11 +593,27 @@ impl Coord for CoordServiceImpl {
             }
         }
 
-        let tags = self
-            .store
-            .consume_auth_key(&req.auth_key)
-            .await
-            .map_err(|error| Status::permission_denied(error.to_string()))?;
+        // 邀请码路径（#55）：设置 invite_code 时走短码核销；限速按对端地址。
+        let (tags, owner_id, node_expiry) = if let Some(code) = req.invite_code.as_deref() {
+            if self.invite_throttled(&caller) {
+                return Err(Status::resource_exhausted("尝试过于频繁，请稍后再试"));
+            }
+            match self.store.consume_invite(code).await {
+                Ok(triple) => triple,
+                Err(reason) => {
+                    self.record_invite_failure(&caller);
+                    tracing::warn!(caller = %caller, "invite rejected: {reason}");
+                    return Err(Status::permission_denied(reason));
+                }
+            }
+        } else {
+            match self.store.consume_auth_key(&req.auth_key).await {
+                Ok(tags) => (tags, None, None),
+                Err(error) => {
+                    return Err(Status::permission_denied(error.to_string()));
+                }
+            }
+        };
         let record = self
             .store
             .register_node(
@@ -575,8 +621,8 @@ impl Coord for CoordServiceImpl {
                 &node_key_pub,
                 &challenge.hostname,
                 &tags,
-                None,
-                None,
+                owner_id.as_deref(),
+                node_expiry,
             )
             .await
             .map_err(|error| {
@@ -1102,6 +1148,115 @@ impl Coord for CoordServiceImpl {
             auth_key,
             key_id,
         }))
+    }
+
+    async fn admin_create_invite(
+        &self,
+        request: Request<AdminCreateInviteRequest>,
+    ) -> Result<Response<AdminCreateInviteResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        crate::admin::require_admin(&operator)?;
+        let created_by = match &operator {
+            crate::admin::Operator::Admin { user } => user.clone(),
+            _ => unreachable!("require_admin 已保证 Admin"),
+        };
+        let owner = match req.owner_name {
+            Some(name) => Some((name, req.node_ttl_days.unwrap_or(90))),
+            None => None,
+        };
+        let ttl = if req.ttl_secs > 0 { req.ttl_secs } else { 900 };
+        let max_uses = if req.max_uses > 0 { req.max_uses } else { 1 };
+        let code = self
+            .store
+            .create_invite(&created_by, ttl, max_uses, &req.tags, owner)
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        tracing::info!(node_id = %record.id, "invite issued via admin rpc");
+        Ok(Response::new(AdminCreateInviteResponse {
+            invite_code: code,
+            invite_id: String::new(),
+        }))
+    }
+
+    async fn admin_list_invites(
+        &self,
+        request: Request<AdminListInvitesRequest>,
+    ) -> Result<Response<AdminListInvitesResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        crate::admin::require_admin(&operator)?;
+        let rows = self
+            .store
+            .list_invites()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let invites = rows
+            .into_iter()
+            .map(|row| hz_proto::InviteInfo {
+                invite_id: row.id,
+                created_at_unix: row.created_at_unix,
+                expires_at_unix: row.expires_at_unix,
+                max_uses: row.max_uses,
+                use_count: row.use_count,
+                tags: row.tags,
+                owner_name: row.owner_name,
+                node_ttl_days: row.node_ttl_days,
+                created_by: row.created_by,
+                last_used_at_unix: row.last_used_at_unix,
+                revoked_at_unix: row.revoked_at_unix,
+            })
+            .collect();
+        Ok(Response::new(AdminListInvitesResponse { invites }))
+    }
+
+    async fn admin_revoke_invite(
+        &self,
+        request: Request<AdminRevokeInviteRequest>,
+    ) -> Result<Response<AdminRevokeInviteResponse>, Status> {
+        let req = request.into_inner();
+        let record = self
+            .authenticate_node_caller(
+                req.protocol_version,
+                &req.machine_key_pub,
+                &req.hostname,
+                &req.challenge_nonce,
+                &req.challenge_signature,
+            )
+            .await?;
+        let operator = crate::admin::resolve_operator(&self.store, &record).await?;
+        crate::admin::require_admin(&operator)?;
+        let revoked = self
+            .store
+            .revoke_invite(&req.invite_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if !revoked {
+            return Err(Status::not_found(format!(
+                "邀请不存在或已吊销：{}",
+                req.invite_id
+            )));
+        }
+        tracing::info!(node_id = %record.id, invite_id = %req.invite_id, "invite revoked via admin rpc");
+        Ok(Response::new(AdminRevokeInviteResponse {}))
     }
 
     async fn admin_revoke_auth_key(

@@ -141,6 +141,21 @@ fn parse_stored_endpoints(json: &str) -> anyhow::Result<Vec<StoredEndpoint>> {
         .collect()
 }
 
+/// invites 表的一行（Admin 列表用）。
+pub struct InviteRow {
+    pub id: String,
+    pub created_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub max_uses: i64,
+    pub use_count: i64,
+    pub tags: Vec<String>,
+    pub owner_name: Option<String>,
+    pub node_ttl_days: Option<i64>,
+    pub created_by: String,
+    pub last_used_at_unix: Option<i64>,
+    pub revoked_at_unix: Option<i64>,
+}
+
 /// cli 原始段参数（#20）：cidr 可缺省（与固化段/默认段合并），reserve 可独立出现。
 #[derive(Debug, Default)]
 pub struct RangeFlags {
@@ -427,6 +442,191 @@ impl Store {
     }
 
     /// 校验并消费 Auth Key，成功时返回它预绑定的 Tag。
+    /// 创建邀请码（#55）：明文只在此产生并返回一次，库中存规范化后的
+    /// sha256。owner 为 Some 时为「有主邀请」（注册出的 Node 归属该 User
+    /// 并带 node_ttl_days 有效期）；为 None 时用 tags（无主、不过期）。
+    /// tags 与 owner 互斥。
+    pub async fn create_invite(
+        &self,
+        created_by: &str,
+        ttl_secs: i64,
+        max_uses: i64,
+        tags: &[String],
+        owner: Option<(String, i64)>,
+    ) -> anyhow::Result<String> {
+        if owner.is_some() && !tags.is_empty() {
+            anyhow::bail!("邀请码不能同时指定归属 User 与 Tag（二选一）");
+        }
+        if let Some((name, _)) = &owner {
+            self.ensure_user_exists(name).await?;
+        }
+        let code = crate::authkey::generate_invite_code();
+        let normalized = crate::authkey::normalize_invite(&code);
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO invites (id, code_hash, created_at_unix, expires_at_unix,
+             max_uses, use_count, tags, owner_name, node_ttl_days, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9)",
+        )
+        .bind(crate::authkey::random_id())
+        .bind(crate::authkey::hash(&normalized))
+        .bind(now)
+        .bind(now + ttl_secs)
+        .bind(max_uses)
+        .bind(serde_json::to_string(tags)?)
+        .bind(owner.as_ref().map(|(name, _)| name))
+        .bind(owner.as_ref().map(|(_, days)| days))
+        .bind(created_by)
+        .execute(self.pool())
+        .await?;
+        Ok(code)
+    }
+
+    /// 校验并原子核销邀请码：成功返回 (tags, owner_user_id, expires_at_unix)。
+    /// 与 consume_auth_key 同风格的错误字符串（中文可读）。
+    pub async fn consume_invite(
+        &self,
+        code: &str,
+    ) -> Result<(Vec<String>, Option<String>, Option<i64>), String> {
+        let normalized = crate::authkey::normalize_invite(code);
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|error| format!("存储错误：{error}"))?;
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                i64,
+                i64,
+                String,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+            ),
+        >(
+            "SELECT id, expires_at_unix, max_uses, use_count, tags, owner_name,
+             node_ttl_days, revoked_at_unix FROM invites WHERE code_hash = ?1",
+        )
+        .bind(crate::authkey::hash(&normalized))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| format!("存储错误：{error}"))?;
+        let Some((
+            id,
+            expires_at,
+            max_uses,
+            use_count,
+            tags_json,
+            owner_name,
+            node_ttl_days,
+            revoked_at,
+        )) = row
+        else {
+            return Err("邀请码无效".to_string());
+        };
+        let now = chrono::Utc::now().timestamp();
+        if revoked_at.is_some() {
+            return Err("邀请码已被吊销".to_string());
+        }
+        if now > expires_at {
+            return Err("邀请码已过期，请向管理员重新索取".to_string());
+        }
+        if use_count >= max_uses {
+            return Err("邀请码已使用（次数用尽）".to_string());
+        }
+        sqlx::query(
+            "UPDATE invites SET use_count = use_count + 1, last_used_at_unix = ?1 WHERE id = ?2",
+        )
+        .bind(now)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| format!("存储错误：{error}"))?;
+        tx.commit()
+            .await
+            .map_err(|error| format!("存储错误：{error}"))?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        // 有主邀请：解析 User 名到 id，并按 node_ttl_days 折算 Node 有效期。
+        let (user_id, node_expiry) = match (&owner_name, node_ttl_days) {
+            (Some(name), Some(days)) => {
+                let uid: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM users WHERE name = ?1")
+                        .bind(name)
+                        .fetch_optional(self.pool())
+                        .await
+                        .map_err(|error| format!("存储错误：{error}"))?;
+                (uid, Some(now + days * 86_400))
+            }
+            _ => (None, None),
+        };
+        Ok((tags, user_id, node_expiry))
+    }
+
+    /// 邀请列表（Admin CLI 用）。
+    pub async fn list_invites(&self) -> anyhow::Result<Vec<InviteRow>> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                i64,
+                i64,
+                i64,
+                String,
+                Option<String>,
+                Option<i64>,
+                String,
+                Option<i64>,
+                Option<i64>,
+            ),
+        >(
+            "SELECT id, created_at_unix, expires_at_unix, max_uses, use_count, tags,
+             owner_name, node_ttl_days, created_by, last_used_at_unix, revoked_at_unix
+             FROM invites ORDER BY created_at_unix DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| InviteRow {
+                id: row.0,
+                created_at_unix: row.1,
+                expires_at_unix: row.2,
+                max_uses: row.3,
+                use_count: row.4,
+                tags: serde_json::from_str(&row.5).unwrap_or_default(),
+                owner_name: row.6,
+                node_ttl_days: row.7,
+                created_by: row.8,
+                last_used_at_unix: row.9,
+                revoked_at_unix: row.10,
+            })
+            .collect())
+    }
+
+    pub async fn revoke_invite(&self, invite_id: &str) -> anyhow::Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let result = sqlx::query(
+            "UPDATE invites SET revoked_at_unix = ?1 WHERE id = ?2 AND revoked_at_unix IS NULL",
+        )
+        .bind(now)
+        .bind(invite_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn ensure_user_exists(&self, name: &str) -> anyhow::Result<()> {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM users WHERE name = ?1")
+            .bind(name)
+            .fetch_optional(self.pool())
+            .await?;
+        anyhow::ensure!(exists.is_some(), "归属 User 不存在：{name}");
+        Ok(())
+    }
+
     pub async fn consume_auth_key(&self, plaintext: &str) -> Result<Vec<String>, AuthKeyError> {
         let key_hash = authkey::hash(plaintext);
         let mut tx = self
