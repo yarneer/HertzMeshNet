@@ -146,11 +146,52 @@ impl OidcClient {
         })
     }
 
+    pub fn redirect_uri(&self) -> &Url {
+        &self.config.redirect_uri
+    }
+
+    /// 跳过发现文档。单测把 token / userinfo 指到本机桩。
+    #[cfg(test)]
+    pub(crate) fn from_endpoints(
+        config: OidcConfig,
+        authorization_endpoint: Url,
+        token_endpoint: Url,
+        userinfo_endpoint: Url,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        Self {
+            config,
+            discovery: Endpoints {
+                authorization_endpoint,
+                token_endpoint,
+                userinfo_endpoint,
+            },
+            http,
+        }
+    }
+
     /// 构造浏览器要打开的授权 URL（授权码 + PKCE S256 + state + nonce）。
     /// state 填 login_id（回调据此找回 PendingLogin）；nonce 与 verifier 都是
-    /// Begin 时生成并存在 PendingLogin 里的那一份。
+    /// Begin 时生成并存在 PendingLogin 里的那一份。redirect_uri 用配置里
+    /// 登记的 Node 登录回调。Admin Console 走 [`Self::authorization_request_to`]。
     pub fn authorization_request(
         &self,
+        state: &str,
+        nonce: &str,
+        verifier: &str,
+    ) -> AuthorizationRequest {
+        self.authorization_request_to(&self.config.redirect_uri, state, nonce, verifier)
+    }
+
+    /// 同 [`Self::authorization_request`]，redirect_uri 由调用方给。
+    /// Admin Console 传 `/admin/oidc/callback`（须在 Kanidm 另行登记）。
+    pub fn authorization_request_to(
+        &self,
+        redirect_uri: &Url,
         state: &str,
         nonce: &str,
         verifier: &str,
@@ -159,7 +200,7 @@ impl OidcClient {
         url.query_pairs_mut().extend_pairs([
             ("response_type", "code"),
             ("client_id", self.config.client_id.as_str()),
-            ("redirect_uri", self.config.redirect_uri.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
             ("scope", "openid profile groups"),
             ("state", state),
             ("nonce", nonce),
@@ -179,6 +220,19 @@ impl OidcClient {
         verifier: &str,
         expected_nonce: &str,
     ) -> anyhow::Result<UserClaims> {
+        self.exchange_at(&self.config.redirect_uri, code, verifier, expected_nonce)
+            .await
+    }
+
+    /// 与 [`Self::exchange`] 相同，但 token 请求里的 redirect_uri 用调用方给的那条，
+    /// 必须和授权请求一致（Admin Console 的回调在 `/admin/oidc/callback`）。
+    pub async fn exchange_at(
+        &self,
+        redirect_uri: &Url,
+        code: &str,
+        verifier: &str,
+        expected_nonce: &str,
+    ) -> anyhow::Result<UserClaims> {
         let token_response = self
             .http
             .post(self.discovery.token_endpoint.clone())
@@ -186,7 +240,7 @@ impl OidcClient {
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("code", code),
-                ("redirect_uri", self.config.redirect_uri.as_str()),
+                ("redirect_uri", redirect_uri.as_str()),
                 ("code_verifier", verifier),
             ])
             .send()

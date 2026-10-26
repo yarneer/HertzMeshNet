@@ -2,7 +2,8 @@
 # 生产 Kanidm 初始化（docs/runbook.md §5）：
 #   恢复内置管理员 → 创建 hznet_admins / hznet_users 组 → 创建第一个 User 并
 #   设口令 → 创建 OAuth2 客户端 hznet-coord（回调 https://coord.<域名>/oidc/
-#   callback）→ 把 --oidc-* 连同 client secret 写进 /etc/default/hz-coord 并
+#   callback 与 Admin Console 的 /admin/oidc/callback）→ 把 --oidc-* 连同
+#   client secret 写进 /etc/default/hz-coord 并
 #   重启 hz-coord。
 # API 走向复用 scripts/test/kanidm/setup.sh 对 Kanidm 1.8 的实测结论：
 #   person 口令只能走 credential-update 会话 API；oauth2 写操作需要特权会话。
@@ -58,6 +59,9 @@ sys() {
 
 ISSUER="https://auth.${DOMAIN}/oauth2/openid/hznet-coord"
 REDIRECT="https://coord.${DOMAIN}/oidc/callback"
+# Admin Console 的 OIDC 回调。与 hz-coord 里 admin_redirect_uri 的路径一致，
+# 严格回调模式下两条都要登记，否则浏览器登录 Admin Console 会被 Kanidm 拒绝。
+ADMIN_REDIRECT="https://coord.${DOMAIN}/admin/oidc/callback"
 URL="https://auth.${DOMAIN}"
 
 echo "==> 等待 Kanidm 就绪（${URL}/status）"
@@ -181,7 +185,7 @@ api() {
   fi
 }
 
-echo "==> 创建 OAuth2 客户端 hznet-coord（回调 ${REDIRECT}）"
+echo "==> 创建 OAuth2 客户端 hznet-coord（回调 ${REDIRECT} 与 ${ADMIN_REDIRECT}）"
 PRIV=$(privileged_token "${ADMIN_NAME}" "${ADMIN_LOGIN_PW}")
 [ -n "${PRIV}" ] || die "未取得特权会话"
 out=$(api POST /v1/oauth2/_basic "${PRIV}" \
@@ -189,7 +193,7 @@ out=$(api POST /v1/oauth2/_basic "${PRIV}" \
   || ok_or_exists "${out}" || die "oauth2 create 失败：${out}"
 # 回调地址走 PATCH（实测 _attr 追加端点对机密客户端返回 nomatchingentries）。
 out=$(api PATCH /v1/oauth2/hznet-coord "${PRIV}" \
-  "{\"attrs\":{\"oauth2_rs_origin\":[\"${REDIRECT}\"]}}" 2>&1) \
+  "{\"attrs\":{\"oauth2_rs_origin\":[\"${REDIRECT}\",\"${ADMIN_REDIRECT}\"]}}" 2>&1) \
   || die "注册回调失败：${out}"
 out=$(api POST "/v1/oauth2/hznet-coord/_scopemap/hznet_users" "${PRIV}" \
   '["openid","profile","groups"]' 2>&1) \
@@ -225,5 +229,5 @@ fi
 
 echo ""
 echo "Kanidm 初始化完成（口令与 secret 仅此一次显示，请立即保存）："
-printf '{"client_id":"hznet-coord","client_secret":"%s","issuer":"%s","redirect_uri":"%s","admin_name":"%s","admin_password":"%s"}\n' \
-  "${SECRET}" "${ISSUER}" "${REDIRECT}" "${ADMIN_NAME}" "${ADMIN_LOGIN_PW}"
+printf '{"client_id":"hznet-coord","client_secret":"%s","issuer":"%s","redirect_uri":"%s","admin_redirect_uri":"%s","admin_name":"%s","admin_password":"%s"}\n' \
+  "${SECRET}" "${ISSUER}" "${REDIRECT}" "${ADMIN_REDIRECT}" "${ADMIN_NAME}" "${ADMIN_LOGIN_PW}"

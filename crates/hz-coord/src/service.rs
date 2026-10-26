@@ -242,6 +242,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
             store: store.clone(),
             login_node_ttl_secs: config.login_node_ttl_secs,
             dist: dist_state,
+            admin: crate::admin_http::AdminGate::default(),
         });
         let http = serve_http(http_listen, http_state).await?;
         let base = login_base_url(

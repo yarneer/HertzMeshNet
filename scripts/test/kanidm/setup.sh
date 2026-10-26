@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 把一个空白的 Kanidm 配置成 #10 集成测试要用的样子：
 #   persons: alice（hznet_admins 成员）、bob（普通 User）、hznet_setup（OAuth2 管理员）
-#   oauth2 client: hznet-coord（机密客户端 + PKCE，回调注册为参数传入的两个端口）
+#   oauth2 client: hznet-coord（机密客户端 + PKCE，回调注册为参数传入的两个端口，
+#   以及各自的 /admin/oidc/callback）
 # 输出：一行 JSON（client_id/client_secret/issuer/alice/bob 密码）供 run.sh 注入测试。
 #
 # 依据实测（kanidm 1.8.0）：
@@ -138,14 +139,17 @@ set_password alice "$ALICE_PW"
 set_password bob "$BOB_PW"
 set_password hznet_setup "$SETUP_PW"
 
-note "创建 OAuth2 客户端（机密 + PKCE + 两个 loopback 回调）"
+note "创建 OAuth2 客户端（机密 + PKCE + Node 登录与 Admin Console 回调）"
 PRIV=$(privileged_token hznet_setup "$SETUP_PW")
 [ -n "$PRIV" ] || exit 1
 out=$(api POST /v1/oauth2/_basic "$PRIV" '{"attrs":{"name":["hznet-coord"],"displayname":["HzNet Coordination Server"],"oauth2_rs_origin_landing":["http://127.0.0.1/"],"oauth2_strict_redirect_uri":["true"]}}')
 echo "$out" | tail -1 | grep -q '^2' || { echo "oauth2 create 失败：$out" >&2; exit 1; }
 # 回调地址走 PATCH（实测 _attr 追加端点对机密客户端返回 nomatchingentries）。
+# Admin 回调与 crates/hz-coord/src/admin_http.rs 的 admin_redirect_uri 一致。
+ADMIN_1="${REDIRECT_1%/oidc/callback}/admin/oidc/callback"
+ADMIN_2="${REDIRECT_2%/oidc/callback}/admin/oidc/callback"
 out=$(api PATCH /v1/oauth2/hznet-coord "$PRIV" \
-  "{\"attrs\":{\"oauth2_rs_origin\":[\"$REDIRECT_1\",\"$REDIRECT_2\"]}}")
+  "{\"attrs\":{\"oauth2_rs_origin\":[\"$REDIRECT_1\",\"$REDIRECT_2\",\"$ADMIN_1\",\"$ADMIN_2\"]}}")
 echo "$out" | tail -1 | grep -q '^2' || { echo "注册回调失败：$out" >&2; exit 1; }
 api POST /v1/oauth2/hznet-coord/_scopemap/hznet_users "$PRIV" '["openid","profile","groups"]' >/dev/null
 out=$(api PATCH /v1/oauth2/hznet-coord "$PRIV" '{"attrs":{"oauth2_prefer_short_username":["true"]}}')

@@ -3,7 +3,7 @@
 # （由 /etc/nginx/streams-enabled/hznet.conf 的 SNI 分流送进来）。
 #
 # hz-coord 两个本地监听：gRPC 明文 h2（127.0.0.1:50051，grpc_pass 直转）与
-# HTTP 明文（127.0.0.1:8080，/install.sh、/dl/、/oidc/、/healthz）。
+# HTTP 明文（127.0.0.1:8080，/install.sh、/dl/、/oidc/、/admin/、/healthz）。
 
 server {
     listen 80;
@@ -48,7 +48,7 @@ server {
         grpc_send_timeout 3600s;
     }
 
-    # HTTP 面：/install.sh、/dl/<os>-<arch>/<bin>、/oidc/start|callback、/healthz
+    # HTTP 面：/install.sh、/dl/<os>-<arch>/<bin>、/oidc/start|callback、/admin/、/healthz
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
