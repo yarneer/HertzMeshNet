@@ -167,14 +167,15 @@ sudo bash scripts/deploy/kanidm-init.sh --domain <域名> --admin-name <第一�
 1. `kanidmd recover-account admin/idm_admin` 拿回内置管理员口令并登录；
 2. 创建组 `hznet_admins`、`hznet_users`，创建第一个 User 并生成随机口令；
 3. 创建 OAuth2 客户端 `hznet-coord`（机密客户端 + PKCE + 严格回调
-   `https://coord.<域名>/oidc/callback`，scopes openid/profile/groups）；
+   `https://coord.<域名>/oidc/callback` 与 Admin Console 的
+   `https://coord.<域名>/admin/oidc/callback`，scopes openid/profile/groups）；
 4. 把 `--oidc-*` 连同 client secret 写进 `/etc/default/hz-coord`（权限 0600）
    并重启 hz-coord，等待 `/healthz` 恢复。
 
 结束打印一行 JSON（**口令与 secret 仅此一次显示，立即保存到密码管理器**）：
 
 ```json
-{"client_id":"hznet-coord","client_secret":"...","issuer":"https://auth.<域名>/oauth2/openid/hznet-coord","redirect_uri":"https://coord.<域名>/oidc/callback","admin_name":"...","admin_password":"..."}
+{"client_id":"hznet-coord","client_secret":"...","issuer":"https://auth.<域名>/oauth2/openid/hznet-coord","redirect_uri":"https://coord.<域名>/oidc/callback","admin_redirect_uri":"https://coord.<域名>/admin/oidc/callback","admin_name":"...","admin_password":"..."}
 ```
 
 `hznet_admins` 的成员即 HzNet Admin（FR-11，经 OIDC groups claim 传给
@@ -404,6 +405,7 @@ AC3 的三步（需要你自己的三台机器；Policy 以"dev 组可访问 db 
 | `hz up` 报连接 Coordination Server 失败 | `curl -fsS https://coord.<域名>/healthz`；不通看 `nginx -t`、`journalctl -u nginx`（SNI 分流按域名匹配，DNS 必须先生效）；证书过期看 §3 |
 | hz-coord 起不来，日志提 OIDC 发现文档 | OIDC 在启动时同步拉发现文档（`OidcClient::discover`）：确认 kanidm 已运行、正式证书已装、`/etc/default/hz-coord` 里 `--oidc-issuer` 指向 `https://auth.<域名>/oauth2/openid/hznet-coord` |
 | 交互式登录回调 404/被拒 | Kanidm 侧回调必须精确等于 `--oidc-redirect-uri`（`https://coord.<域名>/oidc/callback`）；重跑 §5 会重新 PATCH 回调 |
+| Admin Console 登录被拒 | 同一 OAuth2 客户端还要登记 `https://coord.<域名>/admin/oidc/callback`（重跑 §5）。只有 `hznet_admins` 的成员能建立会话 |
 | 打开登录链接后 Kanidm 登录页 404（如 `/ui/login/begin`），或换无痕窗口才能登录 | 证书仍是一张覆盖三个子域名的多 SAN 证书，浏览器把 auth 的请求合并进了 coord 的连接：按 §3「已部署环境的迁移」换成单域名证书并更新 nginx 配置，然后重启浏览器 |
 | `hz login` 打印的登录链接是 `http://127.0.0.1:…` | hz-coord 低于 v0.1.4，或 `/etc/default/hz-coord` 缺 `--public-url https://coord.<域名>`（v0.1.4 起登录链接按它拼接，缺省时取 `--oidc-redirect-uri` 的主机） |
 | 配置 Policy 后某台 Node 与所有 Node 都不通，`hz node list` 显示「归属 User：无（Tag 注册）」「Tags：无」 | 它是用 v0.1.4 之前签发的无 Tag Auth Key 注册的，Policy 覆盖不到；按 §6.5 处置 |

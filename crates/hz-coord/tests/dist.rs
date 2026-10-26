@@ -25,6 +25,7 @@ async fn start_http(dist: Option<Arc<DistState>>) -> (String, hz_coord::http::Ht
         store,
         login_node_ttl_secs: 90 * 86_400,
         dist,
+        admin: hz_coord::admin_http::AdminGate::default(),
     });
     let handle = serve_http("127.0.0.1:0".parse().unwrap(), state)
         .await

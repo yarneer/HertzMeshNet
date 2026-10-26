@@ -1,8 +1,9 @@
 //! Coordination Server 的最小 HTTP 面板：交互式登录的 /oidc/start 与
-//! /oidc/callback（FR-2），以及分发面（FR-13）`GET /install.sh`、
-//! `GET /dl/manifest.json`、`GET /dl/<os>-<arch>/{hzd,hz}`。回调是 OIDC
-//! 客户端的一部分，所以落在 Coordination Server 而不是任何 Node。测试走
-//! loopback http；生产 TLS 由部署侧（反代或证书配置）负责，与 gRPC 面
+//! /oidc/callback（FR-2），分发面（FR-13）`GET /install.sh`、
+//! `GET /dl/manifest.json`、`GET /dl/<os>-<arch>/{hzd,hz}`，以及 Admin
+//! Console 的 `/admin/`（会话与 `/admin/api`，见 [`crate::admin_http`]）。
+//! 回调是 OIDC 客户端的一部分，所以落在 Coordination Server 而不是任何 Node。
+//! 测试走 loopback http；生产 TLS 由部署侧（反代或证书配置）负责，与 gRPC 面
 //! 的 TLS 同级。
 
 use std::net::SocketAddr;
@@ -17,6 +18,7 @@ use axum::routing::get;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::admin_http::{self, AdminGate};
 use crate::authkey;
 use crate::login::{LoginRegistry, TakeError};
 use crate::oidc::OidcClient;
@@ -40,6 +42,8 @@ pub struct HttpState {
     /// 交互式登录授予的 Node 有效期（FR-3 默认 90 天，测试注入更短值）。
     pub login_node_ttl_secs: i64,
     pub dist: Option<Arc<DistState>>,
+    /// Admin Console 的 OIDC 会话（与 Node 的 [`LoginRegistry`] 分开）。
+    pub admin: AdminGate,
 }
 
 /// serve 启动参数里的分发配置；DistState 是它扫描产物。
@@ -140,6 +144,11 @@ pub async fn serve_http(listen: SocketAddr, state: Arc<HttpState>) -> anyhow::Re
         .route("/dl/manifest.json", get(dl_manifest))
         .route("/dl/{platform}/{binary}", get(dl_binary))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/admin/login", get(admin_http::login))
+        .route("/admin/oidc/callback", get(admin_http::callback))
+        .route("/admin", get(admin_http::browser_entry))
+        .route("/admin/", get(admin_http::browser_entry))
+        .nest("/admin/api", admin_http::api_router(state.clone()))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let local_addr = listener.local_addr()?;
