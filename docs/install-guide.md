@@ -25,21 +25,22 @@ curl -fsSL https://coord.example.com:8443/install.sh | sudo sh
 （带 Auth Key：hz up --auth-key <Key>；缺省走交互式登录）
 ```
 
-没有分发面时，用 GitHub Release 的脚本加两个环境变量，效果相同：
+没有分发面时，用 GitHub Release 的脚本加环境变量，效果相同。`sudo` 默认清掉调用者的环境变量，所以用 `sudo env` 把地址送进脚本：
 
 ```sh
 curl -fsSL -o install.sh https://github.com/yarneer/HertzMeshNet/releases/latest/download/install.sh
-HZNET_COORD_URL=https://coord.example.com:8443 \
-HZNET_COORD_ADDR=https://coord.example.com:443 \
-sudo sh install.sh
+sudo env \
+  HZNET_COORD_URL=https://coord.example.com:8443 \
+  HZNET_COORD_ADDR=https://coord.example.com:443 \
+  sh install.sh
 ```
 
-`HZNET_COORD_URL` 是下载二进制的分发地址，`HZNET_COORD_ADDR` 是写进配置的 gRPC 地址。两者不同时都要给。
+`HZNET_COORD_URL` 是下载二进制的分发地址，`HZNET_COORD_ADDR` 是写进配置的 gRPC 地址。两者不同时都要给。标准三子域名下不必再设 Relay：主机名是 `coord.<域名>` 时脚本写成 `HZD_RELAY_ADDR=https://relay.<域名>`。Relay 不在这个名字上时再加 `HZNET_RELAY_ADDR=https://<Relay 主机>`。
 
 脚本做了什么：
 
-- Linux：二进制装入 `/usr/local/bin`；`/etc/default/hzd` 写入 `HZD_COORD_ADDR`；写入并启用 `hzd.service`（systemd）；`/etc/profile.d/hznet.sh` 让登录 shell 也拿到 `HZD_COORD_ADDR`。
-- macOS：二进制装入 `/usr/local/bin`；写入并加载 `/Library/LaunchDaemons/com.hznet.hzd.plist`（launchd，`KeepAlive`）；日志在 `/Library/Logs/hzd.log`。
+- Linux：二进制装入 `/usr/local/bin`；`/etc/default/hzd` 写入 `HZD_COORD_ADDR`，能确定 Relay 地址时同时写入 `HZD_RELAY_ADDR`（已有该变量则保留）；写入并启用 `hzd.service`（systemd）；`/etc/profile.d/hznet.sh` 让登录 shell 也拿到 `HZD_COORD_ADDR`。
+- macOS：二进制装入 `/usr/local/bin`；写入并加载 `/Library/LaunchDaemons/com.hznet.hzd.plist`（launchd，`KeepAlive`）。plist 的 `EnvironmentVariables` 含 `HZD_COORD_ADDR`，能确定 Relay 地址时同时含 `HZD_RELAY_ADDR`（已有则保留）。日志在 `/Library/Logs/hzd.log`。
 
 ## 3. 方式二：手动安装
 
@@ -65,12 +66,14 @@ sudo sh install.sh
    ```sh
    sudo install -m 0755 hzd-linux-x86_64 /usr/local/bin/hzd
    sudo install -m 0755 hz-linux-x86_64 /usr/local/bin/hz
-   echo 'HZD_COORD_ADDR=https://coord.example.com:443' | sudo tee /etc/default/hzd
+   printf '%s\n' \
+     'HZD_COORD_ADDR=https://coord.example.com:443' \
+     'HZD_RELAY_ADDR=https://relay.example.com' | sudo tee /etc/default/hzd
    sudo cp packaging/systemd/hzd.service /etc/systemd/system/
    sudo systemctl daemon-reload && sudo systemctl enable --now hzd
    ```
 
-   macOS 写入 launchd。用仓库里的 [packaging/launchd/com.hznet.hzd.plist](../packaging/launchd/com.hznet.hzd.plist)，把 `HZD_COORD_ADDR` 环境变量填进 plist 的 `EnvironmentVariables` 段（launchd 不继承 shell 环境变量），然后：
+   macOS 写入 launchd。用仓库里的 [packaging/launchd/com.hznet.hzd.plist](../packaging/launchd/com.hznet.hzd.plist)，把 `HZD_COORD_ADDR` 与 `HZD_RELAY_ADDR` 填进 plist 的 `EnvironmentVariables` 段（launchd 不继承 shell 环境变量），然后：
 
    ```sh
    sudo launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist
@@ -128,20 +131,29 @@ sudo hz up
 
    期望与 `hz ping` 一致。Linux 上 `hzd` 通过 systemd-resolved 接管 `hznet.internal` 后缀，macOS 上写 `/etc/resolver/hznet.internal`；两者都只接管这个后缀。
 
-## 6. 补充 Relay 地址
+## 6. Relay 地址
 
-默认安装只写 `HZD_COORD_ADDR`。你的部署如果用独立 Relay 域名（runbook §1 的三子域名形态），把 Relay 地址加进配置并重启，否则跨 NAT 的流量没有中转路径：
+标准三子域名（Coordination Server 在 `coord.<域名>`，Relay 在 `relay.<域名>`，ADR-0004）时，一条命令安装会写入 `HZD_RELAY_ADDR=https://relay.<域名>`：Linux 写 `/etc/default/hzd`，macOS 写 plist 的 `EnvironmentVariables`。重跑安装若发现已经有 `HZD_RELAY_ADDR`，原样保留，不覆盖。
 
-- Linux：在 `/etc/default/hzd` 追加 `HZD_RELAY_ADDR=<relay 地址>`，然后 `sudo systemctl restart hzd`。
-- macOS：在 plist 的 `EnvironmentVariables` 段加同样的键值，然后 `sudo launchctl bootout system/com.hznet.hzd`，等几秒（旧 `hzd` 退出前要先恢复 DNS 配置）再 `sudo launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist`。
+Relay 不在 `relay.<域名>` 上时，安装前设置 `HZNET_RELAY_ADDR`（`sudo` 会清环境变量，用 `sudo env`，与第 2 节相同）：
 
-Relay 使用私有 CA 时还要加 `HZD_RELAY_CA_PATH=<PEM 路径>`。细节见 [runbook.md](runbook.md) §6.3 与 §6.4。
+```sh
+# 仓库或 GitHub Release 里的 install.sh
+sudo env HZNET_RELAY_ADDR=https://relay.example.com:8443 sh install.sh
+
+# 从 Coordination Server 拉下来的脚本。标准三子域名不必设这个变量
+curl -fsSL https://coord.example.com/install.sh | sudo env HZNET_RELAY_ADDR=https://relay.example.com:8443 sh
+```
+
+从 Coordination Server 拉下来的 `install.sh` 已经带好 gRPC 地址，推导或上面的变量都在脚本内部完成，一般不必再手改文件。方式二的手动安装不会推导，按第 3 节把 `HZD_RELAY_ADDR` 和 `HZD_COORD_ADDR` 一起写入。
+
+hzd 只认环境变量 `HZD_RELAY_ADDR`，没有对应的命令行 flag。Relay 使用私有 CA 时还要加 `HZD_RELAY_CA_PATH=<PEM 路径>`（Linux 追加到 `/etc/default/hzd` 后 `sudo systemctl restart hzd`；macOS 加进同一个 `EnvironmentVariables` 字典后重新 bootstrap）。细节见 [runbook.md](runbook.md) §6.3 与 §6.4。
 
 ## 7. 升级
 
 重跑安装命令即可。脚本检测到 `hzd` 在运行会替换二进制并重启服务；注册身份保留在状态目录（Linux `/var/lib/hzd`，macOS `/Library/Application Support/hzd`），升级后无需重新注册。手动安装的机器重复第 3 节的步骤后 `sudo systemctl restart hzd`。
 
-升级会保留你在第 6 节加过的配置：Linux 保留 `/etc/default/hzd` 里已有的变量，macOS 保留 plist `EnvironmentVariables` 里已有的键（`HZD_RELAY_ADDR`、`HZD_STUN_ADDR`、`HZD_BOOTSTRAP_DNS` 等），只把 `HZD_COORD_ADDR` 换成本次安装命令的值。0.1.3 及更早版本的脚本升级时会整份重写这两个文件，用这些版本升级过的机器请检查 Relay 等配置是否还在，缺了按第 6 节补回。
+升级保留已有配置：Linux 保留 `/etc/default/hzd` 里除 `HZD_COORD_ADDR` 以外的变量，macOS 保留 plist `EnvironmentVariables` 里除 `HZD_COORD_ADDR` 以外的键（改过的 `HZD_RELAY_ADDR`、`HZD_STUN_ADDR`、`HZD_BOOTSTRAP_DNS` 等）。`HZD_COORD_ADDR` 换成本次安装的值。还没有 `HZD_RELAY_ADDR`、且本次能确定 Relay 地址时，升级会补上。0.1.3 及更早版本的脚本升级时会整份重写这两个文件，用这些版本升级过的机器请检查 Relay 等配置是否还在，缺了按第 6 节补回。
 
 macOS 上脚本会等旧 `hzd` 完全退出（它退出前要先恢复 DNS 配置，通常几秒）再重新加载服务，并确认新 `hzd` 已在运行才报告「已启动」。等待超时或加载失败时脚本报错退出，按提示的命令查看日志并手动加载，或见第 9 节。
 

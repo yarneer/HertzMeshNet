@@ -197,6 +197,24 @@ assert_contains /tmp/hzboot.log 'hzkey_dryrun_1'
 assert_contains /tmp/hzcoord-args '--tag server'
 assert_contains /tmp/hzboot.log 'Tags：server'
 
+echo "== healthcheck.sh 干跑（无后端：nginx 与证书 PASS，coord/relay/kanidm/dns FAIL）"
+set +e
+/work/scripts/deploy/healthcheck.sh --domain dryrun.example --cert-days 14 > /tmp/hc.log 2>&1
+hc_rc=$?
+set -eu
+if [ "${hc_rc}" -ne 0 ]; then pass "healthcheck.sh non-zero without backends"
+else fail "healthcheck.sh exit 0 without backends"; fi
+assert_contains /tmp/hc.log 'PASS nginx -t'
+assert_contains /tmp/hc.log 'PASS cert coord'
+assert_contains /tmp/hc.log 'PASS cert relay'
+assert_contains /tmp/hc.log 'PASS cert auth'
+assert_contains /tmp/hc.log 'FAIL coord '
+assert_contains /tmp/hc.log 'FAIL relay '
+assert_contains /tmp/hc.log 'FAIL kanidm '
+assert_contains /tmp/hc.log 'FAIL dns coord.dryrun.example'
+if grep -q '^SKIP ' /tmp/hc.log; then fail "dryrun should not SKIP (nginx, openssl, getent are installed)"
+else pass "healthcheck.sh printed no SKIP"; fi
+
 echo "== upgrade.sh 干跑"
 /work/scripts/deploy/upgrade.sh --dist /tmp/dist2 --no-systemctl > /tmp/upgrade.log 2>&1
 pass "upgrade.sh exit 0"

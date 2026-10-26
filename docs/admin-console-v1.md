@@ -40,11 +40,11 @@ REST/JSON under something like `/admin/api/…`. The ops whitelist is those two 
 
 | 项 | 共识 |
 |---|---|
-| `HZD_RELAY_ADDR` | `install.sh` 与它写出的 launchd plist 在部署提供了 Relay 地址时写入 `HZD_RELAY_ADDR`。今天两者只写 `HZD_COORD_ADDR`，Relay 要手补（[runbook §6.3](runbook.md)、[§6.4](runbook.md)、[安装手册 §6](install-guide.md)）。升级仍保留用户已经改过的其他键 |
-| 健康检查脚本 | 在部署脚本旁加一支只读脚本：汇总 coord 的 `/healthz`、三张单域名证书的到期时间、最近一次 `backup.sh` 快照的新旧。只打印，不重启、不改文件。健康页读同一类事实 |
+| `HZD_RELAY_ADDR` | `install.sh` 与它写出的 launchd plist 在 Coordination Server 主机名为 `coord.<域名>`，或设置了 `HZNET_RELAY_ADDR` 时写入 `HZD_RELAY_ADDR`（[安装手册 §6](install-guide.md)、[runbook §6.3](runbook.md)、[§6.4](runbook.md)）。已有值重跑保留 |
+| 健康检查脚本 | `scripts/deploy/healthcheck.sh`（[runbook §7.6](runbook.md)）：coord `/healthz`、Relay、Kanidm `/status`、`nginx -t`、三张证书到期、三条 DNS A。只打印，不重启、不改文件。备份快照新旧不在这支脚本里，健康页以后直接读 `/var/backups/hznet` |
 | 部署向导页 | Admin Console 里的一页，按顺序给出尚未完成的下一步：DNS 与 SNI、证书（[runbook §3](runbook.md)）、Kanidm 与 `hznet_admins`（[§5](runbook.md)）、bootstrap 与首个 Node（[§6](runbook.md)）、Relay 地址、备份 cron（[§7](runbook.md)）。不跑 shell，不 systemctl，不签发证书，不恢复备份。coord 的 HTTP 面还没起来时，仍以 runbook 为准 |
 
-Deploy friction to fix outside this note: write `HZD_RELAY_ADDR` from `install.sh` and the generated plist when the deployment has a Relay address (upgrades keep other keys the operator already set); add a read-only healthcheck script for `/healthz`, the three single-name certificates, and the latest packaged backup; add a wizard page that lists those next steps and links the runbook without running them.
+Deploy friction outside this note: `install.sh` writes `HZD_RELAY_ADDR` when the Coordination Server host is `coord.<domain>` or `HZNET_RELAY_ADDR` is set, and keeps an existing value on upgrade. `scripts/deploy/healthcheck.sh` is read-only (`/healthz`, Relay, Kanidm, nginx, certificate expiry, DNS A); backup age is not part of that script. The wizard page is still Admin Console work: it lists next steps and links the runbook, and does not run them.
 
 ## 不做
 
