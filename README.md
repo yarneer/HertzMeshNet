@@ -149,6 +149,7 @@ All MVP feature tickets (registration, data plane, NAT traversal, Map streaming,
 | [docs/install-guide.md](docs/install-guide.md) | Node 安装手册：一条命令安装、注册、验证、升级、卸载 / Install guide: one-command install, registration, verification, upgrade, uninstall |
 | [docs/mvp-spec.md](docs/mvp-spec.md) | MVP 规格说明：13 条功能需求与验收标准 / MVP spec: 13 functional requirements with acceptance criteria |
 | [docs/adr/](docs/adr/) | 架构决策记录 / Architecture decision records |
+| [docs/admin-console-v1.md](docs/admin-console-v1.md) | Admin Console v1 范围：页面、HTTP API、部署摩擦 / Admin Console v1 scope |
 | [docs/runbook.md](docs/runbook.md) | 云主机部署与运维手册 / Cloud deployment & operations runbook |
 | [docs/mvp-tasks.md](docs/mvp-tasks.md) | 任务分解与进度 / Task breakdown & progress |
 | [GLOSSARY.md](GLOSSARY.md) | 术语表（中英）/ Terminology (bilingual) |
