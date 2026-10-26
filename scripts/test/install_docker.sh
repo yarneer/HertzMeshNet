@@ -81,7 +81,12 @@ docker exec "$NODE" test -x /usr/local/bin/hz
 docker exec "$NODE" test -f /etc/systemd/system/hzd.service
 docker exec "$NODE" grep -q "^HZD_COORD_ADDR=http://coord:$GRPC_PORT\$" /etc/default/hzd
 docker exec "$NODE" grep -q "^export HZD_COORD_ADDR=http://coord:$GRPC_PORT\$" /etc/profile.d/hznet.sh
+if docker exec "$NODE" grep -q '^HZD_RELAY_ADDR=' /etc/default/hzd; then
+  echo "FAIL: 主机名不是 coord.<域名> 时不应写入 HZD_RELAY_ADDR" >&2
+  exit 1
+fi
 echo "PASS: 一条命令安装（hzd/hz 落盘 + hzd.service + /etc/default/hzd）"
+echo "PASS: 主机名不是 coord.<域名> 时不写 HZD_RELAY_ADDR"
 
 docker exec -d "$NODE" sh -c 'set -a; . /etc/default/hzd; set +a; exec /usr/local/bin/hzd > /tmp/hzd.log 2>&1'
 for _ in $(seq 1 30); do
@@ -98,8 +103,7 @@ STATUS_OUT=$(docker exec "$NODE" /usr/local/bin/hz status)
 grep -q "已加入 HzNet" <<<"$STATUS_OUT"
 echo "PASS: hz status 显示已加入 HzNet"
 
-# 模拟用户按安装手册第 6 节补过 Relay 地址：重装（升级）后应原样保留，
-# HZD_COORD_ADDR 仍只有一行
+# 非标准 HZD_RELAY_ADDR 重装后应原样保留，HZD_COORD_ADDR 仍只有一行
 docker exec "$NODE" sh -c 'echo HZD_RELAY_ADDR=https://relay.example:8443 >> /etc/default/hzd'
 docker exec "$NODE" sh -c "curl -fsSL http://coord:$HTTP_PORT/install.sh | sh" >/dev/null
 echo "PASS: 重复执行 install.sh 幂等（RC=0）"

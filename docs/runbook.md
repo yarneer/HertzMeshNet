@@ -108,6 +108,8 @@ curl -fsS https://coord.<域名>/healthz   # 预期 ok
 curl -fsS https://auth.<域名>/status     # 预期 true（kanidm 已启动）
 ```
 
+同一组检查，外加 Relay、nginx、三张证书到期与 DNS A 记录，用 §7.6 的 `healthcheck.sh`。
+
 ## 4. 部署步骤（G2，照抄）
 
 在云主机上以 root 执行（仓库与 dist 一起放上去，脚本从仓库根运行）：
@@ -217,33 +219,26 @@ hz status
 
 ```sh
 curl -fsSL https://coord.<域名>/install.sh | sudo sh
-echo 'HZD_RELAY_ADDR=https://relay.<域名>' | sudo tee -a /etc/default/hzd
-sudo systemctl restart hzd
 sudo hz up --auth-key <Auth Key>
 ```
 
-> 第二行是必须的：install.sh（#17）目前只写 `HZD_COORD_ADDR`；Relay 地址
-> 只有环境变量 `HZD_RELAY_ADDR` 一个入口（无 CLI flag）。
+`install.sh` 看到 Coordination Server 地址是 `https://coord.<域名>` 时，把
+`HZD_RELAY_ADDR=https://relay.<域名>` 写入 `/etc/default/hzd`（ADR-0004 的三子域名）。
+已经存在的 `HZD_RELAY_ADDR` 重跑安装时原样保留。Relay 不在 `relay.<域名>` 上时，
+安装前设置 `HZNET_RELAY_ADDR`（写法见 [install-guide.md](install-guide.md) §6）。
+hzd 没有对应的命令行 flag；私有 CA 仍要另写 `HZD_RELAY_CA_PATH`。
 
 ### 6.4 macOS Node
 
 ```sh
 curl -fsSL https://coord.<域名>/install.sh | sudo sh
-```
-
-launchd 不继承 shell 环境变量，且 install.sh 生成的 plist 只带
-`HZD_COORD_ADDR`，需要手工补 Relay 地址（`/Library/LaunchDaemons/com.hznet.hzd.plist`
-的 `EnvironmentVariables` 字典里加一项；之后重跑 install.sh 升级会保留这一项）：
-
-```sh
-sudo /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables:HZD_RELAY_ADDR string https://relay.<域名>' \
-  /Library/LaunchDaemons/com.hznet.hzd.plist
-sudo launchctl bootout system/com.hznet.hzd 2>/dev/null || true
-# 旧 hzd 退出前要先恢复 DNS 配置，等它从 launchd 卸载完再加载，否则 bootstrap 报 I/O 错误
-while sudo launchctl print system/com.hznet.hzd >/dev/null 2>&1; do sleep 1; done
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.hznet.hzd.plist
 sudo hz up --auth-key <Auth Key>
 ```
+
+launchd 不继承 shell 环境变量。`install.sh` 把 `HZD_COORD_ADDR` 与（能确定时）
+`HZD_RELAY_ADDR` 写进 `/Library/LaunchDaemons/com.hznet.hzd.plist` 的
+`EnvironmentVariables`，再加载服务。已有的 `HZD_RELAY_ADDR` 重跑时保留。
+非标准 Relay 地址与私有 CA 见 [install-guide.md](install-guide.md) §6。
 
 macOS 的详细冒烟步骤（utun、路由、launchd、DNS）见
 [docs/macos-smoke-test.md](macos-smoke-test.md)。无 Auth Key 时 `sudo hz up`
@@ -341,6 +336,18 @@ coord `:9100`、relay `:9101` 只绑 127.0.0.1。Prometheus 跑在同机时，�
 `packaging/deploy/prometheus/scrape.yml` 的片段并入 `prometheus.yml`。异地
 抓取走 SSH 隧道（`ssh -L 9100:127.0.0.1:9100 ...`），不要把端口开进安全组。
 关键指标：在线 Node 数、按 Node 的 Relay 流量与限速丢弃、打洞成功率（FR-12）。
+
+### 7.6 健康检查
+
+只读，不重启、不改文件。在云主机上：
+
+```sh
+sudo bash scripts/deploy/healthcheck.sh --domain <域名>
+```
+
+省略 `--domain` 时从 `/etc/default/hz-coord` 的 `--public-url`（其次 `/etc/default/hzd` 的 `HZD_COORD_ADDR`）推导，主机名须为 `coord.<域名>`。
+
+逐项打印 `PASS` / `FAIL` / `SKIP`（供以后 Admin Console 健康页复用）：Coordination Server 本机 `http://127.0.0.1:8080/healthz`、Relay 的 TLS（先 `127.0.0.1:443` 上的 SNI `relay.<域名>`，不通再看 `:8444`）、Kanidm `https://auth.<域名>/status`（经本机 443，避免绕回公网 IP）、`nginx -t`（未安装 nginx 则 SKIP）、`/etc/hznet/tls/{coord,relay,auth}/fullchain.pem` 是否在 `--cert-days`（默认 14）天内到期、三条 DNS A 记录（有 `getent` 或 `python3` 才查；三者不一致也算 FAIL）。任一 FAIL 则退出码非零。
 
 ## 8. 与第三方 TUN 类网络工具共存
 
