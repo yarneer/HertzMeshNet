@@ -79,6 +79,21 @@ impl Metrics {
         self.refresh_ratio();
     }
 
+    /// 打洞计数摘要（Relay 路径指标）。与 Prometheus 计数同一份状态。
+    pub fn punch_summary(&self) -> PunchSummary {
+        let attempts = self.punch_attempts.get();
+        let success = self.punch_success.get();
+        PunchSummary {
+            attempts,
+            success,
+            ratio: if attempts == 0 {
+                0.0
+            } else {
+                success as f64 / attempts as f64
+            },
+        }
+    }
+
     fn refresh_ratio(&self) {
         let attempts = self.punch_attempts.get();
         let success = self.punch_success.get();
@@ -98,6 +113,14 @@ impl Metrics {
         let _ = encoder.encode(&self.registry.gather(), &mut buffer);
         String::from_utf8_lossy(&buffer).into_owned()
     }
+}
+
+/// `hz_coord_punch_*` 的当前值，给 Admin 健康页，不走 Prometheus 文本。
+#[derive(Debug, Clone, Copy)]
+pub struct PunchSummary {
+    pub attempts: u64,
+    pub success: u64,
+    pub ratio: f64,
 }
 
 struct MetricsState {

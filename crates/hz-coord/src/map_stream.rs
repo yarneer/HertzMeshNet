@@ -90,6 +90,14 @@ impl MapHub {
     pub fn online_nodes(&self) -> usize {
         self.subscribers.lock().expect("map hub poisoned").len()
     }
+
+    /// 该 Node 是否有打开中的 Network Map 下发流。
+    pub fn is_online(&self, node_id: &str) -> bool {
+        self.subscribers
+            .lock()
+            .expect("map hub poisoned")
+            .contains_key(node_id)
+    }
 }
 
 /// 一轮推送的输入快照：全部在册 Node + 当前 Policy（None = 尚无 Policy，

@@ -18,7 +18,7 @@ use axum::routing::get;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::admin_http::{self, AdminGate};
+use crate::admin_http::{self, AdminGate, ConsoleState};
 use crate::authkey;
 use crate::login::{LoginRegistry, TakeError};
 use crate::oidc::OidcClient;
@@ -44,6 +44,8 @@ pub struct HttpState {
     pub dist: Option<Arc<DistState>>,
     /// Admin Console 的 OIDC 会话（与 Node 的 [`LoginRegistry`] 分开）。
     pub admin: AdminGate,
+    /// Admin REST 读在线数、打洞计数和备份/证书路径。缺省时在线数为 0。
+    pub console: ConsoleState,
 }
 
 /// serve 启动参数里的分发配置；DistState 是它扫描产物。

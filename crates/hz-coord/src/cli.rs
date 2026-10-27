@@ -329,6 +329,16 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             public_grpc_addr: grpc_addr,
         });
     }
+    config.ops.db_path = Some(db);
+    if let Some(path) = env_value("HZNET_BACKUP_SCRIPT") {
+        config.ops.backup_script = PathBuf::from(path);
+    }
+    if let Some(path) = env_value("HZ_BACKUP_DIR") {
+        config.ops.backup_dir = PathBuf::from(path);
+    }
+    if let Some(path) = env_value("HZNET_TLS_DIR") {
+        config.ops.tls_dir = PathBuf::from(path);
+    }
     let handle = serve(config).await?;
     tokio::signal::ctrl_c().await?;
     tracing::info!("ctrl-c received, hz-coord shutting down");
