@@ -45,8 +45,159 @@ main h2 {
   font-size: 1.25rem;
 }
 
+main h3 {
+  margin: 1rem 0 0.35rem;
+  font-size: 1rem;
+}
+
 main p {
+  margin: 0.35rem 0;
+}
+
+.note {
+  color: GrayText;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: progress;
+}
+
+label {
+  display: grid;
+  gap: 0.15rem;
+}
+
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.stack {
+  max-width: 36rem;
+  margin: 0.75rem 0;
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.msg:empty {
+  display: none;
+}
+
+.msg[data-kind="err"] {
+  font-weight: 700;
+}
+
+.msg[data-kind="ok"] {
+  font-weight: 700;
+}
+
+.wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0 0.75rem;
+}
+
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid GrayText;
+  word-break: break-word;
+}
+
+td[data-status="expiring"],
+td[data-status="expired"],
+td[data-status="missing"],
+td[data-status="unreadable"] {
+  font-weight: 700;
+}
+
+tr.revoked td {
+  color: GrayText;
+}
+
+code,
+pre {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85em;
+}
+
+pre {
+  overflow: auto;
+  margin: 0.35rem 0;
+  padding: 0.6rem 0.75rem;
+  background: ButtonFace;
+  border: 1px solid GrayText;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: 8rem 1fr;
+  gap: 0.2rem 0.75rem;
+  margin: 0.35rem 0 0.75rem;
+}
+
+dt {
+  color: GrayText;
+}
+
+dd {
   margin: 0;
+  word-break: break-word;
+}
+
+.secret {
+  max-width: 40rem;
+  margin: 0.75rem 0;
+  padding: 0.75rem;
+  border: 1px solid GrayText;
+}
+
+article.step {
+  margin: 0 0 1.25rem;
+}
+
+dialog {
+  max-width: 28rem;
+  border: 1px solid GrayText;
+  background: Canvas;
+  color: CanvasText;
+  padding: 1rem;
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+dialog p {
+  margin: 0 0 0.75rem;
+}
+
+dialog input {
+  width: 100%;
+  margin: 0 0 0.75rem;
+  box-sizing: border-box;
 }
 
 section:target {
