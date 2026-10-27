@@ -839,8 +839,13 @@ impl SocketEngine {
         }
         let socket = self.socket();
         for candidate in candidates {
-            if let Err(error) = socket.send_to(&datagram, candidate).await {
-                tracing::debug!(node_id, endpoint = %candidate, %error, "punch send failed");
+            if let Err(error) = send_udp(&socket, &datagram, candidate).await {
+                tracing::debug!(
+                    node_id,
+                    endpoint = %candidate,
+                    error = %format!("{error:#}"),
+                    "punch send failed"
+                );
             }
         }
     }
@@ -1030,6 +1035,9 @@ impl SocketEngine {
                 received = socket.recv_from(&mut buf) => {
                     match received {
                         Ok((len, from)) => {
+                            // 双栈 socket 把 IPv4 对端报成 v4-mapped；还原成 V4
+                            // 才能和 Network Map 里的 Endpoint 对上。
+                            let from = dual_stack_peer_addr(from);
                             let datagram = &buf[..len];
                             // STUN 响应按事务 id 路由回等待中的查询，不进 WireGuard。
                             if self.stun_router.dispatch(datagram) {
@@ -1056,9 +1064,43 @@ impl SocketEngine {
     }
 }
 
+/// 双栈（本地地址为 IPv6）socket 的发送目的地。macOS 对 AF_INET6 socket
+/// 上的 IPv4 `sockaddr_in` 返回 EINVAL；改成 v4-mapped 后 Linux 与 macOS
+/// 都能发出。纯 v4 socket 与已经是 V6 的目的地原样返回。
+pub(crate) fn dual_stack_send_addr(local: SocketAddr, dest: SocketAddr) -> SocketAddr {
+    match (local.is_ipv6(), dest) {
+        (true, SocketAddr::V4(v4)) => {
+            SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+        }
+        _ => dest,
+    }
+}
+
+/// 双栈 socket 收上来的 v4-mapped 对端还原成 V4，与 Network Map 里的
+/// Endpoint 写法一致。其余地址（含带 scope 的 IPv6）原样返回。
+pub(crate) fn dual_stack_peer_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.ip().to_canonical() {
+        IpAddr::V4(v4) if addr.is_ipv6() => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+        _ => addr,
+    }
+}
+
+/// 经双栈 socket 的 UDP 发送都走这里，发出前做 [`dual_stack_send_addr`]。
+pub(crate) async fn send_udp(
+    socket: &UdpSocket,
+    datagram: &[u8],
+    dest: SocketAddr,
+) -> std::io::Result<usize> {
+    let dest = match socket.local_addr() {
+        Ok(local) => dual_stack_send_addr(local, dest),
+        Err(_) => dest,
+    };
+    socket.send_to(datagram, dest).await
+}
+
 /// 单 socket 双栈绑定：先试 [::] 关闭 v6only（v4-mapped 收 v4），失败再退
 /// 纯 v4。打洞与 WireGuard 共用这一个 socket（ADR-0002），IPv6 直连也必须
-/// 落在它上面。
+/// 落在它上面。向这个 socket 发 IPv4 必须经 [`send_udp`]（macOS 否则 EINVAL）。
 async fn bind_dual_stack(port: u16) -> anyhow::Result<UdpSocket> {
     match socket2::Socket::new(
         socket2::Domain::IPV6,
@@ -1122,7 +1164,7 @@ async fn send_to_network(socket: &Arc<UdpSocket>, sends: Vec<NetworkSend>) {
         let mut candidates = std::iter::once(send.primary).chain(send.alternates.iter().copied());
         let mut sent = false;
         for candidate in candidates.by_ref() {
-            match socket.send_to(&send.datagram, candidate).await {
+            match send_udp(socket, &send.datagram, candidate).await {
                 Ok(_) => {
                     sent = true;
                     break;
@@ -1130,7 +1172,7 @@ async fn send_to_network(socket: &Arc<UdpSocket>, sends: Vec<NetworkSend>) {
                 Err(error) => tracing::warn!(
                     node_id = %send.node_id,
                     endpoint = %candidate,
-                    %error,
+                    error = %format!("{error:#}"),
                     "udp send failed, rotating endpoint"
                 ),
             }
@@ -1229,5 +1271,66 @@ mod tests {
             "127.0.0.1:80".parse::<SocketAddr>().unwrap()
         );
         assert!(coord_probe_target("no-port-here").is_err());
+    }
+
+    #[test]
+    fn dual_stack_send_addr_maps_v4_only_on_ipv6_socket() {
+        let v6_local: SocketAddr = "[::]:51820".parse().unwrap();
+        let v4_local: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::5]:51820".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:51820".parse().unwrap();
+
+        assert_eq!(dual_stack_send_addr(v6_local, v4), mapped);
+        assert_eq!(dual_stack_peer_addr(dual_stack_send_addr(v6_local, v4)), v4);
+        assert_eq!(dual_stack_send_addr(v6_local, v6), v6);
+        assert_eq!(dual_stack_send_addr(v6_local, mapped), mapped);
+        assert_eq!(
+            dual_stack_send_addr(v4_local, v4),
+            v4,
+            "纯 v4 socket 不改写目的地"
+        );
+    }
+
+    #[test]
+    fn dual_stack_peer_addr_unmaps_v4_mapped_and_keeps_v6() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:51820".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::5]:51820".parse().unwrap();
+        let scoped: SocketAddr = "[fe80::1%1]:51820".parse().unwrap();
+
+        assert_eq!(dual_stack_peer_addr(mapped), v4);
+        assert_eq!(dual_stack_peer_addr(v4), v4);
+        assert_eq!(dual_stack_peer_addr(v6), v6);
+        assert_eq!(dual_stack_peer_addr(scoped), scoped);
+    }
+
+    #[tokio::test]
+    async fn dual_stack_socket_sends_udp_to_ipv4_loopback() {
+        let sender = bind_dual_stack(0).await.unwrap();
+        assert!(
+            sender.local_addr().unwrap().is_ipv6(),
+            "本测试要求双栈绑定成功；纯 v4 回退测不到 macOS 的 EINVAL"
+        );
+        let listener = bind_dual_stack(0).await.unwrap();
+        let dest = SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            listener.local_addr().unwrap().port(),
+        );
+
+        send_udp(&sender, b"hz-v4", dest)
+            .await
+            .expect("双栈 socket 向 127.0.0.1 发送");
+
+        let mut buf = [0u8; 8];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buf))
+            .await
+            .expect("2s 内应收到回环包")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hz-v4");
+        assert_eq!(
+            dual_stack_peer_addr(from),
+            SocketAddr::new("127.0.0.1".parse().unwrap(), from.port())
+        );
     }
 }
