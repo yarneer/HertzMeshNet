@@ -1,4 +1,4 @@
-//! Admin Console 的静态壳，编进 `hz-coord`，没有前端构建。
+//! Admin Console 的静态页面，编进 `hz-coord`，没有前端构建。
 //!
 //! `/admin/` 与 `/admin` 返回 [`index`]。样式和脚本是
 //! `/admin/console.css`、`/admin/console.js`。登录门禁在 [`crate::admin_http`]。

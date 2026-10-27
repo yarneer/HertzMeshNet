@@ -21,25 +21,146 @@
   <main>
     <section id="nodes">
       <h2>Nodes</h2>
-      <p>即将就绪</p>
+      <p class="note">列出全部 Node，含已吊销。吊销保留记录；删除不可恢复。</p>
+      <p><button type="button" id="nodes-refresh">刷新</button></p>
+      <p id="nodes-msg" class="msg" role="status"></p>
+      <div id="nodes-table" class="wrap"><p>正在读取…</p></div>
     </section>
     <section id="keys">
       <h2>Auth Keys</h2>
-      <p>即将就绪</p>
+      <p class="note">只签发，或按当时给出的 Key ID 吊销。没有 Key 清单。明文只在签发成功时出现一次。</p>
+      <form id="key-create" class="stack">
+        <label>到期时间
+          <input name="expires" type="datetime-local" required>
+        </label>
+        <label class="check"><input name="single_use" type="checkbox" checked> 一次性</label>
+        <label>Tag（至少一个，逗号或空格分隔）
+          <input name="tags" required placeholder="server" autocomplete="off">
+        </label>
+        <p><button type="submit">签发</button></p>
+      </form>
+      <div id="key-once" class="secret" hidden>
+        <p>明文只显示这一次。点「我已保存」或离开后无法再查看。</p>
+        <p>Key ID</p>
+        <pre id="key-id"></pre>
+        <p><button type="button" data-copy="key-id">复制 Key ID</button></p>
+        <p>Auth Key</p>
+        <pre id="key-plain"></pre>
+        <p>
+          <button type="button" data-copy="key-plain">复制 Auth Key</button>
+          <button type="button" id="key-dismiss">我已保存</button>
+        </p>
+      </div>
+      <form id="key-revoke" class="stack">
+        <label>Key ID
+          <input name="key_id" required autocomplete="off" spellcheck="false">
+        </label>
+        <p><button type="submit">吊销</button></p>
+      </form>
+      <p id="keys-msg" class="msg" role="status"></p>
     </section>
     <section id="ops">
       <h2>健康与运维</h2>
-      <p>即将就绪</p>
+      <p class="note">健康汇总来自健康接口；备份目录与证书来自运维状态。这里只能触发一次打包备份，不能重启、升级或执行命令。</p>
+      <p><button type="button" id="ops-refresh">刷新</button></p>
+      <h3>健康</h3>
+      <dl id="ops-health"><div>正在读取…</div></dl>
+      <h3>备份与证书</h3>
+      <dl id="ops-backup"></dl>
+      <div id="ops-certs" class="wrap"></div>
+      <p>
+        <button type="button" id="backup-run">立即备份</button>
+      </p>
+      <p id="ops-msg" class="msg" role="status"></p>
     </section>
     <section id="policy">
       <h2>Policy</h2>
-      <p>即将就绪</p>
+      <p class="note">只读当前 Policy 与版本。不能在此编辑、推送或回滚。</p>
+      <p><button type="button" id="policy-refresh">刷新</button></p>
+      <p id="policy-meta">正在读取…</p>
+      <pre id="policy-body"></pre>
+      <h3>历史</h3>
+      <ul id="policy-history"></ul>
+      <p id="policy-msg" class="msg" role="status"></p>
     </section>
     <section id="wizard">
       <h2>部署向导</h2>
-      <p>即将就绪</p>
+      <p class="note">按顺序照抄到服务器上自己执行。本页不执行命令，不打开远程 shell，不签发证书，不恢复备份，也不重启服务。形态是 musl 静态二进制加 systemd，不用容器。把命令里的占位符换成你的域名与路径。细节以仓库 <a href="https://github.com/yarneer/HertzMeshNet/blob/dev/docs/runbook.md">runbook</a> 为准。</p>
+
+      <article class="step">
+        <h3>1. DNS 与 SNI</h3>
+        <p>大陆云主机使用已备案域名。三条 A 记录指向同一公网 IP：<code>coord</code>、<code>relay</code>、<code>auth</code>。安全组只放行 TCP 443、TCP 80、UDP 3478。443 由 nginx 按 SNI 把整条连接分给三个服务，每个子域名一张只含自身名字的证书。</p>
+        <pre id="wiz-dns"><code>dig +short coord.&lt;域名&gt; A
+dig +short relay.&lt;域名&gt; A
+dig +short auth.&lt;域名&gt; A</code></pre>
+        <p><button type="button" data-copy="wiz-dns">复制命令</button></p>
+      </article>
+
+      <article class="step">
+        <h3>2. 安装服务</h3>
+        <p>在仓库根目录执行。脚本安装 nginx、hz-coord、hz-relay、hzd，并写 systemd 单元。Kanidm 同样是原生二进制加 systemd，不是容器。dist 来自 Release 产物，或 <code>x86_64-unknown-linux-musl</code> 的 release 构建。</p>
+        <pre id="wiz-install"><code>sudo bash scripts/deploy/server-bootstrap.sh \
+  --domain &lt;域名&gt; \
+  --dist &lt;dist 目录绝对路径&gt; \
+  --kanidm-tarball &lt;kanidm 发布包路径或 URL，可选&gt;</code></pre>
+        <p><button type="button" data-copy="wiz-install">复制命令</button></p>
+      </article>
+
+      <article class="step">
+        <h3>3. 证书</h3>
+        <p>bootstrap 会先放占位自签证书。正式证书用 acme.sh，coord / relay / auth 各一张。续期由 acme.sh 的定时任务完成。测试环境可加 <code>--self-signed</code>。</p>
+        <pre id="wiz-certs"><code>sudo bash scripts/deploy/certs.sh --domain &lt;域名&gt; --account-email &lt;你的邮箱&gt;
+curl -fsS https://coord.&lt;域名&gt;/healthz
+curl -fsS https://auth.&lt;域名&gt;/status</code></pre>
+        <p><button type="button" data-copy="wiz-certs">复制命令</button></p>
+      </article>
+
+      <article class="step">
+        <h3>4. Kanidm 与 hznet_admins</h3>
+        <p>前提是正式证书已装好。脚本创建 <code>hznet_admins</code> 与第一个管理员，并登记 OIDC 回调 <code>https://coord.&lt;域名&gt;/admin/oidc/callback</code>。口令与 client secret 只打印一次。只有该组成员能进入本控制台。之后加人用第二条命令。</p>
+        <pre id="wiz-kanidm"><code>sudo bash scripts/deploy/kanidm-init.sh --domain &lt;域名&gt; --admin-name &lt;登录名&gt;
+kanidm group add-members hznet_admins &lt;某人&gt;</code></pre>
+        <p><button type="button" data-copy="wiz-kanidm">复制命令</button></p>
+      </article>
+
+      <article class="step">
+        <h3>5. bootstrap 与首个 Node</h3>
+        <p>签发第一把 Auth Key（必须带至少一个 Tag）并让云主机自己接入。明文只显示一次。其他机器用 install.sh 后同样 <code>hz up</code>。要让 Node 归属某个 User，在该机器上交互登录，而不是只用 Auth Key。</p>
+        <pre id="wiz-node"><code>sudo bash scripts/deploy/hz-bootstrap.sh --admin &lt;登录名&gt; --expiry 365d --tag server
+sudo hz up --auth-key &lt;Auth Key&gt;
+hz status
+curl -fsSL https://coord.&lt;域名&gt;/install.sh | sudo sh
+sudo hz up --auth-key &lt;Auth Key&gt;</code></pre>
+        <p><button type="button" data-copy="wiz-node">复制命令</button></p>
+      </article>
+
+      <article class="step">
+        <h3>6. Relay 地址</h3>
+        <p>Coordination Server 主机名是 <code>coord.&lt;域名&gt;</code> 时，install.sh 写入 <code>HZD_RELAY_ADDR=https://relay.&lt;域名&gt;</code>：Linux 在 <code>/etc/default/hzd</code>，macOS 在 launchd plist。已有值重跑保留。Relay 不在这个名字上时，安装前设置 <code>HZNET_RELAY_ADDR</code>（sudo 会清环境变量，用 <code>sudo env</code>）。hzd 没有对应的命令行参数。</p>
+        <pre id="wiz-relay"><code>curl -fsSL https://coord.&lt;域名&gt;/install.sh | sudo sh
+curl -fsSL https://coord.&lt;域名&gt;/install.sh | sudo env HZNET_RELAY_ADDR=https://relay.example.com:8443 sh</code></pre>
+        <p><button type="button" data-copy="wiz-relay">复制命令</button></p>
+      </article>
+
+      <article class="step">
+        <h3>7. 备份 cron</h3>
+        <p>本页的「立即备份」只触发一次打包。日常备份写在 root 的 crontab 里，由你自己添加。健康检查脚本只打印，不改文件；备份新旧不在那支脚本里，看上面的运维状态。</p>
+        <pre id="wiz-backup"><code>0 4 * * * /bin/bash /path/to/HertzMeshNet/scripts/deploy/backup.sh --with-kanidm &gt;&gt; /var/log/hznet-backup.log 2&gt;&amp;1
+sudo bash scripts/deploy/healthcheck.sh --domain &lt;域名&gt;</code></pre>
+        <p><button type="button" data-copy="wiz-backup">复制命令</button></p>
+      </article>
     </section>
   </main>
+  <dialog id="ask">
+    <form method="dialog">
+      <p id="ask-text"></p>
+      <input id="ask-input" hidden autocomplete="off">
+      <div class="row-actions">
+        <button type="submit" value="ok">确认</button>
+        <button type="submit" value="cancel" formnovalidate>取消</button>
+      </div>
+    </form>
+  </dialog>
   <script src="/admin/console.js"></script>
 </body>
 </html>

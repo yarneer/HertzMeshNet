@@ -1434,13 +1434,22 @@ mod tests {
             "href=\"#ops\">健康与运维",
             "href=\"#policy\">Policy",
             "href=\"#wizard\">部署向导",
-            "<p>即将就绪</p>",
+            "id=\"nodes-table\"",
+            "id=\"key-create\"",
+            "id=\"key-revoke\"",
+            "id=\"key-once\"",
+            "id=\"policy-body\"",
+            "id=\"ops-health\"",
+            "id=\"ops-backup\"",
+            "id=\"backup-run\"",
+            "本页不执行命令",
             "/admin/console.css",
             "/admin/console.js",
         ] {
             assert!(html.contains(needle), "{needle} missing");
         }
-        assert_eq!(html.matches("<p>即将就绪</p>").count(), 5);
+        assert!(!html.contains("即将就绪"));
+        assert!(!html.contains("systemctl"));
 
         let bare = client
             .get(format!("{base}/admin"))
@@ -1479,12 +1488,24 @@ mod tests {
                 .unwrap()
                 .starts_with("text/javascript")
         );
-        assert!(
-            js.text()
-                .await
-                .unwrap()
-                .contains("fetch(\"/admin/api/me\")")
-        );
+        let source = js.text().await.unwrap();
+        assert!(source.contains("api(\"/admin/api/me\")"));
+        for needle in [
+            "\"/admin/api/nodes\"",
+            "\"/admin/api/auth-keys\"",
+            "\"/admin/api/policy\"",
+            "\"/admin/api/health\"",
+            "\"/admin/api/ops/status\"",
+            "\"/admin/api/ops/backup\"",
+            "method: \"POST\"",
+            "method: \"DELETE\"",
+        ] {
+            assert!(source.contains(needle), "{needle} missing");
+        }
+        // 签发是 POST /admin/api/auth-keys。没有列表，不能 GET 这个集合。
+        assert!(!source.contains("api(\"/admin/api/auth-keys\")"));
+        assert!(!source.contains("fetch(\"/admin/api/auth-keys\")"));
+        assert!(!source.contains("systemctl"));
 
         let replay = client
             .get(format!("{base}/admin/oidc/callback"))
