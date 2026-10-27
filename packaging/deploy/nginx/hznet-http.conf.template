@@ -3,7 +3,10 @@
 # （由 /etc/nginx/streams-enabled/hznet.conf 的 SNI 分流送进来）。
 #
 # hz-coord 两个本地监听：gRPC 明文 h2（127.0.0.1:50051，grpc_pass 直转）与
-# HTTP 明文（127.0.0.1:8080，/install.sh、/dl/、/oidc/、/admin/、/healthz）。
+# HTTP 明文（127.0.0.1:8080）。HTTP 面包含：
+#   /install.sh、/dl/、/oidc/start|callback、/healthz
+#   /admin/、/admin/login、/admin/oidc/callback、/admin/api/
+# Admin Console 与 Kanidm 的回调都在 /admin/ 下，不另开 location，也不另开 OAuth2 客户端。
 
 server {
     listen 80;
@@ -48,7 +51,10 @@ server {
         grpc_send_timeout 3600s;
     }
 
-    # HTTP 面：/install.sh、/dl/<os>-<arch>/<bin>、/oidc/start|callback、/admin/、/healthz
+    # HTTP 面，同一上游。下面这些路径都由这条 location / 转到 127.0.0.1:8080：
+    #   /install.sh、/dl/<os>-<arch>/<bin>、/oidc/start|callback、/healthz
+    #   /admin/、/admin/login、/admin/oidc/callback（Kanidm 严格回调，见 runbook §5.1）
+    #   /admin/api/（会话 cookie 的 Path 是 /admin，所以 API 与页面走同一条反代）
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;

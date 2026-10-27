@@ -1112,6 +1112,11 @@ fn escape_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! 不连接 Kanidm。[`spawn_idp`] 在 127.0.0.1 上提供 token 与 userinfo，
+    //! `cargo test -p hz-coord admin_http` 与 CI 的 `cargo test --all` 都跑这些测试。
+    //! 真实 Kanidm 在 `tests/kanidm_login.rs`，`#[ignore]`，由
+    //! `scripts/test/kanidm/run.sh` 显式启用。静态页没有前端构建。
+    //! 证书用例调用本机 openssl。约束说明见 docs/admin-console-v1.md「测试」。
     use std::sync::Mutex;
 
     use axum::Router;
@@ -1309,6 +1314,18 @@ mod tests {
             .unwrap()
     }
 
+    async fn login_cookie(client: &reqwest::Client, base: &str, idp: &Idp) -> String {
+        let callback = callback_on(client, base, idp).await;
+        assert_eq!(callback.status(), 307, "admin login");
+        callback.headers()["set-cookie"]
+            .to_str()
+            .expect("set-cookie")
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_owned()
+    }
+
     #[tokio::test]
     async fn unauthenticated_api_is_401_json_and_browser_redirects_to_login() {
         let (base, _handle) = start(None).await;
@@ -1330,26 +1347,54 @@ mod tests {
             .unwrap();
         assert_api_error(forged, 401, UNAUTHENTICATED, UNAUTHENTICATED_MESSAGE).await;
 
-        let post = client
-            .post(format!("{base}/admin/api/me"))
-            .send()
-            .await
-            .unwrap();
-        assert_api_error(post, 401, UNAUTHENTICATED, UNAUTHENTICATED_MESSAGE).await;
-
-        let backup = client
-            .post(format!("{base}/admin/api/ops/backup"))
-            .send()
-            .await
-            .unwrap();
-        assert_api_error(backup, 401, UNAUTHENTICATED, UNAUTHENTICATED_MESSAGE).await;
-
-        let missing = client
-            .get(format!("{base}/admin/api/no-such"))
-            .send()
-            .await
-            .unwrap();
-        assert_api_error(missing, 401, UNAUTHENTICATED, UNAUTHENTICATED_MESSAGE).await;
+        // 门禁包住每条主路径，也包括清单 / Policy 写入 / 重启升级这些没有实现的路径。
+        for (method, path) in [
+            ("GET", "/admin/api/me"),
+            ("GET", "/admin/api/nodes"),
+            ("DELETE", "/admin/api/nodes/n1"),
+            ("POST", "/admin/api/nodes/n1/rename"),
+            ("POST", "/admin/api/nodes/n1/revoke"),
+            ("POST", "/admin/api/auth-keys"),
+            ("GET", "/admin/api/auth-keys"),
+            ("POST", "/admin/api/auth-keys/k1/revoke"),
+            ("GET", "/admin/api/policy"),
+            ("POST", "/admin/api/policy"),
+            ("PUT", "/admin/api/policy"),
+            ("GET", "/admin/api/health"),
+            ("GET", "/admin/api/ops/status"),
+            ("POST", "/admin/api/ops/backup"),
+            ("POST", "/admin/api/ops/restart"),
+            ("POST", "/admin/api/ops/upgrade"),
+            ("GET", "/admin/api/no-such"),
+        ] {
+            let response = client
+                .request(method.parse().unwrap(), format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let cache = response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let text = response.text().await.unwrap_or_default();
+            assert!(
+                status == StatusCode::UNAUTHORIZED
+                    && content_type.starts_with("application/json")
+                    && cache == "no-store"
+                    && text.contains("\"error\":\"unauthenticated\"")
+                    && text.contains(UNAUTHENTICATED_MESSAGE),
+                "{method} {path} -> {status} {content_type} {text}"
+            );
+        }
 
         for path in [
             "/admin",
@@ -1534,6 +1579,114 @@ mod tests {
             .await
             .unwrap();
         assert_api_error(me, 401, UNAUTHENTICATED, UNAUTHENTICATED_MESSAGE).await;
+    }
+
+    #[tokio::test]
+    async fn admin_api_closed_routes_and_backup_misconfig() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_script = root.path().join("missing-backup.sh");
+        let idp = spawn_idp(&["hznet_admins@localhost"]).await;
+        let store = Store::open_in_memory(AddressConfig::default())
+            .await
+            .unwrap();
+        let console = ConsoleState {
+            ops: OpsConfig {
+                backup_script: missing_script.clone(),
+                db_path: None,
+                ..OpsConfig::default()
+            },
+            ..ConsoleState::default()
+        };
+        let (base, _handle) = start_with(Some(oidc_for(&idp)), store, console).await;
+        let client = http();
+        let cookie = login_cookie(&client, &base, &idp).await;
+
+        let no_list = client
+            .get(format!("{base}/admin/api/auth-keys"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_list.status(), 405, "auth key list must not exist");
+        let no_list_body = no_list.text().await.unwrap();
+        assert!(
+            !no_list_body.contains("hznet."),
+            "list body leaked a key: {no_list_body}"
+        );
+
+        for method in ["POST", "PUT"] {
+            let write_policy = client
+                .request(method.parse().unwrap(), format!("{base}/admin/api/policy"))
+                .header("cookie", &cookie)
+                .json(&serde_json::json!({"content": "groups = []\n"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(write_policy.status(), 405, "{method} /admin/api/policy");
+        }
+
+        for path in ["/admin/api/ops/restart", "/admin/api/ops/upgrade"] {
+            let response = client
+                .post(format!("{base}{path}"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_api_error(response, 404, NOT_FOUND, NOT_FOUND_MESSAGE).await;
+        }
+
+        let bad_json = client
+            .post(format!("{base}/admin/api/auth-keys"))
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body("not-json")
+            .send()
+            .await
+            .unwrap();
+        assert_api_error(bad_json, 400, "invalid_argument", "请求体不是合法的 JSON").await;
+
+        let missing = client
+            .post(format!("{base}/admin/api/ops/backup"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_api_error(
+            missing,
+            503,
+            "unavailable",
+            &format!(
+                "未找到备份脚本 {}（设置 HZNET_BACKUP_SCRIPT）",
+                missing_script.display()
+            ),
+        )
+        .await;
+
+        let script = root.path().join("backup.sh");
+        let db = root.path().join("hznet.db");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::write(&script, "#!/bin/bash\necho 'disk full' >&2\nexit 1\n").unwrap();
+        let failed = ConsoleState {
+            ops: OpsConfig {
+                backup_script: script,
+                db_path: Some(db),
+                backup_dir: root.path().join("backups"),
+                ..OpsConfig::default()
+            },
+            ..ConsoleState::default()
+        };
+        let store = Store::open_in_memory(AddressConfig::default())
+            .await
+            .unwrap();
+        let (base, _handle) = start_with(Some(oidc_for(&idp)), store, failed).await;
+        let cookie = login_cookie(&client, &base, &idp).await;
+        let ran = client
+            .post(format!("{base}/admin/api/ops/backup"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_api_error(ran, 500, "backup_failed", "disk full").await;
     }
 
     #[test]

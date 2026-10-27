@@ -57,3 +57,17 @@ Deploy friction outside this note: `install.sh` writes `HZD_RELAY_ADDR` when the
 - 单独的 `hz-admin` 进程，或 Vue/React 构建链
 
 Out of scope: User self-service, containers or K8s, Policy edits in the browser, restart or upgrade through the UI or HTTP, arbitrary shell, gRPC-Web, a separate `hz-admin` process, and a Vue or React build.
+
+## 测试
+
+`/admin/api` 的会话门禁和 REST 主路径在 `crates/hz-coord/src/admin_http.rs` 的测试里，`cargo test --all` 与 `cargo test -p hz-coord admin_http` 都会跑到，CI 不需要外网。Kanidm 被进程内的假 token/userinfo 端点代替，不起容器。真实 Kanidm 只在 `crates/hz-coord/tests/kanidm_login.rs`，标了 `#[ignore]`，默认跳过；要跑时用 `bash scripts/test/kanidm/run.sh`（Docker）。证书状态断言调用本机 `openssl`。备份测试写自己的假脚本，不调用部署机上的 `backup.sh`。
+
+没有 SPA 构建。`crates/hz-coord/src/admin_ui/` 的 HTML/CSS/JS 用 `include_str!` 编进二进制。不要加 npm、Vite、Vue 或 React，CI 也不该出现前端构建步骤。
+
+失败时看测试函数名：`unauthenticated_api_is_401_json_and_browser_redirects_to_login` 是会话门禁（每条主路径未登录都是 JSON 401），`hznet_admins_session_can_read_me` 与 `oidc_login_outside_hznet_admins_does_not_open_a_session` 是假 IdP 登录，`admin_api_nodes_keys_policy_health_and_backup` 是 Node / Auth Key / Policy / 健康 / 备份主路径，`admin_api_closed_routes_and_backup_misconfig` 是 Key 清单、Policy 写入、重启升级这些不提供的路径，以及备份脚本缺失或失败时的错误正文。
+
+Tests for the `/admin/api` session gate and the main REST paths live in `crates/hz-coord/src/admin_http.rs`. `cargo test --all` and `cargo test -p hz-coord admin_http` run them with no network. Kanidm is replaced by an in-process fake token/userinfo endpoint; no container. The real Kanidm gate is `crates/hz-coord/tests/kanidm_login.rs`, marked `#[ignore]`, and runs only via `bash scripts/test/kanidm/run.sh` (Docker). Certificate assertions call the local `openssl`. Backup tests use a fake script, not the deploy host's `backup.sh`.
+
+There is no SPA build. HTML/CSS/JS under `crates/hz-coord/src/admin_ui/` are compiled in with `include_str!`. Do not add npm, Vite, Vue, or React, and CI should not grow a frontend build step.
+
+On failure, the test name locates the path: `unauthenticated_api_is_401_json_and_browser_redirects_to_login` is the session gate (every main path is JSON 401 when logged out), `hznet_admins_session_can_read_me` and `oidc_login_outside_hznet_admins_does_not_open_a_session` are the fake IdP login, `admin_api_nodes_keys_policy_health_and_backup` is the Node / Auth Key / Policy / health / backup paths, and `admin_api_closed_routes_and_backup_misconfig` is the absent key list, Policy writes, restart/upgrade, and backup errors when the script is missing or fails.

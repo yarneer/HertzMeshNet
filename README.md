@@ -85,7 +85,12 @@ cargo build --release          # 构建 / build
 cargo fmt --all                # 格式化 / format
 cargo clippy --all-targets -- -D warnings   # lint
 cargo test --all               # 单元与集成测试 / unit & integration tests
+cargo test -p hz-coord admin_http   # 只跑 Admin Console HTTP
 ```
+
+**Admin Console HTTP**（`/admin/api`）随上面的 `cargo test --all` 在 CI 里跑，不需要 Kanidm，也不需要前端构建。测试在进程内起一个假的 token/userinfo 端点（见 `crates/hz-coord/src/admin_http.rs`）。真实 Kanidm 的交互登录是 `#[ignore]`，只由 `bash scripts/test/kanidm/run.sh` 显式跑，并且要 Docker。静态页是 `include_str!` 编进 `hz-coord` 的 HTML/CSS/JS，没有 npm、Vite、Vue 或 React；CI 不会跑前端构建。证书状态那条断言调用本机 `openssl`（Ubuntu 与 macOS 的 CI runner 都有）。约定与 [docs/admin-console-v1.md](docs/admin-console-v1.md) 的「测试」一节相同。
+
+**Admin Console HTTP** (`/admin/api`) runs in CI under `cargo test --all`. It does not need Kanidm or a frontend build: the tests spawn an in-process fake token/userinfo endpoint (`crates/hz-coord/src/admin_http.rs`). The real Kanidm interactive-login gate is `#[ignore]` and runs only via `bash scripts/test/kanidm/run.sh`, which needs Docker. The pages are HTML/CSS/JS compiled in with `include_str!` — no npm, Vite, Vue, or React, and CI does not run a frontend build. The certificate-status assertion calls the local `openssl` binary (present on the Ubuntu and macOS CI runners). Same constraints as the「测试」section of [docs/admin-console-v1.md](docs/admin-console-v1.md).
 
 **Seam A —— NAT 拓扑集成门禁**：在单个特权 Docker 容器内用 network namespace + nftables 搭建模拟公网与三种 NAT（全锥 / 端口受限 / 对称型），端到端验证注册、直连打洞、Relay 兜底、Policy、限速、Admin 吊销、网络切换恢复、与接管默认路由的第三方 TUN 工具共存等场景（清单见 `scripts/test/topo/scenarios/`）。CI 在每次 push 时全量运行；本机一键复跑：
 

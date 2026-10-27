@@ -18,7 +18,9 @@
                       │
         coord.<域名> ─┤→ 127.0.0.1:8443  nginx https（终止 TLS）
                       │      ├─ /hz.v1.Coord/*  ─→ grpc(h2c) → 127.0.0.1:50051  hz-coord（gRPC 明文）
-                      │      └─ /install.sh /dl/ /oidc/ /healthz ─→ 127.0.0.1:8080  hz-coord（HTTP 明文）
+                      │      └─ 其余 HTTP ─→ 127.0.0.1:8080  hz-coord
+                      │            /install.sh /dl/ /oidc/ /healthz
+                      │            /admin/ /admin/login /admin/oidc/callback /admin/api/
         relay.<域名> ─┤→ 127.0.0.1:8444  hz-relay（自带 TLS 终止）
         auth.<域名>  ─┤→ 127.0.0.1:8445  kanidmd（自带 TLS 终止）
 
@@ -152,8 +154,9 @@ sudo tar -xzf kanidm-linux-x86_64.tar.gz -C /tmp \
 （规格要求"我方服务不用容器"；Kanidm 作为独立上游组件以原生二进制 +
 systemd 运行，与 hz-coord/hz-relay 同一形态。）
 
-此时 coord 已可对公网提供 `/install.sh` 与 `/dl/`，但登录与 Relay 还不可用，
-继续 §5、§6。
+此时 coord 已可对公网提供 `/install.sh` 与 `/dl/`。`/admin/` 会跳到
+`/admin/login`；§5 写好 OIDC 之前，该页返回「未配置交互式登录」。登录与 Relay
+还不可用，继续 §5、§6。
 
 ## 5. Kanidm 初始化（G2）
 
@@ -185,6 +188,53 @@ Coordination Server）。此后加管理员就是往 Kanidm 组里加人：
 
 ```sh
 kanidm group add-members hznet_admins <某人>
+```
+
+### 5.1 登录 Admin Console
+
+不需要第二个 OAuth2 客户端，也不需要新的回调路径。`kanidm-init.sh` 已经在
+同一个 `hznet-coord` 客户端上登记两条严格回调：
+
+- Node 交互登录：`https://coord.<域名>/oidc/callback`
+- Admin Console：`https://coord.<域名>/admin/oidc/callback`
+
+nginx 也不必为 `/admin` 再写一条 `location`。coord 的 TLS vhost 里现有的
+`location /` 把 `/admin/`、`/admin/login`、`/admin/oidc/callback` 和
+`/admin/api/` 反代到 `127.0.0.1:8080`（模板
+`packaging/deploy/nginx/hznet-http.conf.template`）。gRPC 仍只走
+`location /hz.v1.Coord/`。改过旧配置后：
+
+```sh
+sudo sed "s/@DOMAIN@/<域名>/g" packaging/deploy/nginx/hznet-http.conf.template \
+  | sudo tee /etc/nginx/sites-available/hznet >/dev/null
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+浏览器登录（证书与 §5 已完成）：
+
+1. 打开 `https://coord.<域名>/admin/`。未登录先到 `/admin/login`，再跳到
+   Kanidm。授权请求里的 `redirect_uri` 是
+   `https://coord.<域名>/admin/oidc/callback`。
+2. 用 `hznet_admins` 的成员登录（§5 打印的第一个管理员，或
+   `kanidm group add-members` 加进去的人）。不在组里会看到「无权进入」，不会发会话。
+3. 成功后回到 `/admin/`。会话 cookie 名 `hz_admin`，`Path=/admin`（因此
+   `/admin/api` 会带上），`HttpOnly`，回调是 https 时带 `Secure`，有效期 12
+   小时。会话只在 hz-coord 进程内存里，`systemctl restart hz-coord` 之后要重新登录。
+4. 页面是 Node 列表、Auth Key 签发与吊销（明文只出现一次，没有清单）、Policy
+   只读、健康与一次打包备份、部署向导（只给可复制命令）。没有重启、升级或任意 shell。
+
+未登录自检（不需要浏览器；正式证书已装时不要加 `-k`）：
+
+```sh
+curl -sI https://coord.<域名>/admin/ | tr -d '\r' | head -n 20
+# 预期：HTTP/2 307，location: /admin/login
+
+curl -sS -D- -o /tmp/admin-me.json https://coord.<域名>/admin/api/me
+# 预期：状态行 401。/tmp/admin-me.json 为
+# {"error":"unauthenticated","message":"需要 Admin 会话"}
+
+curl -sI http://127.0.0.1:8080/admin/ | tr -d '\r' | head -n 8
+# 绕过 nginx，同样应是 307。本机通、公网不通时，问题在 nginx 或证书，不在 hz-coord。
 ```
 
 ## 6. bootstrap 与首个 Node 接入（G2）
@@ -412,7 +462,11 @@ AC3 的三步（需要你自己的三台机器；Policy 以"dev 组可访问 db 
 | `hz up` 报连接 Coordination Server 失败 | `curl -fsS https://coord.<域名>/healthz`；不通看 `nginx -t`、`journalctl -u nginx`（SNI 分流按域名匹配，DNS 必须先生效）；证书过期看 §3 |
 | hz-coord 起不来，日志提 OIDC 发现文档 | OIDC 在启动时同步拉发现文档（`OidcClient::discover`）：确认 kanidm 已运行、正式证书已装、`/etc/default/hz-coord` 里 `--oidc-issuer` 指向 `https://auth.<域名>/oauth2/openid/hznet-coord` |
 | 交互式登录回调 404/被拒 | Kanidm 侧回调必须精确等于 `--oidc-redirect-uri`（`https://coord.<域名>/oidc/callback`）；重跑 §5 会重新 PATCH 回调 |
-| Admin Console 登录被拒 | 同一 OAuth2 客户端还要登记 `https://coord.<域名>/admin/oidc/callback`（重跑 §5）。只有 `hznet_admins` 的成员能建立会话 |
+| 打开 `https://coord.<域名>/admin/` 是 nginx 404 或默认页 | 先 `curl -sI http://127.0.0.1:8080/admin/`，预期 307 到 `/admin/login`。本机通、公网不通：`nginx -t`，确认 `/etc/nginx/sites-enabled/hznet` 的 `location /` 含 `proxy_pass http://127.0.0.1:8080`，然后按 §5.1 重装模板并 `systemctl reload nginx`。`journalctl -u nginx` 看 SNI 是否把 coord 送进了 8443 |
+| `/admin/login` 显示「未配置交互式登录」 | `/etc/default/hz-coord` 缺 `--oidc-*`，或 hz-coord 启动时没拉到发现文档。重跑 §5；`journalctl -u hz-coord` 与 `journalctl -u kanidm` |
+| Kanidm 报 `redirect_uri` 不匹配 | 必须精确等于 `https://coord.<域名>/admin/oidc/callback`，与 Node 的 `/oidc/callback` 是同一客户端上的两条，不要新建第二个 OAuth2 客户端。重跑 §5 |
+| 登录页写「无权进入」 | 该账号不在 `hznet_admins`。`kanidm group get-members hznet_admins`，然后 `kanidm group add-members hznet_admins <某人>`。只有组成员会拿到 `hz_admin` cookie |
+| 回到 `/admin/` 后接口仍是 401，或重启后又要登录 | 开发者工具里看有没有 `hz_admin`。没有：回调必须是 https（https 回调才加 `Secure`），`Path` 必须是 `/admin`（只写成 `/admin/` 会漏掉 `/admin/api`）。有 cookie 仍 401：会话在 hz-coord 内存里，`systemctl restart hz-coord` 会清掉，重新打开 `/admin/` |
 | 打开登录链接后 Kanidm 登录页 404（如 `/ui/login/begin`），或换无痕窗口才能登录 | 证书仍是一张覆盖三个子域名的多 SAN 证书，浏览器把 auth 的请求合并进了 coord 的连接：按 §3「已部署环境的迁移」换成单域名证书并更新 nginx 配置，然后重启浏览器 |
 | `hz login` 打印的登录链接是 `http://127.0.0.1:…` | hz-coord 低于 v0.1.4，或 `/etc/default/hz-coord` 缺 `--public-url https://coord.<域名>`（v0.1.4 起登录链接按它拼接，缺省时取 `--oidc-redirect-uri` 的主机） |
 | 配置 Policy 后某台 Node 与所有 Node 都不通，`hz node list` 显示「归属 User：无（Tag 注册）」「Tags：无」 | 它是用 v0.1.4 之前签发的无 Tag Auth Key 注册的，Policy 覆盖不到；按 §6.5 处置 |
