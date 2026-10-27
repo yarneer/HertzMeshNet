@@ -158,7 +158,7 @@ trap 'rm -rf "$STAGE"' EXIT
 fetch() { curl -fsSL -o "$2" "$1" || fail "下载失败：$1"; }
 
 manifest_sha() {
-  sed -n "s|^.*\"$1\",{\"sha256\":\"\([0-9a-f]*\)\".*|\1|p" "$STAGE/manifest.json"
+  sed -n "s|^.*\"$1\":{\"sha256\":\"\([0-9a-f]*\)\".*|\1|p" "$STAGE/manifest.json"
 }
 
 fetch "$COORD_URL/dl/manifest.json" "$STAGE/manifest.json"
