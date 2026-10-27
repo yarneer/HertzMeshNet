@@ -74,6 +74,7 @@ async fn registration_succeeds_over_tls_with_trusted_ca() {
 
     let response = client
         .register_with_auth_key(RegisterAuthKeyRequest {
+            invite_code: None,
             challenge_nonce: hello.challenge_nonce.clone(),
             challenge_signature: machine.sign(&hello.challenge_nonce).to_bytes().to_vec(),
             auth_key,

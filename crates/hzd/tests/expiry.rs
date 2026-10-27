@@ -49,7 +49,7 @@ async fn daemon_marks_itself_expired_when_swept_out_of_the_map() {
 
     // 对端 Node 先在册，hzd 的 Map 里能看到它，证明订阅已建立。
     let other_dir = tempfile::tempdir().unwrap();
-    register_with_auth_key(other_dir.path(), &auth_key, "node-b", &coord_addr)
+    register_with_auth_key(other_dir.path(), &auth_key, None, "node-b", &coord_addr)
         .await
         .unwrap();
 

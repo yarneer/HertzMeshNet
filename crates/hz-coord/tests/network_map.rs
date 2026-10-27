@@ -97,6 +97,7 @@ async fn register(
     let signature = keys.machine.sign(&hello.challenge_nonce);
     client
         .register_with_auth_key(RegisterAuthKeyRequest {
+            invite_code: None,
             challenge_nonce: hello.challenge_nonce,
             challenge_signature: signature.to_bytes().to_vec(),
             auth_key: auth_key.to_owned(),

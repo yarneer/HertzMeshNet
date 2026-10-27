@@ -70,6 +70,7 @@ async fn register_fresh(
         .to_vec();
     let response = client
         .register_with_auth_key(RegisterAuthKeyRequest {
+            invite_code: None,
             challenge_nonce: hello.challenge_nonce,
             challenge_signature: signature,
             auth_key: auth_key.to_owned(),

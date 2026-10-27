@@ -163,7 +163,7 @@ async fn daemon_survives_coord_outage_and_reconnects_after_recovery() {
     // 服务恢复：未重启的 hzd 自动重连；之后注册的 Node 必须不重启就对两端可见。
     let handle = restart_on_same_addr(&store, coord_local).await;
     let dir_c = tempfile::tempdir().unwrap();
-    let info_c = register_with_auth_key(dir_c.path(), &key_c, "node-c", &coord_addr)
+    let info_c = register_with_auth_key(dir_c.path(), &key_c, None, "node-c", &coord_addr)
         .await
         .unwrap();
     let ipv4_c = info_c.ipv4.clone();

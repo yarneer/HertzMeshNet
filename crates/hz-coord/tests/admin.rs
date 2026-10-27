@@ -92,6 +92,7 @@ async fn register_fresh_auth_key(
     let (nonce, signature) = signed_challenge(client, keys, hostname).await;
     client
         .register_with_auth_key(RegisterAuthKeyRequest {
+            invite_code: None,
             challenge_nonce: nonce,
             challenge_signature: signature,
             auth_key: auth_key.to_owned(),
@@ -530,6 +531,7 @@ async fn register_with_auth_key_status(
     let (nonce, signature) = signed_challenge(client, keys, hostname).await;
     client
         .register_with_auth_key(RegisterAuthKeyRequest {
+            invite_code: None,
             challenge_nonce: nonce,
             challenge_signature: signature,
             auth_key: auth_key.to_owned(),
