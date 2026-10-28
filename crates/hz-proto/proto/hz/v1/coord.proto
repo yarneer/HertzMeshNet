@@ -53,6 +53,11 @@ message HelloRequest {
   uint32 protocol_version = 1;
   bytes machine_key_pub = 2;
   string hostname = 3;
+  // Node 侧软件版本与平台（#71 / OB-1，optional：旧 Node 不携带）。
+  // node_version 与 `hzd --version` 是同一字符串（semver + commit 短哈希）。
+  optional string node_version = 4;
+  optional string os = 5;
+  optional string arch = 6;
 }
 
 message HelloResponse {
@@ -103,6 +108,9 @@ enum EndpointKind {
   ENDPOINT_KIND_STUN = 2;
   // 网卡上的全球单播 IPv6（无 NAT 预期）。
   ENDPOINT_KIND_V6 = 3;
+  // 端口映射（#77）：PCP / NAT-PMP / UPnP IGD 为 WireGuard 端口申请的
+  // 稳定公网映射，优先级高于 STUN。
+  ENDPOINT_KIND_PORT_MAP = 4;
 }
 
 message Endpoint {
@@ -123,6 +131,9 @@ message ReportEndpointsRequest {
   // 打洞结果记账（FR-12 打洞成功率）：本 Node 自启动起的累计值，
   // 服务端按 Node 去重差量后累加进全局计数。旧客户端缺省不上报。
   optional PathReport path_report = 7;
+  // Health Report（#72 / OB-2，optional：旧 Node 不携带）：本机 netcheck
+  // 结论与每个 Relayed 对端的原因。coord 内存保存，90 秒未更新即过期。
+  optional HealthReport health = 8;
 }
 
 message ReportEndpointsResponse {}
@@ -132,6 +143,34 @@ message ReportEndpointsResponse {}
 message PathReport {
   uint32 punch_attempts = 1;
   uint32 punch_success = 2;
+}
+
+// Health Report（#69 v0.3 / 规格 §3）：hzd 每 30 秒随 ReportEndpoints 上报，
+// 判定逻辑见 docs/v0.3-observability-spec.md。
+message HealthReport {
+  // 最近一轮 IPv4 STUN 是否成功发出并收到响应。
+  bool udp4_ok = 1;
+  // 同上，IPv6；无 IPv6 STUN 目标时为 false。
+  bool udp6_ok = 2;
+  // 是否拿到公网映射地址。
+  bool has_stun_mapping = 3;
+  // `easy`（两个 STUN 目标映射端口相同）/ `hard`（不同，端点相关映射）/
+  // `unknown`（只有一个目标成功）。第二个目标由 #76 提供。
+  string nat = 4;
+  // 默认路由是否由虚拟网卡持有（第三方 TUN 类网络工具开启）。
+  bool default_route_virtual = 5;
+  // 上报的 Endpoint 中有落在 198.18.0.0/15 或回环地址的。
+  bool suspicious_endpoint = 6;
+  // 当前 Direct Path 对端数。
+  uint32 direct_peers = 7;
+  // 当前 Relayed Path 对端：node_id + 本地判定的原因。
+  repeated RelayedPeer relayed_peers = 8;
+}
+
+message RelayedPeer {
+  string node_id = 1;
+  // `local_udp_broken` / `no_candidates` / `handshake_timeout` / `punch_pending`。
+  string reason = 2;
 }
 
 message BeginLoginRequest {
@@ -397,6 +436,12 @@ message AdminNodeInfo {
   optional int64 expires_at_unix = 7;
   // true = 已吊销（保留行供审计，不在任何 Network Map 里）。
   bool revoked = 8;
+  // Hello 上报并落库的软件版本 / 平台（#71；旧 Node 为空）。
+  optional string node_version = 9;
+  optional string os = 10;
+  optional string arch = 11;
+  // 最近一次被 coord 观测到的时刻（unix 秒）。
+  optional int64 last_seen_unix = 12;
 }
 
 message ListNodesResponse {

@@ -90,6 +90,9 @@ async fn register(
             protocol_version: PROTOCOL_VERSION,
             machine_key_pub: keys.machine.verifying_key().to_bytes().to_vec(),
             hostname: hostname.to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .unwrap()
@@ -123,6 +126,9 @@ async fn open_map(
             protocol_version: PROTOCOL_VERSION,
             machine_key_pub: keys.machine.verifying_key().to_bytes().to_vec(),
             hostname: "map-client".to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .unwrap()
@@ -515,6 +521,9 @@ async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
             protocol_version: PROTOCOL_VERSION,
             machine_key_pub: node_b.machine.verifying_key().to_bytes().to_vec(),
             hostname: "node-b".to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .unwrap()
@@ -548,6 +557,7 @@ async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
                 },
             ],
             path_report: None,
+            health: None,
         })
         .await
         .expect("挑战认证通过的上报必须被接受");
@@ -584,6 +594,9 @@ async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
             protocol_version: PROTOCOL_VERSION,
             machine_key_pub: node_b.machine.verifying_key().to_bytes().to_vec(),
             hostname: "node-b".to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .unwrap()
@@ -599,6 +612,7 @@ async fn report_endpoints_stores_kinds_and_fans_out_detailed_view() {
             challenge_signature: bad_signature.to_vec(),
             endpoints: vec![],
             path_report: None,
+            health: None,
         })
         .await;
     assert!(rejected.is_err(), "伪造签名的上报必须被拒绝");

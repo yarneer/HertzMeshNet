@@ -31,6 +31,19 @@ use crate::status::RegisteredInfo;
 /// 占位的默认服务地址；部署时用 HZD_COORD_ADDR 或 `hz up --coord` 覆盖。
 pub const DEFAULT_COORD_ADDR: &str = "https://coord.hznet.internal:443";
 
+/// Hello 请求的公共构造（#71 / OB-1）：protocol_version、Machine Key、主机名
+/// 之外，随附软件版本与平台；旧 coord 忽略新字段（proto3 optional）。
+fn hello_request(keys: &KeyStore, hostname: &str) -> HelloRequest {
+    HelloRequest {
+        protocol_version: PROTOCOL_VERSION,
+        machine_key_pub: keys.machine_public().to_vec(),
+        hostname: hostname.to_owned(),
+        node_version: Some(crate::version::node_version()),
+        os: Some(crate::version::os().to_string()),
+        arch: Some(crate::version::arch().to_string()),
+    }
+}
+
 /// 用 Auth Key 完成 Machine-Key 挑战注册，返回授予的身份。
 pub async fn register_with_auth_key(
     state_dir: &Path,
@@ -44,11 +57,7 @@ pub async fn register_with_auth_key(
     let mut client = CoordClient::new(channel);
 
     let hello = client
-        .hello(HelloRequest {
-            protocol_version: PROTOCOL_VERSION,
-            machine_key_pub: keys.machine_public().to_vec(),
-            hostname: hostname.to_owned(),
-        })
+        .hello(hello_request(&keys, hostname))
         .await
         .map_err(|status| anyhow!("注册失败：Coordination Server 拒绝了 Hello（{status}）"))?
         .into_inner();
@@ -96,11 +105,7 @@ pub async fn open_network_map_stream(
     let mut client = CoordClient::new(channel);
 
     let hello = client
-        .hello(HelloRequest {
-            protocol_version: PROTOCOL_VERSION,
-            machine_key_pub: keys.machine_public().to_vec(),
-            hostname: local_hostname(),
-        })
+        .hello(hello_request(&keys, &local_hostname()))
         .await
         .map_err(|status| anyhow!("Network Map 订阅失败：Hello 被拒绝（{status}）"))?
         .into_inner();
@@ -131,23 +136,21 @@ pub struct PunchCounters {
 
 /// 上报收集到的 Endpoint（FR-8）：Hello → 签挑战 → ReportEndpoints。
 /// 服务端落库后随 Network Map 差量推给其他 Node。punch 为 Some 时随上报
-/// 携带打洞累计计数（Node 自启动起），服务端按 Node 去差量累加。
+/// 携带打洞累计计数（Node 自启动起），服务端按 Node 去差量累加；
+/// health 为 Some 时携带 Health Report（#72，旧 coord 忽略）。
 pub async fn report_endpoints(
     state_dir: &Path,
     endpoints: &[DiscoveredEndpoint],
     coord_addr: &str,
     punch: Option<PunchCounters>,
+    health: Option<&crate::health::HealthSnapshot>,
 ) -> anyhow::Result<()> {
     let keys = KeyStore::load_or_create(state_dir)?;
     let channel = connect(coord_addr).await?;
     let mut client = CoordClient::new(channel);
 
     let hello = client
-        .hello(HelloRequest {
-            protocol_version: PROTOCOL_VERSION,
-            machine_key_pub: keys.machine_public().to_vec(),
-            hostname: local_hostname(),
-        })
+        .hello(hello_request(&keys, &local_hostname()))
         .await
         .map_err(|status| anyhow!("Endpoint 上报失败：Hello 被拒绝（{status}）"))?
         .into_inner();
@@ -169,6 +172,7 @@ pub async fn report_endpoints(
                         EndpointKind::Lan => hz_proto::EndpointKind::Lan as i32,
                         EndpointKind::Stun => hz_proto::EndpointKind::Stun as i32,
                         EndpointKind::V6 => hz_proto::EndpointKind::V6 as i32,
+                        EndpointKind::PortMap => hz_proto::EndpointKind::PortMap as i32,
                     },
                 })
                 .collect(),
@@ -176,6 +180,7 @@ pub async fn report_endpoints(
                 punch_attempts: u32::try_from(counters.attempts).unwrap_or(u32::MAX),
                 punch_success: u32::try_from(counters.successes).unwrap_or(u32::MAX),
             }),
+            health: health.map(|snapshot| snapshot.to_proto()),
         })
         .await
         .map_err(|status| anyhow!("Endpoint 上报失败：{status}"))?;
@@ -196,11 +201,7 @@ pub async fn begin_interactive_login(
     let mut client = CoordClient::new(channel);
 
     let hello = client
-        .hello(HelloRequest {
-            protocol_version: PROTOCOL_VERSION,
-            machine_key_pub: keys.machine_public().to_vec(),
-            hostname: hostname.to_owned(),
-        })
+        .hello(hello_request(&keys, hostname))
         .await
         .map_err(|status| anyhow!("登录失败：Coordination Server 拒绝了 Hello（{status}）"))?
         .into_inner();
@@ -258,11 +259,7 @@ pub async fn poll_login_status(
     let mut client = CoordClient::new(channel);
 
     let hello = client
-        .hello(HelloRequest {
-            protocol_version: PROTOCOL_VERSION,
-            machine_key_pub: keys.machine_public().to_vec(),
-            hostname: hostname.to_owned(),
-        })
+        .hello(hello_request(&keys, hostname))
         .await
         .map_err(|status| anyhow!("登录状态查询失败：Hello 被拒绝（{status}）"))?
         .into_inner();
@@ -313,11 +310,7 @@ async fn signed_challenge(
     hostname: &str,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let hello = client
-        .hello(HelloRequest {
-            protocol_version: PROTOCOL_VERSION,
-            machine_key_pub: keys.machine_public().to_vec(),
-            hostname: hostname.to_owned(),
-        })
+        .hello(hello_request(keys, hostname))
         .await
         .map_err(|status| anyhow!("Hello 被拒绝（{status}）"))?
         .into_inner();
@@ -454,6 +447,11 @@ pub struct ManagedNode {
     pub owner_user: Option<String>,
     pub expires_at_unix: Option<i64>,
     pub revoked: bool,
+    /// Hello 上报的软件版本（#71；旧 Node 为 None）。
+    pub node_version: Option<String>,
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub last_seen_unix: Option<i64>,
 }
 
 /// 签发 Auth Key（仅 Admin）。
@@ -628,6 +626,10 @@ pub async fn list_nodes(state_dir: &Path, coord_addr: &str) -> anyhow::Result<Ve
             owner_user: node.owner_user,
             expires_at_unix: node.expires_at_unix,
             revoked: node.revoked,
+            node_version: node.node_version,
+            os: node.os,
+            arch: node.arch,
+            last_seen_unix: node.last_seen_unix,
         })
         .collect())
 }
@@ -791,8 +793,8 @@ async fn dial(uri: &Uri) -> io::Result<tokio::net::TcpStream> {
 
 /// 非阻塞 TCP 连接：SO_BINDTODEVICE 只约束发送路径，必须抢在 SYN 发出前生效，
 /// 所以先绑物理出口网卡再 connect(2)。目标是 loopback 时不绑（本地测试服务
-/// 无法从物理网卡到达）。
-async fn connect_bound(addr: SocketAddr) -> io::Result<tokio::net::TcpStream> {
+/// 无法从物理网卡到达）。coord 连接与 UPnP 的 HTTP（portmap）共用。
+pub(crate) async fn connect_bound(addr: SocketAddr) -> io::Result<tokio::net::TcpStream> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {

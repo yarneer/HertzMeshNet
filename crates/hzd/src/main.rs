@@ -4,6 +4,13 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // --version / -V 只打印版本退出，不初始化 tracing、不碰状态目录（#70）。
+    if args.get(1).map(String::as_str) == Some("--version")
+        || args.get(1).map(String::as_str) == Some("-V")
+    {
+        println!("{}", hz_core::version::banner("hzd"));
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("install-launchd") {
         let plist_path = args
             .iter()

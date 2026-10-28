@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "hz"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "hz-coord"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "hz-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "hz-proto"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "prost",
  "protox",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "hz-relay"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "hzd"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",

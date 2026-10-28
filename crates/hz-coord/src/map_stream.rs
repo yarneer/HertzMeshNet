@@ -346,6 +346,7 @@ pub fn node_info_from(record: NodeRecord) -> NodeInfo {
             let kind = match stored.kind.as_str() {
                 "stun" => hz_proto::EndpointKind::Stun,
                 "v6" => hz_proto::EndpointKind::V6,
+                "portmap" => hz_proto::EndpointKind::PortMap,
                 _ => hz_proto::EndpointKind::Lan,
             };
             Some(hz_proto::Endpoint {

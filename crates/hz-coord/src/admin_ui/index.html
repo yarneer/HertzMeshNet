@@ -89,7 +89,7 @@
 
       <article class="step">
         <h3>1. DNS 与 SNI</h3>
-        <p>大陆云主机使用已备案域名。三条 A 记录指向同一公网 IP：<code>coord</code>、<code>relay</code>、<code>auth</code>。安全组只放行 TCP 443、TCP 80、UDP 3478。443 由 nginx 按 SNI 把整条连接分给三个服务，每个子域名一张只含自身名字的证书。</p>
+        <p>大陆云主机使用已备案域名。三条 A 记录指向同一公网 IP：<code>coord</code>、<code>relay</code>、<code>auth</code>。安全组放行 TCP 443、TCP 80、UDP 3478 与 UDP 3479（第二个 STUN 端口，未放行只让 NAT 判定退化为 unknown）。443 由 nginx 按 SNI 把整条连接分给三个服务，每个子域名一张只含自身名字的证书。</p>
         <pre id="wiz-dns"><code>dig +short coord.&lt;域名&gt; A
 dig +short relay.&lt;域名&gt; A
 dig +short auth.&lt;域名&gt; A</code></pre>

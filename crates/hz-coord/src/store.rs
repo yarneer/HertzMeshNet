@@ -48,6 +48,8 @@ pub enum NodeScope {
 
 /// 管理列表的一行：Node 的身份字段 + 吊销标记（不含数据面字段）。
 /// `created_at_unix` / `revoked_at_unix` 是注册与吊销时刻，Admin Console 用。
+/// `node_version` / `os` / `arch` / `last_seen_unix` 是 #71 的可观测性列
+/// （旧 Node 为 None）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedNode {
     pub node_id: String,
@@ -60,6 +62,10 @@ pub struct ListedNode {
     pub revoked: bool,
     pub revoked_at_unix: Option<i64>,
     pub created_at_unix: i64,
+    pub node_version: Option<String>,
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub last_seen_unix: Option<i64>,
 }
 
 /// 改名的失败（成功返回更新后的记录）。
@@ -107,7 +113,7 @@ impl StoredEndpoint {
 
     /// 未知来源的兜底种类：按 lan 对待。
     pub fn of_kind(addr: impl Into<String>, kind: &str) -> Self {
-        let known = matches!(kind, "lan" | "stun" | "v6");
+        let known = matches!(kind, "lan" | "stun" | "v6" | "portmap");
         Self {
             addr: addr.into(),
             kind: if known {
@@ -772,6 +778,49 @@ impl Store {
         Ok(())
     }
 
+    /// Hello 携带的软件版本 / 平台落库（#71）。None 的字段保持原值不动，
+    /// 这样旧 Node 的 NULL 不会被新上报意外清掉。
+    pub async fn update_node_runtime(
+        &self,
+        node_id: &str,
+        node_version: Option<&str>,
+        os: Option<&str>,
+        arch: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE nodes SET
+                node_version = COALESCE(?1, node_version),
+                os = COALESCE(?2, os),
+                arch = COALESCE(?3, arch)
+             WHERE id = ?4",
+        )
+        .bind(node_version)
+        .bind(os)
+        .bind(arch)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 批量落库 last_seen（#71 / ADR-0009：内存实时更新，这里只在流断开与
+    /// 每 5 分钟批量时调用，不随每次上报写库）。
+    pub async fn flush_last_seen(&self, entries: &[(String, i64)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.begin_write().await?;
+        for (node_id, unix) in entries {
+            sqlx::query("UPDATE nodes SET last_seen_unix = ?1 WHERE id = ?2")
+                .bind(unix)
+                .bind(node_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// 吊销 Node：之后不再出现在任何 Network Map 里；已在推送流上的对端
     /// 会收到 removed 差量。重复吊销是空操作。返回是否发生了状态迁移。
     pub async fn revoke_node(&self, node_id: &str) -> anyhow::Result<bool> {
@@ -796,6 +845,7 @@ impl Store {
     pub async fn list_nodes(&self, scope: &NodeScope) -> anyhow::Result<Vec<ListedNode>> {
         let base = "SELECT n.id, n.name, n.ipv4, n.ipv6, n.tags, u.name AS owner_user,
                     n.expires_at_unix, n.revoked_at_unix, n.created_at_unix,
+                    n.node_version, n.os, n.arch, n.last_seen_unix,
                     (n.revoked_at_unix IS NOT NULL) AS revoked
              FROM nodes n LEFT JOIN users u ON u.id = n.user_id";
         let rows = match scope {
@@ -822,6 +872,10 @@ impl Store {
                 revoked: row.get::<i64, _>("revoked") != 0,
                 revoked_at_unix: row.get("revoked_at_unix"),
                 created_at_unix: row.get("created_at_unix"),
+                node_version: row.get("node_version"),
+                os: row.get("os"),
+                arch: row.get("arch"),
+                last_seen_unix: row.get("last_seen_unix"),
             })
             .collect())
     }

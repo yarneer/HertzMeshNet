@@ -17,7 +17,21 @@ pub struct NetcheckReport {
     pub endpoints: Vec<EndpointNote>,
     pub ipv6_usable: bool,
     pub relay_rtt_ms: Option<f64>,
+    /// 端口映射状态（#77）。serde default：旧 hzd 的应答没有该字段。
+    #[serde(default)]
+    pub portmap: PortMapNote,
     pub peers: Vec<PeerNote>,
+}
+
+/// 端口映射（#77）的结论：协议、外网地址与是否多重 NAT。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMapNote {
+    /// `PCP` / `NAT-PMP` / `UPnP`；None = 不可用（或被 HZD_PORTMAP=0 关闭）。
+    pub protocol: Option<String>,
+    /// `ip:port`；仅映射成功时有。
+    pub external: Option<String>,
+    /// 映射返回的外网地址不是公网：路由器上游还有 NAT，建议光猫桥接。
+    pub multi_nat: bool,
 }
 
 /// 分别向 Relay 的 STUN 服务做的 IPv4 / IPv6 外发探测。
@@ -37,7 +51,9 @@ pub struct UdpProbe {
     pub mapped: Option<String>,
 }
 
-/// STUN 映射与 NAT 形态。目标不足两个、或成功映射不足两个时 `nat` 为「无法判断」。
+/// STUN 映射与 NAT 形态。目标不足两个、或成功映射不足两个时 `nat` 为
+/// `unknown`（不猜测）。取值是稳定契约：`easy`（两个目标映射端口相同，
+/// 端点无关）/ `hard`（不同，端点相关即对称型）/ `unknown`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StunReport {
     pub targets: usize,
@@ -63,19 +79,21 @@ pub struct PeerNote {
     pub path: Option<String>,
     /// `"success"` / `"attempted"` / `"fallback"` / `"skipped"`；还没打过洞为 null。
     pub punch: Option<String>,
+    /// 走 Relay 时的本地判定原因（规格 §4）；直连或数据面未拉起为 null。
+    pub relay_reason: Option<String>,
 }
 
-/// IPv4 STUN 目标不足两个，或成功映射不足两个：不猜测。
-/// 两个及以上映射端口不一致，视为端点相关（对称 NAT）。
+/// IPv4 STUN 目标不足两个，或成功映射不足两个：`unknown`，不猜测。
+/// 两个及以上映射端口不一致视为端点相关（对称 NAT）：`hard`。
 ///
 /// ponytail: 只比映射端口，不是 RFC 5780 的完整分类；要更细再加 CHANGE-REQUEST。
 pub fn nat_verdict(ipv4_targets: usize, mapped_ports: &[u16]) -> &'static str {
     if ipv4_targets < 2 || mapped_ports.len() < 2 {
-        "无法判断"
+        "unknown"
     } else if mapped_ports.iter().all(|port| *port == mapped_ports[0]) {
-        "端点无关"
+        "easy"
     } else {
-        "端点相关（对称 NAT），直连概率低"
+        "hard"
     }
 }
 
@@ -143,6 +161,7 @@ pub fn format_report(report: &NetcheckReport) -> String {
     };
     lines.push(format!("物理出口：{physical}"));
     lines.push(format!("默认路由：{holder}"));
+    lines.push(portmap_line(&report.portmap));
     lines.push(udp_line("IPv4", &report.udp.ipv4));
     lines.push(udp_line("IPv6", &report.udp.ipv6));
     let mapped = if report.stun.mapped.is_empty() {
@@ -151,7 +170,12 @@ pub fn format_report(report: &NetcheckReport) -> String {
         report.stun.mapped.join("、")
     };
     lines.push(format!("STUN 映射：{mapped}"));
-    lines.push(format!("NAT：{}", report.stun.nat));
+    let nat_note = match report.stun.nat.as_str() {
+        "easy" => "（端点无关）",
+        "hard" => "（端点相关（对称 NAT），直连概率低）",
+        _ => "（无法判断：目标或成功映射不足两个）",
+    };
+    lines.push(format!("NAT：{}{}", report.stun.nat, nat_note));
     lines.push(format!(
         "可用 IPv6：{}",
         if report.ipv6_usable { "是" } else { "否" }
@@ -173,15 +197,45 @@ pub fn format_report(report: &NetcheckReport) -> String {
     } else {
         lines.push("对端：".to_string());
         for peer in &report.peers {
+            let reason = match (peer.path.as_deref(), peer.relay_reason.as_deref()) {
+                (Some("relay"), Some(reason)) => format!("（中转原因：{}）", reason_label(reason)),
+                _ => String::new(),
+            };
             lines.push(format!(
-                "  {}  {}  最近打洞：{}",
+                "  {}  {}  最近打洞：{}{}",
                 peer.name,
                 path_label(peer.path.as_deref()),
                 punch_label(peer.punch.as_deref()),
+                reason,
             ));
         }
     }
     lines.join("\n")
+}
+
+/// Relay 原因的中文说明（规格 §4 表）。
+pub fn reason_label(reason: &str) -> &'static str {
+    match reason {
+        "local_udp_broken" => "本机 UDP 外发失败",
+        "no_candidates" => "对端无可用候选",
+        "handshake_timeout" => "握手超时（handshake_timeout）",
+        "punch_pending" => "打洞进行中",
+        _ => "未知",
+    }
+}
+
+/// 端口映射行（#77）：协议 + 外网地址；多重 NAT 时给出光猫桥接提示。
+fn portmap_line(note: &PortMapNote) -> String {
+    match (&note.protocol, &note.external, note.multi_nat) {
+        (Some(protocol), Some(external), false) => {
+            format!("端口映射：{protocol}，外网 {external}")
+        }
+        (Some(protocol), Some(external), true) => format!(
+            "端口映射：{protocol}，外网 {external}（⚠ 多重 NAT：路由器上游还有 NAT，建议把光猫设为桥接，见安装手册）"
+        ),
+        (Some(protocol), None, _) => format!("端口映射：{protocol}，未取到外网地址"),
+        (None, _, _) => "端口映射：不可用".to_string(),
+    }
 }
 
 fn udp_line(family: &str, probe: &UdpProbe) -> String {
@@ -277,11 +331,17 @@ mod tests {
             }],
             ipv6_usable: false,
             relay_rtt_ms: None,
+            portmap: PortMapNote {
+                protocol: Some("NAT-PMP".to_string()),
+                external: Some("192.168.115.116:52001".to_string()),
+                multi_nat: true,
+            },
             peers: vec![PeerNote {
                 name: "mini".to_string(),
                 node_id: "n-mini".to_string(),
                 path: Some("relay".to_string()),
                 punch: Some("attempted".to_string()),
+                relay_reason: Some("handshake_timeout".to_string()),
             }],
         }
     }
@@ -316,7 +376,7 @@ mod tests {
     "mapped": [
       "[2001:db8::8]:51820"
     ],
-    "nat": "无法判断"
+    "nat": "unknown"
   },
   "endpoints": [
     {
@@ -330,12 +390,18 @@ mod tests {
   ],
   "ipv6_usable": false,
   "relay_rtt_ms": null,
+  "portmap": {
+    "protocol": "NAT-PMP",
+    "external": "192.168.115.116:52001",
+    "multi_nat": true
+  },
   "peers": [
     {
       "name": "mini",
       "node_id": "n-mini",
       "path": "relay",
-      "punch": "attempted"
+      "punch": "attempted",
+      "relay_reason": "handshake_timeout"
     }
   ]
 }"#
@@ -354,20 +420,47 @@ mod tests {
             "198.18.0.0/15 的 LAN Endpoint 必须告警：{text}"
         );
         assert!(text.contains("默认路由：utun4（虚拟网卡持有）"), "{text}");
-        assert!(text.contains("NAT：无法判断"), "{text}");
+        assert!(text.contains("NAT：unknown"), "{text}");
         assert!(
-            text.contains("mini  Relayed Path  最近打洞：已尝试"),
+            text.contains("端口映射：NAT-PMP，外网 192.168.115.116:52001（⚠ 多重 NAT"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "mini  Relayed Path  最近打洞：已尝试（中转原因：握手超时（handshake_timeout））"
+            ),
             "{text}"
         );
     }
 
     #[test]
+    fn portmap_line_covers_all_shapes() {
+        let unavailable = PortMapNote::default();
+        assert_eq!(portmap_line(&unavailable), "端口映射：不可用");
+        let mapped = PortMapNote {
+            protocol: Some("PCP".into()),
+            external: Some("198.51.100.7:52001".into()),
+            multi_nat: false,
+        };
+        assert_eq!(
+            portmap_line(&mapped),
+            "端口映射：PCP，外网 198.51.100.7:52001"
+        );
+        let no_external = PortMapNote {
+            protocol: Some("UPnP".into()),
+            external: None,
+            multi_nat: false,
+        };
+        assert_eq!(portmap_line(&no_external), "端口映射：UPnP，未取到外网地址");
+    }
+
+    #[test]
     fn nat_verdict_refuses_to_guess_below_two_targets() {
-        assert_eq!(nat_verdict(0, &[]), "无法判断");
-        assert_eq!(nat_verdict(1, &[4000]), "无法判断");
-        assert_eq!(nat_verdict(2, &[4000]), "无法判断");
-        assert_eq!(nat_verdict(2, &[4000, 4000]), "端点无关");
-        assert!(nat_verdict(2, &[4000, 4001]).contains("直连概率低"));
+        assert_eq!(nat_verdict(0, &[]), "unknown");
+        assert_eq!(nat_verdict(1, &[4000]), "unknown");
+        assert_eq!(nat_verdict(2, &[4000]), "unknown");
+        assert_eq!(nat_verdict(2, &[4000, 4000]), "easy");
+        assert_eq!(nat_verdict(2, &[4000, 4001]), "hard");
     }
 
     #[test]

@@ -67,6 +67,9 @@ async fn registration_succeeds_over_tls_with_trusted_ca() {
             protocol_version: PROTOCOL_VERSION,
             machine_key_pub: machine.verifying_key().to_bytes().to_vec(),
             hostname: "tls-node".to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .unwrap()

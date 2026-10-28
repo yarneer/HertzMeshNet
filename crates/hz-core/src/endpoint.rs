@@ -1,8 +1,10 @@
-//! Endpoint 收集（FR-8）。三种来源：
+//! Endpoint 收集（FR-8）。收集来源：
 //! Lan = 非虚拟网卡的 IPv4 + WireGuard 端口（不含 198.18.0.0/15）；Stun = 从共享 socket 向 Relay
 //! 主机的 UDP 3478 查询得到的公网映射；V6 = 网卡上的全球单播 IPv6（v6 无 NAT
-//! 预期）。收集结果经 ReportEndpoints 上报 Coordination Server，随 Network
-//! Map 下发给对端，对端据此排候选序（V6 优先、Stun 次之、Lan 兜底）。
+//! 预期）；PortMap = 端口映射申请到的稳定公网映射（#77，由 hzd 的 portmap
+//! 任务并入，不在 collect 里产生）。收集结果经 ReportEndpoints 上报
+//! Coordination Server，随 Network Map 下发给对端，对端据此排候选序
+//! （V6 优先、PortMap、Stun 次之、Lan 兜底）。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -13,6 +15,8 @@ pub enum EndpointKind {
     Lan,
     Stun,
     V6,
+    /// 端口映射（#77）：PCP / NAT-PMP / UPnP IGD 申请到的稳定公网映射。
+    PortMap,
 }
 
 impl EndpointKind {
@@ -21,6 +25,7 @@ impl EndpointKind {
             EndpointKind::Lan => "lan",
             EndpointKind::Stun => "stun",
             EndpointKind::V6 => "v6",
+            EndpointKind::PortMap => "portmap",
         }
     }
 
@@ -29,6 +34,7 @@ impl EndpointKind {
             "lan" => Some(EndpointKind::Lan),
             "stun" => Some(EndpointKind::Stun),
             "v6" => Some(EndpointKind::V6),
+            "portmap" => Some(EndpointKind::PortMap),
             _ => None,
         }
     }
@@ -41,14 +47,16 @@ pub struct DiscoveredEndpoint {
     pub kind: EndpointKind,
 }
 
-/// 按候选优先级排序：V6（无 NAT）→ Stun（公网映射）→ Lan（同网段才可达）。
+/// 按候选优先级排序：V6（无 NAT）→ PortMap（稳定映射，#77）→ Stun（公网
+/// 映射，对称 NAT 下只对查询目标有效）→ Lan（同网段才可达）。
 /// 同类内保持收集顺序。
 pub fn rank(endpoints: &[DiscoveredEndpoint]) -> Vec<DiscoveredEndpoint> {
     let mut ranked = endpoints.to_vec();
     ranked.sort_by_key(|endpoint| match endpoint.kind {
         EndpointKind::V6 => 0,
-        EndpointKind::Stun => 1,
-        EndpointKind::Lan => 2,
+        EndpointKind::PortMap => 1,
+        EndpointKind::Stun => 2,
+        EndpointKind::Lan => 3,
     });
     ranked
 }
@@ -149,6 +157,17 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xe000) == 0x2000 && !ip.is_unspecified()
 }
 
+/// 非虚拟网卡上的 IPv4 地址（端口映射的 NewInternalClient 候选，#77）。
+pub(crate) fn lan_ipv4_candidates() -> Vec<Ipv4Addr> {
+    interface_addrs()
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) if usable_lan_v4(v4) => Some(v4),
+            _ => None,
+        })
+        .collect()
+}
+
 /// 非虚拟网卡上有全球单播 IPv6。链路本地与 ULA 不算可直连的地址。
 pub fn has_usable_ipv6() -> bool {
     interface_addrs().into_iter().any(|ip| match ip {
@@ -214,7 +233,12 @@ mod tests {
 
     #[test]
     fn kinds_round_trip_through_strings() {
-        for kind in [EndpointKind::Lan, EndpointKind::Stun, EndpointKind::V6] {
+        for kind in [
+            EndpointKind::Lan,
+            EndpointKind::Stun,
+            EndpointKind::V6,
+            EndpointKind::PortMap,
+        ] {
             assert_eq!(EndpointKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(EndpointKind::parse("other"), None);
@@ -239,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_orders_v6_before_stun_before_lan() {
+    fn rank_orders_v6_portmap_stun_lan() {
         let endpoints = vec![
             DiscoveredEndpoint {
                 addr: "192.168.1.2:51820".parse().unwrap(),
@@ -253,11 +277,20 @@ mod tests {
                 addr: "[2001:db8::2]:51820".parse().unwrap(),
                 kind: EndpointKind::V6,
             },
+            DiscoveredEndpoint {
+                addr: "198.51.100.7:52001".parse().unwrap(),
+                kind: EndpointKind::PortMap,
+            },
         ];
         let order: Vec<EndpointKind> = rank(&endpoints).into_iter().map(|e| e.kind).collect();
         assert_eq!(
             order,
-            vec![EndpointKind::V6, EndpointKind::Stun, EndpointKind::Lan]
+            vec![
+                EndpointKind::V6,
+                EndpointKind::PortMap,
+                EndpointKind::Stun,
+                EndpointKind::Lan
+            ]
         );
     }
 

@@ -67,6 +67,9 @@ async fn hello(
             protocol_version: PROTOCOL_VERSION,
             machine_key_pub: keys.machine.verifying_key().to_bytes().to_vec(),
             hostname: hostname.to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .unwrap()
@@ -310,6 +313,9 @@ async fn protocol_version_zero_is_rejected_with_upgrade_hint() {
             protocol_version: 0,
             machine_key_pub: keys.machine.verifying_key().to_bytes().to_vec(),
             hostname: "node-a".to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .expect_err("协议版本 0 必须被拒绝");

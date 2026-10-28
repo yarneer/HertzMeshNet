@@ -110,6 +110,22 @@ jobs:
             -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
             -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run block-direct-fallback
 
+      - name: Seam A 场景 handshake-timeout
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run handshake-timeout
+
+      - name: Seam A 场景 portmap-direct
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v /tmp/hz-topo-cargo:/usr/local/cargo/registry \
+            -v hz-topo-target:/target -v hz-topo-bin:/out -v /tmp/hz-topo-artifacts:/tmp/hz-topo \
+            -e CARGO_TARGET_DIR=/target -e HZ_TOPO_CARGO_TARGET_DIR=/target \
+            -w /src hertzmesh-topo:ci bash scripts/test/topo/topo.sh run portmap-direct
+
       - name: Seam A 场景 cone-cone-proxysim
         run: |
           docker run --rm --privileged \

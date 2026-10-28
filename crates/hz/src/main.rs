@@ -7,8 +7,13 @@ use hz_core::status::{NodeStatus, RegisteredInfo};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+/// `hz --version` 的版本串（#70）：clap 自动加 `hz ` 前缀，这里只给
+/// `0.3.0 (a1b2c3d)`（与 hzd --version 同一来源，无 commit 时仅 semver）。
+static VERSION: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(hz_core::version::node_version);
+
 #[derive(Parser)]
-#[command(name = "hz", version, about = "HzNet 命令行工具")]
+#[command(name = "hz", version = VERSION.as_str(), about = "HzNet 命令行工具")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -495,7 +500,7 @@ async fn node(command: NodeCommand) -> std::process::ExitCode {
     }
 }
 
-/// `hz node list` 的表格输出：id / 名字 / 地址 / 归属与 Tag / 有效期 / 状态。
+/// `hz node list` 的表格输出：id / 名字 / 地址 / 版本 / 归属与 Tag / 有效期 / 状态。
 fn print_node_table(result: &serde_json::Value) -> std::process::ExitCode {
     let Some(nodes) = result.as_array() else {
         eprintln!("hzd 应答格式异常：{result}");
@@ -505,7 +510,7 @@ fn print_node_table(result: &serde_json::Value) -> std::process::ExitCode {
         println!("没有可见的 Node");
         return std::process::ExitCode::SUCCESS;
     }
-    println!("Node ID | Node Name | IPv4 | 归属 User | Tags | 有效期至 | 状态");
+    println!("Node ID | Node Name | IPv4 | 版本 | 归属 User | Tags | 有效期至 | 状态");
     for node in nodes {
         let field = |name: &str| {
             node.get(name)
@@ -513,6 +518,12 @@ fn print_node_table(result: &serde_json::Value) -> std::process::ExitCode {
                 .unwrap_or("-")
                 .to_string()
         };
+        // 版本（#71）：旧 Node 不上报，显示「未知（< 0.3）」。
+        let version = node
+            .get("node_version")
+            .and_then(|v| v.as_str())
+            .filter(|text| !text.is_empty())
+            .unwrap_or("未知（< 0.3）");
         let owner = node
             .get("owner_user")
             .and_then(|v| v.as_str())
@@ -541,10 +552,11 @@ fn print_node_table(result: &serde_json::Value) -> std::process::ExitCode {
             "在册"
         };
         println!(
-            "{} | {} | {} | {} | {} | {} | {}",
+            "{} | {} | {} | {} | {} | {} | {} | {}",
             field("node_id"),
             field("name"),
             field("ipv4"),
+            version,
             owner,
             tags,
             expires,
@@ -1145,6 +1157,17 @@ fn print_identity(info: &RegisteredInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_flag_string_is_semver_with_optional_commit() {
+        // clap 会自动加 `hz ` 前缀，属性里只能给 semver(+commit) 部分。
+        let version = VERSION.as_str();
+        assert!(
+            version.starts_with(hz_core::version::semver()),
+            "版本串以 semver 开头：{version}"
+        );
+        assert!(!version.starts_with("hz "), "不得重复程序名前缀：{version}");
+    }
 
     #[test]
     fn authkey_create_requires_a_tag() {

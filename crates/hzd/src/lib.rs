@@ -18,6 +18,7 @@ use hz_core::coord_client::{
     rename_node, report_endpoints, revoke_node,
 };
 use hz_core::endpoint::{self, DiscoveredEndpoint};
+use hz_core::health::{HealthSnapshot, RelayedPeerNote, nat_kind, relay_reason};
 use hz_core::ipc::{self, Handler};
 use hz_core::keys::{KeyStore, NodeStaticSecret};
 use hz_core::map::{MapNode, NetworkMapCache};
@@ -185,6 +186,16 @@ fn spawn_route_guard(tun: Arc<Tun>, mut egress: tokio::sync::watch::Receiver<u64
     });
 }
 
+/// 每个对端的打洞信令观察（Relay 原因判定的输入，规格 §4）：路径任务在
+/// 发 Offer / 收 Ack 时记录，Health Report 生成时读取。
+#[derive(Debug, Clone, Copy, Default)]
+struct PunchObs {
+    /// 本机最近一次发出 PunchOffer 的时刻。
+    offer_at: Option<std::time::Instant>,
+    /// 最近一次收到对端 PunchAck 的时刻（双方都朝候选出过洞）。
+    ack_at: Option<std::time::Instant>,
+}
+
 struct Daemon {
     state_dir: PathBuf,
     registration: StdMutex<Session>,
@@ -205,6 +216,12 @@ struct Daemon {
     punch: Arc<StdMutex<PunchCounters>>,
     /// 每个对端最近一次打洞结果（`hz netcheck` 用）。
     punch_last: Arc<StdMutex<HashMap<String, String>>>,
+    /// 每个对端的打洞信令观察（Relay 原因判定，#72）。
+    punch_obs: Arc<StdMutex<HashMap<String, PunchObs>>>,
+    /// 端口映射状态（#77）：netcheck 展示。
+    portmap_status: Arc<StdMutex<hz_core::netcheck::PortMapNote>>,
+    /// 端口映射成功时的候选 Endpoint（合并进 own_endpoints 一起上报）。
+    portmap_endpoint: Arc<StdMutex<Option<DiscoveredEndpoint>>>,
     /// 等待中的 ping 探针（应答到达时唤醒）。
     probes: Arc<ping::Probes>,
     /// 本 Node 已被 Admin 吊销（区别于过期：重新登录救不回来）。
@@ -290,6 +307,9 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         policy_gate: Arc::new(InboundGate::new()),
         punch: Arc::new(StdMutex::new(PunchCounters::default())),
         punch_last: Arc::new(StdMutex::new(HashMap::new())),
+        punch_obs: Arc::new(StdMutex::new(HashMap::new())),
+        portmap_status: Arc::new(StdMutex::new(hz_core::netcheck::PortMapNote::default())),
+        portmap_endpoint: Arc::new(StdMutex::new(None)),
         probes: Arc::new(ping::Probes::default()),
         revoked: StdMutex::new(false),
         egress_epoch: EgressEpoch::new(),
@@ -998,16 +1018,11 @@ async fn start_dataplane(
     if let Err(error) = dns::spawn(daemon.map_cache.clone(), dns_v4).await {
         tracing::warn!(%error, "dns responder unavailable");
     }
-    spawn_endpoint_collector(
-        daemon.state_dir.clone(),
-        daemon.own_endpoints.clone(),
-        daemon.punch.clone(),
-        engine.clone(),
-        coord_addr.to_string(),
-    );
+    spawn_endpoint_collector(daemon.clone(), engine.clone(), coord_addr.to_string());
     #[cfg(target_os = "macos")]
     let boot_for_watch = boot_endpoint.clone();
     spawn_net_recovery(daemon, engine.clone(), coord_addr, boot_endpoint);
+    spawn_portmap(daemon.clone(), engine.clone());
     spawn_path_task(
         daemon.map_cache.clone(),
         daemon.map_signal.clone(),
@@ -1015,6 +1030,7 @@ async fn start_dataplane(
         daemon.use_relay.clone(),
         daemon.punch.clone(),
         daemon.punch_last.clone(),
+        daemon.punch_obs.clone(),
         engine.clone(),
         keys.clone(),
         &info.node_id,
@@ -1112,25 +1128,14 @@ fn spawn_egress_watch(
     coord_addr: &str,
     boot: Arc<StdMutex<Option<SocketAddr>>>,
 ) {
-    let state_dir = daemon.state_dir.clone();
-    let own_slot = daemon.own_endpoints.clone();
-    let punch = daemon.punch.clone();
+    let daemon = daemon.clone();
     let coord_addr = coord_addr.to_string();
-    let stun_target = stun_server_target();
     tokio::spawn(async move {
         let mut events = hz_core::netwatch_mac::spawn_watcher();
         while let Some(event) = events.recv().await {
             tracing::info!(?event, "egress changed; recomputing lan endpoint");
             publish_lan_endpoint(engine.local_addr().port(), &boot);
-            collect_and_report(
-                &state_dir,
-                &own_slot,
-                &punch,
-                &engine,
-                &coord_addr,
-                stun_target.as_deref(),
-            )
-            .await;
+            collect_and_report(&daemon, &engine, &coord_addr).await;
         }
     });
 }
@@ -1204,38 +1209,45 @@ fn spawn_relay_supervisor(
 
 /// STUN 服务器列表。`HZD_STUN_ADDR` 显式设置时按逗号拆开（可多个，供
 /// netcheck 比较映射端口）；未设置时从 `HZD_RELAY_ADDR` 的主机推导
-/// UDP 3478（FR-8：STUN 与 Relay 同主机）。周期收集只用第一个。
+/// UDP 3478 与 3479 两个目标（FR-8：STUN 与 Relay 同主机；#76：Relay 缺省
+/// 双端口，两个目标比较映射端口得到 nat=easy/hard）。周期收集只用第一个。
 fn stun_server_targets() -> Vec<String> {
-    match std::env::var("HZD_STUN_ADDR") {
-        Ok(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|target| !target.is_empty())
-            .map(str::to_string)
-            .collect(),
-        Err(_) => relay_stun_target().into_iter().collect(),
-    }
+    stun_targets_from(
+        std::env::var("HZD_STUN_ADDR").ok(),
+        std::env::var("HZD_RELAY_ADDR").ok(),
+    )
 }
 
 fn stun_server_target() -> Option<String> {
     stun_server_targets().into_iter().next()
 }
 
-fn relay_stun_target() -> Option<String> {
-    let relay = std::env::var("HZD_RELAY_ADDR").ok()?;
+fn stun_targets_from(explicit: Option<String>, relay: Option<String>) -> Vec<String> {
+    if let Some(raw) = explicit {
+        return raw
+            .split(',')
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    relay
+        .and_then(|relay| relay_host_of(&relay))
+        .map(|host| vec![format!("{host}:3478"), format!("{host}:3479")])
+        .unwrap_or_default()
+}
+
+/// 地址串的主机部分（去 scheme、去端口）。
+fn relay_host_of(relay: &str) -> Option<String> {
     let host_port = relay
         .rsplit_once("://")
         .map(|(_, rest)| rest)
-        .unwrap_or(&relay);
+        .unwrap_or(relay);
     let host = host_port
         .rsplit_once(':')
         .map(|(host, _)| host)
         .unwrap_or(host_port);
-    if host.is_empty() {
-        None
-    } else {
-        Some(format!("{host}:3478"))
-    }
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// 解析一个 STUN 目标的全部地址（A 与 AAAA）。经外层解析器（系统 DNS
@@ -1401,10 +1413,8 @@ fn peer_notes(daemon: &Daemon) -> Vec<hz_core::netcheck::PeerNote> {
         return Vec::new();
     }
     let own = daemon.registration_info().map(|info| info.node_id);
-    let reports: HashMap<String, PeerReport> = daemon
-        .engine
-        .lock()
-        .expect("engine poisoned")
+    let engine = daemon.engine.lock().expect("engine poisoned").clone();
+    let reports: HashMap<String, PeerReport> = engine
         .as_ref()
         .map(|engine| {
             engine
@@ -1419,22 +1429,34 @@ fn peer_notes(daemon: &Daemon) -> Vec<hz_core::netcheck::PeerNote> {
         .lock()
         .expect("punch last poisoned")
         .clone();
+    // Relay 原因（#72）：netcheck 的对端行与健康报告同一判定函数。
+    let reasons = match &engine {
+        Some(engine) => relay_reason_map(
+            daemon, engine,
+            // 原因判定用的 UDP 结论在 collect_netcheck 里现场探测，这里拿不到；
+            // 传 true 让 local_udp_broken 只由周期上报那条路径报出。
+            true,
+        ),
+        None => HashMap::new(),
+    };
     daemon
         .map_cache
         .snapshot()
         .into_iter()
         .filter(|node| own.as_deref() != Some(node.node_id.as_str()))
-        .map(|node| hz_core::netcheck::PeerNote {
-            path: reports.get(&node.node_id).map(|report| {
-                if report.use_relay {
-                    "relay".to_string()
-                } else {
-                    "direct".to_string()
-                }
-            }),
-            punch: punch.get(&node.node_id).cloned(),
-            name: node.name,
-            node_id: node.node_id,
+        .map(|node| {
+            let report = reports.get(&node.node_id);
+            let path = report.map(|report| if report.use_relay { "relay" } else { "direct" });
+            hz_core::netcheck::PeerNote {
+                relay_reason: match path {
+                    Some("relay") => reasons.get(&node.node_id).copied().map(str::to_string),
+                    _ => None,
+                },
+                path: path.map(str::to_string),
+                punch: punch.get(&node.node_id).cloned(),
+                name: node.name,
+                node_id: node.node_id,
+            }
         })
         .collect()
 }
@@ -1478,75 +1500,398 @@ async fn collect_netcheck(daemon: &Daemon) -> NetcheckReport {
         endpoints,
         ipv6_usable,
         relay_rtt_ms,
+        portmap: daemon
+            .portmap_status
+            .lock()
+            .expect("portmap status poisoned")
+            .clone(),
         peers,
     }
 }
 
-/// Endpoint 收集与上报（FR-8）：周期性收集 Lan/STUN/V6，ReportEndpoints 落库，
-/// 结果同时存进共享槽供打洞信令取本机候选；打洞累计计数随上报携带（FR-12）。
-/// 收集动作本身抽成 [`collect_and_report`]，网络变化恢复序列即时复用。
-fn spawn_endpoint_collector(
-    state_dir: PathBuf,
-    own_slot: Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
-    punch: Arc<StdMutex<PunchCounters>>,
-    engine: Arc<SocketEngine>,
-    coord_addr: String,
-) {
-    let stun_target = stun_server_target();
-    if stun_target.is_none() {
-        tracing::debug!("no stun server configured (HZD_STUN_ADDR / HZD_RELAY_ADDR)");
+/// 端口映射开关（#77）：HZD_PORTMAP=0 关闭——不发起任何映射请求，
+/// 适合不希望 hzd 改路由器配置的网络。
+fn portmap_enabled() -> bool {
+    std::env::var("HZD_PORTMAP").ok().as_deref() != Some("0")
+}
+
+/// 端口映射的网关端点：`HZD_PORTMAP_GATEWAY`（`ip` 或 `ip:port`，缺省端口
+/// 5351）显式指定，否则默认网关 + 5351。显式指定主要供测试注入桩网关，
+/// 也可用于网关不在默认路由上的网络。
+fn portmap_gateway_endpoint() -> Option<std::net::SocketAddr> {
+    if let Ok(raw) = std::env::var("HZD_PORTMAP_GATEWAY") {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Ok(endpoint) = raw.parse() {
+            return Some(endpoint);
+        }
+        let ip: std::net::IpAddr = raw.parse().ok()?;
+        return Some(std::net::SocketAddr::new(
+            ip,
+            hz_core::portmap::GATEWAY_PORT,
+        ));
     }
+    hz_core::netif::default_gateway_v4().map(|gateway| {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(gateway),
+            hz_core::portmap::GATEWAY_PORT,
+        )
+    })
+}
+
+/// 端口映射监督任务（#77）：申请 → 发布 PortMap 候选 → 租期过半续租；
+/// 物理出口变化时立即重新申请；任务结束（hzd 退出）时尽力删除映射。
+fn spawn_portmap(daemon: Arc<Daemon>, engine: Arc<SocketEngine>) {
+    if !portmap_enabled() {
+        tracing::debug!("portmap disabled by HZD_PORTMAP=0");
+        return;
+    }
+    let egress = daemon.egress_epoch.receiver();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(ENDPOINT_COLLECT_EVERY);
+        let mut egress = egress;
+        let mut egress_open = true;
+        // Drop 时同步发出 lifetime=0 的删除报文（PCP/NAT-PMP）。
+        struct PortMapDropGuard(Option<hz_core::portmap::PortMapLease>);
+        impl Drop for PortMapDropGuard {
+            fn drop(&mut self) {
+                let Some(lease) = &self.0 else { return };
+                let Some((gateway, datagram)) = hz_core::portmap::delete_datagram(lease) else {
+                    return;
+                };
+                let socket = std::net::UdpSocket::bind("0.0.0.0:0");
+                if let Ok(socket) = socket {
+                    let _ = socket.send_to(&datagram, gateway);
+                    tracing::info!(
+                        protocol = lease.protocol.as_str(),
+                        "port mapping deleted on shutdown"
+                    );
+                }
+            }
+        }
+        let mut guard = PortMapDropGuard(None);
+        // 上一份租约：续租时传给申请（PCP 复用 nonce、沿用旧外端口，候选不漂移）。
+        let mut lease: Option<hz_core::portmap::PortMapLease> = None;
         loop {
-            ticker.tick().await;
-            collect_and_report(
-                &state_dir,
-                &own_slot,
-                &punch,
-                &engine,
-                &coord_addr,
-                stun_target.as_deref(),
-            )
-            .await;
+            let wg_port = engine.local_addr().port();
+            let mut wait = Duration::from_secs(60);
+            match portmap_gateway_endpoint() {
+                Some(endpoint) if endpoint.is_ipv4() => {
+                    match hz_core::portmap::request_mapping_at(
+                        endpoint,
+                        wg_port,
+                        lease.as_ref(),
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(Some(hz_core::portmap::MappingOutcome::Mapped(established))) => {
+                            tracing::info!(
+                                protocol = established.protocol.as_str(),
+                                external = %established.external,
+                                lifetime_secs = established.lifetime_secs,
+                                "port mapping established"
+                            );
+                            *daemon
+                                .portmap_status
+                                .lock()
+                                .expect("portmap status poisoned") =
+                                hz_core::netcheck::PortMapNote {
+                                    protocol: Some(established.protocol.as_str().to_string()),
+                                    external: Some(established.external.to_string()),
+                                    multi_nat: false,
+                                };
+                            daemon
+                                .portmap_endpoint
+                                .lock()
+                                .expect("portmap endpoint poisoned")
+                                .replace(DiscoveredEndpoint {
+                                    addr: established.external,
+                                    kind: hz_core::endpoint::EndpointKind::PortMap,
+                                });
+                            merge_portmap_into(&daemon);
+                            // 新候选尽快报给 coord（等不及 30 秒的下一轮收集）。
+                            let coord_addr = {
+                                daemon
+                                    .coord_addr
+                                    .lock()
+                                    .expect("coord addr poisoned")
+                                    .clone()
+                                    .filter(|addr| !addr.is_empty())
+                            };
+                            if let Some(coord_addr) = coord_addr {
+                                collect_and_report(&daemon, &engine, &coord_addr).await;
+                            }
+                            // 租期过半续租（下限 30 秒，防短租期自旋）。
+                            wait =
+                                Duration::from_secs((established.lifetime_secs as u64 / 2).max(30));
+                            guard.0 = Some(established.clone());
+                            lease = Some(established);
+                        }
+                        Ok(Some(hz_core::portmap::MappingOutcome::MultiNat {
+                            protocol,
+                            external,
+                        })) => {
+                            tracing::warn!(
+                                protocol = protocol.as_str(),
+                                %external,
+                                "port mapping behind another NAT (multi-NAT); not reporting a candidate, consider bridging the modem"
+                            );
+                            *daemon
+                                .portmap_status
+                                .lock()
+                                .expect("portmap status poisoned") =
+                                hz_core::netcheck::PortMapNote {
+                                    protocol: Some(protocol.as_str().to_string()),
+                                    external: Some(external.to_string()),
+                                    multi_nat: true,
+                                };
+                            daemon
+                                .portmap_endpoint
+                                .lock()
+                                .expect("portmap endpoint poisoned")
+                                .take();
+                            merge_portmap_into(&daemon);
+                        }
+                        Ok(None) => {
+                            *daemon
+                                .portmap_status
+                                .lock()
+                                .expect("portmap status poisoned") =
+                                hz_core::netcheck::PortMapNote::default();
+                            daemon
+                                .portmap_endpoint
+                                .lock()
+                                .expect("portmap endpoint poisoned")
+                                .take();
+                            merge_portmap_into(&daemon);
+                        }
+                        Err(error) => {
+                            // 传输层错误（socket 建立失败等）视为暂时性：保留上次的
+                            // 状态与候选不清空，与 Ok(None)（确定无网关应答）不同。
+                            tracing::debug!(%error, "portmap request failed");
+                        }
+                    }
+                }
+                None => {
+                    tracing::debug!("no default gateway; port mapping not attempted");
+                }
+                // IPv6 网关：端口映射协议只走 IPv4，本轮跳过。
+                Some(_) => {
+                    tracing::debug!("portmap gateway must be IPv4");
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                changed = egress.changed(), if egress_open => {
+                    egress_open = changed.is_ok();
+                    tracing::info!("egress changed, re-requesting port mapping");
+                }
+            }
         }
     });
 }
 
-/// 收集一轮本机 Endpoint 并上报（周期收集与网络变化恢复共用）：
-/// STUN 查询走引擎共享 socket（重绑后自动落在新出口上），结果连同
-/// Lan/V6 候选写入共享槽并 ReportEndpoints 给 Coordination Server。
-async fn collect_and_report(
-    state_dir: &Path,
-    own_slot: &Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
-    punch: &Arc<StdMutex<PunchCounters>>,
-    engine: &Arc<SocketEngine>,
-    coord_addr: &str,
-    stun_target: Option<&str>,
-) {
-    let stun_server = match stun_target {
-        Some(target) => resolve_stun(target).await,
-        None => None,
-    };
-    let stun_mapped = match stun_server {
-        Some(server) => match engine.stun_query(server).await {
+/// 把端口映射候选并入 own_endpoints（替换既有 PortMap 项；无映射时移除）。
+/// 周期收集会整体覆盖槽位，收集结束后与映射任务更新后都要调一次。
+fn merge_portmap_into(daemon: &Arc<Daemon>) {
+    let portmap = daemon
+        .portmap_endpoint
+        .lock()
+        .expect("portmap endpoint poisoned")
+        .clone();
+    let mut own = daemon.own_endpoints.lock().expect("own endpoints poisoned");
+    own.retain(|found| found.kind != hz_core::endpoint::EndpointKind::PortMap);
+    if let Some(portmap) = portmap {
+        own.push(portmap);
+    }
+}
+
+/// Endpoint 收集与上报（FR-8）：周期性收集 Lan/STUN/V6，ReportEndpoints 落库，
+/// 结果同时存进共享槽供打洞信令取本机候选；打洞累计计数随上报携带（FR-12）；
+/// Health Report（#72 / OB-2）同帧上报，netcheck 六项与 Relay 原因在本帧
+/// 现场判定。收集动作本身抽成 [`collect_and_report`]，网络变化恢复序列即时复用。
+fn spawn_endpoint_collector(daemon: Arc<Daemon>, engine: Arc<SocketEngine>, coord_addr: String) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ENDPOINT_COLLECT_EVERY);
+        loop {
+            ticker.tick().await;
+            collect_and_report(&daemon, &engine, &coord_addr).await;
+        }
+    });
+}
+
+/// 一轮 STUN 探测的结论：Endpoint 候选 + Health Report 的 netcheck 输入。
+/// 逐目标查询（最多前两个：周期收集用第一个出候选，两个比较映射端口得
+/// NAT 形态，#76）；同族失败即停（EINVAL 之类每目标都会同样失败）。
+#[derive(Debug, Default)]
+struct StunRound {
+    /// 第一个目标的映射（Endpoint 候选来源，None = 不可达）。
+    first_mapped: Option<SocketAddr>,
+    udp4_ok: bool,
+    udp6_ok: bool,
+    /// 每个目标的 IPv4 映射端口（NAT 比较用）。
+    mapped_ports: Vec<u16>,
+}
+
+async fn stun_round(engine: &Arc<SocketEngine>, targets: &[String]) -> StunRound {
+    let mut round = StunRound::default();
+    let mut send_broken_v4 = false;
+    let mut send_broken_v6 = false;
+    for (index, target) in targets.iter().take(2).enumerate() {
+        let Some(server) = resolve_stun(target).await else {
+            continue;
+        };
+        match engine.stun_query(server).await {
             Ok(mapped) => {
-                tracing::info!(%mapped, "stun mapped endpoint discovered");
-                Some(mapped)
+                if mapped.is_ipv4() {
+                    round.udp4_ok = true;
+                    round.mapped_ports.push(mapped.port());
+                } else {
+                    round.udp6_ok = true;
+                }
+                if index == 0 {
+                    tracing::info!(%mapped, "stun mapped endpoint discovered");
+                    round.first_mapped = Some(mapped);
+                }
             }
             Err(error) => {
-                // {:#} 打出 anyhow 整条链，否则只剩 context，底层 errno 被吞。
-                tracing::warn!(%server, error = %format!("{error:#}"), "stun query failed");
-                None
+                let (stage, token) = netcheck::classify_udp_error(&error);
+                tracing::warn!(%server, stage, error = %token, "stun query failed");
+                // 发送失败（如 macOS 双栈 EINVAL）同族每个目标都会失败，不重试。
+                if stage == "send" {
+                    if server.is_ipv4() {
+                        send_broken_v4 = true;
+                    } else {
+                        send_broken_v6 = true;
+                    }
+                }
             }
-        },
-        None => None,
-    };
-    let found = endpoint::collect(engine.local_addr().port(), stun_mapped);
+        }
+        if send_broken_v4 && send_broken_v6 {
+            break;
+        }
+    }
+    round
+}
+
+/// 每个走 Relay 的对端的原因（规格 §4，纯函数 [`relay_reason`] 的装配）。
+fn relay_reason_map(
+    daemon: &Daemon,
+    engine: &SocketEngine,
+    local_udp_ok: bool,
+) -> HashMap<String, &'static str> {
+    let own_node_id = daemon
+        .registration_info()
+        .map(|info| info.node_id)
+        .unwrap_or_default();
+    let peers = peer_endpoint_view(&daemon.map_cache, &own_node_id);
+    let direct_rx = engine.direct_rx_ages();
+    let obs = daemon.punch_obs.lock().expect("punch obs poisoned").clone();
+    engine
+        .peer_reports()
+        .into_iter()
+        .filter(|report| report.use_relay)
+        .filter_map(|report| {
+            let peer = peers
+                .iter()
+                .find(|peer| peer.endpoints.node_id == report.node_id)?;
+            let obs = obs.get(&report.node_id).copied().unwrap_or_default();
+            let rx_fresh = direct_rx
+                .get(&report.node_id)
+                .and_then(|age| *age)
+                .is_some_and(|age| age <= hz_core::path::DIRECT_RX_FRESH);
+            let _ = obs; // offer_at 仅日志/调试用，原因判定只看 ack（§4）
+            let reason = relay_reason(&hz_core::health::RelayReasonInput {
+                local_udp_ok,
+                peer_has_candidates: !(peer.endpoints.v6.is_empty()
+                    && peer.endpoints.stun.is_empty()
+                    && peer.endpoints.lan.is_empty()),
+                signaling_exchanged: obs.ack_at.is_some(),
+                direct_rx_fresh: rx_fresh,
+            });
+            Some((report.node_id, reason))
+        })
+        .collect()
+}
+
+/// 组装一份 Health Report（规格 §3）。netcheck 六项来自本轮 STUN 探测与
+/// 状态采集，`direct_peers` / `relayed_peers` 来自数据面现状 + 原因判定。
+fn build_health_snapshot(
+    daemon: &Daemon,
+    engine: &SocketEngine,
+    stun: &StunRound,
+) -> HealthSnapshot {
+    let reasons = relay_reason_map(daemon, engine, stun.udp4_ok || stun.udp6_ok);
+    let mut direct_peers = 0u32;
+    let mut relayed_peers = Vec::new();
+    for report in engine.peer_reports() {
+        if report.use_relay {
+            if let Some(reason) = reasons.get(&report.node_id) {
+                relayed_peers.push(RelayedPeerNote {
+                    node_id: report.node_id.clone(),
+                    reason,
+                });
+            }
+        } else {
+            direct_peers += 1;
+        }
+    }
+    let found = daemon
+        .own_endpoints
+        .lock()
+        .expect("own endpoints poisoned")
+        .clone();
+    let suspicious_endpoint = noted_endpoints(&found).iter().any(|note| {
+        note.suspicious
+            .iter()
+            .any(|flag| flag == "198.18.0.0/15" || flag == "loopback")
+    });
+    let route = hz_core::netif::route_picture();
+    HealthSnapshot {
+        udp4_ok: stun.udp4_ok,
+        udp6_ok: stun.udp6_ok,
+        has_stun_mapping: stun.first_mapped.is_some() || !stun.mapped_ports.is_empty(),
+        nat: nat_kind(&stun.mapped_ports),
+        default_route_virtual: route.virtual_holds_default,
+        suspicious_endpoint,
+        direct_peers,
+        relayed_peers,
+    }
+}
+
+/// 收集一轮本机 Endpoint 并上报（周期收集与网络变化恢复共用）：
+/// STUN 查询走引擎共享 socket（重绑后自动落在新出口上），结果连同
+/// Lan/V6 候选写入共享槽并 ReportEndpoints 给 Coordination Server；
+/// Health Report 同帧携带（#72）。
+async fn collect_and_report(daemon: &Arc<Daemon>, engine: &Arc<SocketEngine>, coord_addr: &str) {
+    let targets = stun_server_targets();
+    let round = stun_round(engine, &targets).await;
+    let mut found = endpoint::collect(engine.local_addr().port(), round.first_mapped);
+    // 端口映射候选（#77）并入本轮结果一起上报与共享（替换旧 PortMap 项）。
+    let portmap = daemon
+        .portmap_endpoint
+        .lock()
+        .expect("portmap endpoint poisoned")
+        .clone();
+    found.retain(|endpoint| endpoint.kind != hz_core::endpoint::EndpointKind::PortMap);
+    if let Some(portmap) = portmap {
+        found.push(portmap);
+    }
     tracing::info!(endpoints = ?found, "collected endpoints");
-    *own_slot.lock().expect("own endpoints poisoned") = found.clone();
-    let counters = *punch.lock().expect("punch counters poisoned");
-    if let Err(error) = report_endpoints(state_dir, &found, coord_addr, Some(counters)).await {
+    *daemon.own_endpoints.lock().expect("own endpoints poisoned") = found.clone();
+    let counters = *daemon.punch.lock().expect("punch counters poisoned");
+    let snapshot = build_health_snapshot(daemon, engine, &round);
+    if let Err(error) = report_endpoints(
+        &daemon.state_dir,
+        &found,
+        coord_addr,
+        Some(counters),
+        Some(&snapshot),
+    )
+    .await
+    {
         tracing::warn!(%error, "endpoint report to coord failed");
     }
 }
@@ -1563,15 +1908,12 @@ fn spawn_net_recovery(
     coord_addr: &str,
     boot: Arc<StdMutex<Option<SocketAddr>>>,
 ) {
-    let state_dir = daemon.state_dir.clone();
-    let own_slot = daemon.own_endpoints.clone();
-    let punch = daemon.punch.clone();
+    let daemon = daemon.clone();
     let map_signal = daemon.map_signal.clone();
     let egress_epoch = daemon.egress_epoch.clone();
     let coord_addr = coord_addr.to_string();
     tokio::spawn(async move {
         let mut events = netwatch::spawn();
-        let stun_target = stun_server_target();
         let mut handled = netwatch::egress_snapshot();
         while let Some(event) = events.recv().await {
             let current = netwatch::egress_snapshot();
@@ -1591,18 +1933,12 @@ fn spawn_net_recovery(
             engine.reset_direct_rx();
             publish_lan_endpoint(engine.local_addr().port(), &boot);
             // 换网瞬间路由可能尚未收敛：STUN 限次重试，给出口几秒钟。
+            let has_stun_target = stun_server_target().is_some();
             for round in 0..3 {
-                collect_and_report(
-                    &state_dir,
-                    &own_slot,
-                    &punch,
-                    &engine,
-                    &coord_addr,
-                    stun_target.as_deref(),
-                )
-                .await;
-                let stun_reached = stun_target.is_none()
-                    || own_slot
+                collect_and_report(&daemon, &engine, &coord_addr).await;
+                let stun_reached = !has_stun_target
+                    || daemon
+                        .own_endpoints
                         .lock()
                         .expect("own endpoints poisoned")
                         .iter()
@@ -1633,6 +1969,7 @@ fn spawn_path_task(
     use_relay_slot: Arc<StdMutex<HashMap<String, bool>>>,
     punch_slot: Arc<StdMutex<PunchCounters>>,
     punch_last: Arc<StdMutex<HashMap<String, String>>>,
+    punch_obs: Arc<StdMutex<HashMap<String, PunchObs>>>,
     engine: Arc<SocketEngine>,
     keys: Arc<KeyStore>,
     own_node_id: &str,
@@ -1653,7 +1990,7 @@ fn spawn_path_task(
                     match frame {
                         Some(frame) => {
                             handle_punch_frame(
-                                &cache, &own_node_id, &engine, &keys, &mut manager, &frame,
+                                &cache, &own_node_id, &engine, &keys, &mut manager, &punch_obs, &frame,
                             )
                             .await;
                         }
@@ -1675,6 +2012,7 @@ fn spawn_path_task(
                     &use_relay_slot,
                     &punch_slot,
                     &punch_last,
+                    &punch_obs,
                     &keys,
                     &peers,
                     event,
@@ -1713,7 +2051,8 @@ fn peer_endpoint_view(cache: &NetworkMapCache, own_node_id: &str) -> Vec<PeerVie
                 };
                 match detailed.kind() {
                     hz_core::endpoint::EndpointKind::V6 => endpoints.v6.push(addr),
-                    hz_core::endpoint::EndpointKind::Stun => endpoints.stun.push(addr),
+                    hz_core::endpoint::EndpointKind::Stun
+                    | hz_core::endpoint::EndpointKind::PortMap => endpoints.stun.push(addr),
                     hz_core::endpoint::EndpointKind::Lan => endpoints.lan.push(addr),
                 }
             }
@@ -1732,6 +2071,7 @@ async fn apply_path_event(
     use_relay_slot: &Arc<StdMutex<HashMap<String, bool>>>,
     punch_slot: &Arc<StdMutex<PunchCounters>>,
     punch_last: &Arc<StdMutex<HashMap<String, String>>>,
+    punch_obs: &Arc<StdMutex<HashMap<String, PunchObs>>>,
     keys: &Arc<KeyStore>,
     peers: &[PeerView],
     event: PathEvent,
@@ -1788,6 +2128,12 @@ async fn apply_path_event(
             }
             // 一轮打洞（Offer + 握手并发，FR-12 成功率分母）。
             punch_slot.lock().expect("punch counters poisoned").attempts += 1;
+            punch_obs
+                .lock()
+                .expect("punch obs poisoned")
+                .entry(node_id.clone())
+                .or_default()
+                .offer_at = Some(std::time::Instant::now());
             let Some(relay) = engine.relay_client() else {
                 tracing::debug!(%node_id, "punch offer skipped: no relay transport");
                 note_punch(punch_last, &node_id, "skipped");
@@ -1846,6 +2192,7 @@ async fn handle_punch_frame(
     engine: &Arc<SocketEngine>,
     keys: &Arc<KeyStore>,
     manager: &mut PathManager,
+    punch_obs: &Arc<StdMutex<HashMap<String, PunchObs>>>,
     frame: &[u8],
 ) {
     if force_relay() {
@@ -1865,6 +2212,13 @@ async fn handle_punch_frame(
                     candidates = ?candidates,
                     "punch offer received"
                 );
+                // 对端已发起打洞：记入观察（Relay 原因判定输入）。
+                punch_obs
+                    .lock()
+                    .expect("punch obs poisoned")
+                    .entry(peer.endpoints.node_id.clone())
+                    .or_default()
+                    .offer_at = Some(std::time::Instant::now());
                 engine.add_peer_endpoints(&peer.endpoints.node_id, candidates.clone());
                 engine.send_punch(&peer.endpoints.node_id).await;
                 if let Some(chosen) = candidates.first().copied() {
@@ -1880,6 +2234,13 @@ async fn handle_punch_frame(
                 // Ack 只确认对端已朝我们的候选出洞；不再额外触发握手，
                 // 避免反复强制重置 boringtun 的进行中握手（ Relay 会话会被饿死）。
                 tracing::info!(node_id = %peer.endpoints.node_id, %chosen, "punch ack received");
+                // 信令已往来（规格 §4 handshake_timeout 的前置）。
+                punch_obs
+                    .lock()
+                    .expect("punch obs poisoned")
+                    .entry(peer.endpoints.node_id.clone())
+                    .or_default()
+                    .ack_at = Some(std::time::Instant::now());
             }
         }
         return;
@@ -2512,7 +2873,7 @@ mod netcheck_probe_tests {
         assert!(!udp.ipv6.ok);
         assert_eq!(udp.ipv6.error.as_deref(), Some("无该族 STUN 目标"));
         assert_eq!(stun_report.targets, 2);
-        assert_eq!(stun_report.nat, "端点无关");
+        assert_eq!(stun_report.nat, "easy");
         assert!(rtt.is_some());
     }
 }

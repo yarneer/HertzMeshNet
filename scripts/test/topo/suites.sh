@@ -94,7 +94,8 @@ wait_for_log() { # wait_for_log <file> <pattern> <label> [timeout-secs]
   return 1
 }
 
-relay_env_extra() { # 打洞/STUN 场景共用的 hzd 注入：Relay 地址 + 自签 CA（STUN 地址自动推导同主机 3478）
+relay_env_extra() { # 打洞/STUN 场景共用的 hzd 注入：Relay 地址 + 自签 CA
+  #（STUN 地址自动推导同主机 3478 与 3479，#76：两个目标比较映射端口）
   echo "HZD_RELAY_ADDR=https://203.0.113.1:$RELAY_PORT HZD_RELAY_CA_PATH=$ART_DIR/relay-ca.pem"
 }
 
@@ -1653,4 +1654,202 @@ assert_suite_routeheal() {
   else
     fail "hz status 未显示路由修复：$status_out"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# 套件 handshaketimeout（#75）：直连建立后丢弃 b 的 WG 端口入方向（模拟
+# 云主机安全组未放行 UDP），对端上报 handshake_timeout、coord 指标按原因
+# 计数；撤销后 30-60 秒内恢复 Direct Path。
+# ---------------------------------------------------------------------------
+assert_suite_handshaketimeout() {
+  local a b b4 a4 natnum before now handle i reason metrics
+  a=$(reg_list | awk -F'|' '$2 == "fullcone" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 fullcone + portrestricted 各一个"; return 1; }
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
+
+  note "人为阻断：在 $b 的 NAT 丢弃 WG 端口入方向（模拟云主机安全组未放行 UDP $HZ_WG_PORT）"
+  natnum=$(nat_num_of "$(reg_field "$b" 2)")
+  ip netns exec "hz-nat$natnum" nft insert rule ip "hz-nat$natnum" filterin udp dport "$HZ_WG_PORT" drop
+  pass "已在 hz-nat$natnum 的 forward 链首插入 udp dport $HZ_WG_PORT drop（仅入方向）"
+  before=$(grep -c "path=direct" "$ART_DIR/hz-node-$a.log" || true)
+
+  note "断言 1：对端退回 Relay，且 hz netcheck --json 的对端原因为 handshake_timeout"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=relay" "$a 退回 Relayed Path" 60 || return 1
+  reason=""
+  for i in $(seq 1 90); do # 最多 45 秒：Health Report / netcheck 状态随打洞观察刷新
+    reason=$(hz_cli "$a" netcheck --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    peers = d.get("peers") or []
+    print(peers[0].get("relay_reason") or "")
+except Exception:
+    print("")
+')
+    [[ $reason == handshake_timeout ]] && break
+    sleep 0.5
+  done
+  if [[ $reason == handshake_timeout ]]; then
+    pass "$a 上报的 Health Report 中 $b 的原因为 handshake_timeout"
+  else
+    fail "$a 上报的 Relay 原因不是 handshake_timeout（实际：'${reason}'）"
+  fi
+
+  note "断言 2：coord 指标按原因计数（hz_coord_relayed_paths{reason=\"handshake_timeout\"} ≥ 1，黄点由该原因驱动）"
+  metrics=$(ip netns exec "$WAN_NS" curl -s http://127.0.0.1:9100/metrics || true)
+  if grep -q 'hz_coord_relayed_paths{reason="handshake_timeout"} [1-9]' <<<"$metrics"; then
+    pass "coord 指标已按原因计数 handshake_timeout"
+  else
+    fail "coord 指标未见 handshake_timeout：$(grep hz_coord_relayed <<<"$metrics" | tr '\n' ' ')"
+  fi
+
+  note "断言 3：撤销 nftables 规则后 30-60 秒内恢复 Direct Path"
+  handle=$(ip netns exec "hz-nat$natnum" nft -a list chain ip "hz-nat$natnum" filterin \
+    | awk -v port="$HZ_WG_PORT" '$0 ~ "udp dport "port" drop" {for (i = 1; i <= NF; i++) if ($i == "handle") print $(i+1)}' | head -1)
+  if [[ -n $handle ]]; then
+    ip netns exec "hz-nat$natnum" nft delete rule ip "hz-nat$natnum" filterin handle "$handle"
+    pass "已删除 hz-nat$natnum filterin 的 drop 规则（handle $handle）"
+  else
+    fail "找不到 drop 规则的 handle，无法撤销"
+    return 1
+  fi
+  local recovered=0
+  for i in $(seq 1 120); do # 最多 60 秒
+    now=$(grep -c "path=direct" "$ART_DIR/hz-node-$a.log" || true)
+    if (( now > before )); then recovered=1; break; fi
+    sleep 0.5
+  done
+  if (( recovered == 1 )); then
+    pass "撤销后 $(( i / 2 )) 秒内 $a 恢复 Direct Path"
+  else
+    fail "撤销后 60 秒内未恢复 Direct Path"
+  fi
+  ping_assert "$a" "$b4" "$a → $b 恢复后仍通（${b4}）"
+  # 恢复直连后，上报里不再有该对端的 handshake_timeout 原因。
+  reason=$(hz_cli "$a" netcheck --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    peers = d.get("peers") or []
+    print(peers[0].get("relay_reason") or "")
+except Exception:
+    print("")
+')
+  if [[ $reason != handshake_timeout ]]; then
+    pass "恢复后 handshake_timeout 原因消失（当前：'${reason:-无}'）"
+  else
+    fail "恢复后仍上报 handshake_timeout"
+  fi
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# 套件 portmapdirect（#77）：对称 × 端口受限本无法直连（symcone 场景证明）；
+# 在对称 NAT 的 netns 里跑 NAT-PMP 应答器并钉扎映射端口，hzd 申请到 PortMap
+# 候选（稳定公网映射）后两端建立 Direct Path。
+# ---------------------------------------------------------------------------
+assert_suite_portmapdirect() {
+  local a b natnum table wan_ip a_lan stub_log b4 a4
+  a=$(reg_list | awk -F'|' '$2 == "symmetric" { print $1; exit }')
+  b=$(reg_list | awk -F'|' '$2 == "portrestricted" { print $1; exit }')
+  [[ -n $a && -n $b ]] || { fail "场景需要 symmetric + portrestricted 各一个"; return 1; }
+  natnum=$(nat_num_of symmetric)
+  table="hz-nat$natnum"
+  wan_ip="203.0.113.1${natnum}"
+  a_lan=$(reg_field "$a" 4)
+  stub_log="$ART_DIR/natpmp-stub.log"
+
+  note "前置：在 $table（对称 NAT，外网 $wan_ip）里跑 NAT-PMP 应答器 + 端口钉扎"
+  ip netns exec "$table" setsid python3 - "$wan_ip" "$a_lan" "$HZ_WG_PORT" "$table" > "$stub_log" 2>&1 <<'PY' &
+import socket
+import subprocess
+import sys
+
+# 参数：NAT 外网 IP、被映射 Node 的内网 IP、Node 的 WireGuard 端口、nft 表名。
+wan_ip, node_ip, wg_port, table = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+DEFAULT_EXT = 52001
+# Node 的默认网关是本 NAT 的内网地址，hzd 会自己发现 5351。
+
+def nft(*args):
+    # add chain 已存在时报错但不影响后续 add rule（no-op）。
+    subprocess.run(["nft", *args], check=False)
+
+def program(ext):
+    # 入方向 DNAT：映射端口 → Node 的 WG 端口（对称 NAT 没建过 prerouting 链）。
+    nft("add", "chain", "ip", table, "pm_prerouting",
+        "{ type nat hook prerouting priority dstnat; policy accept; }")
+    nft("add", "rule", "ip", table, "pm_prerouting",
+        "iifname", '"wan0"', "udp", "dport", str(ext),
+        "dnat", "to", "%s:%d" % (node_ip, wg_port))
+    # 出方向 SNAT 钉扎：Node 的 WG 端口固定映射到 wan:ext（先于 masquerade 兜底，
+    # nat 链首条命中即终止，insert 保证在最前）。
+    nft("insert", "rule", "ip", table, "postrouting",
+        "oifname", '"wan0"', "ip", "saddr", node_ip,
+        "udp", "sport", str(wg_port), "snat", "to", "%s:%d" % (wan_ip, ext))
+    # 放行入方向的新建流（对称 NAT 的 filterin 默认丢弃 wan0 新建；DNAT 在
+    # prerouting 已完成，此处 dport 是翻译后的 WG 端口）。
+    nft("insert", "rule", "ip", table, "filterin",
+        "iifname", '"wan0"', "udp", "dport", str(wg_port), "accept")
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", 5351))
+print("responder ready on :5351", flush=True)
+while True:
+    data, addr = sock.recvfrom(1500)
+    if len(data) < 2:
+        continue
+    version, opcode = data[0], data[1]
+    if version == 0 and opcode == 0:
+        reply = bytes([0, 0x80]) + (0).to_bytes(2, "big") + (0).to_bytes(4, "big") \
+            + socket.inet_aton(wan_ip)
+        sock.sendto(reply, addr)
+        print("external addr query ->", wan_ip, flush=True)
+    elif version == 0 and opcode == 2:
+        internal = int.from_bytes(data[4:6], "big")
+        suggested = int.from_bytes(data[6:8], "big")
+        ext = suggested or DEFAULT_EXT
+        program(ext)
+        reply = bytes([0, 0x82]) + (0).to_bytes(2, "big") + (0).to_bytes(4, "big") \
+            + internal.to_bytes(2, "big") + ext.to_bytes(2, "big") \
+            + (7200).to_bytes(4, "big")
+        sock.sendto(reply, addr)
+        print("NAT-PMP map %d -> %s:%d (pinned)" % (internal, wan_ip, ext), flush=True)
+    # 其余报文（PCP 等）不答：hzd 2 秒超时后落到 NAT-PMP。
+PY
+  pass "NAT-PMP 应答器已在 $table:5351 启动（外网 $wan_ip，映射目标 $a_lan:$HZ_WG_PORT）"
+
+  start_pair_with_relay "$a" "$b" || return 1
+  wait_pair_mutual_view "$a" "$b" || return 1
+
+  note "断言 1：hzd 经 NAT-PMP 拿到映射并上报 PortMap 候选"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "port mapping established" "$a 端口映射建立" 60 || return 1
+  if grep -q "NAT-PMP map" "$stub_log" 2>/dev/null; then
+    pass "应答器记录到映射申请：$(grep 'NAT-PMP map' "$stub_log" | tail -1)"
+  else
+    fail "应答器未记录映射申请（见 $stub_log）"
+  fi
+
+  note "断言 2：对称 × 端口受限组合靠 PortMap 候选建立 Direct Path"
+  wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 120 || return 1
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 120 || return 1
+  # b 侧在用的直连 endpoint 应是钉扎的外网地址（a 的 PortMap 候选）。
+  wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct.*${wan_ip}" \
+    "$b 的直连 endpoint 落在 ${wan_ip}（PortMap 候选）" 30 || return 1
+
+  note "断言 3：双向连通"
+  b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
+  ping_assert "$a" "$b4" "$a → $b IPv4（${b4}）"
+  ping_assert "$b" "$a4" "$b → $a IPv4（${a4}）"
+
+  unset HZD_NODE_EXTRA
+  (( FAILURES == 0 ))
 }

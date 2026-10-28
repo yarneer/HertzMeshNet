@@ -7,6 +7,7 @@ pub mod admin_ui;
 pub mod authkey;
 pub mod challenge;
 pub mod cli;
+pub mod health;
 pub mod http;
 pub mod login;
 pub mod map_stream;

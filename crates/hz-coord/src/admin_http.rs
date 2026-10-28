@@ -69,20 +69,27 @@ impl Default for OpsConfig {
     }
 }
 
-/// 在线流、打洞计数、运维路径。备份锁是进程内的一把。
+/// 在线流、打洞计数、Health Report、运维路径。备份锁是进程内的一把。
 pub struct ConsoleState {
     pub hub: Option<Arc<MapHub>>,
     pub metrics: Option<Arc<Metrics>>,
+    pub health: Option<Arc<crate::health::HealthCenter>>,
     pub ops: OpsConfig,
     // ponytail: one backup at a time for this process. Per-host lock if coord is ever multi-process.
     backup_busy: AtomicBool,
 }
 
 impl ConsoleState {
-    pub fn with_runtime(ops: OpsConfig, hub: Arc<MapHub>, metrics: Arc<Metrics>) -> Self {
+    pub fn with_runtime(
+        ops: OpsConfig,
+        hub: Arc<MapHub>,
+        metrics: Arc<Metrics>,
+        health: Arc<crate::health::HealthCenter>,
+    ) -> Self {
         Self {
             hub: Some(hub),
             metrics: Some(metrics),
+            health: Some(health),
             ops,
             backup_busy: AtomicBool::new(false),
         }
@@ -103,6 +110,7 @@ impl Default for ConsoleState {
         Self {
             hub: None,
             metrics: None,
+            health: None,
             ops: OpsConfig::default(),
             backup_busy: AtomicBool::new(false),
         }
@@ -376,6 +384,43 @@ struct NodeBody {
     revoked_at_unix: Option<i64>,
     created_at_unix: i64,
     online: bool,
+    // ---- #71 / #73 的可观测性字段 ----
+    /// Hello 上报的软件版本（`0.3.0 (a1b2c3d)`）；旧 Node 为 null。
+    version: Option<String>,
+    os: Option<String>,
+    arch: Option<String>,
+    /// 内存中的 last_seen（unix 秒；优先于库里的批量值）。
+    last_seen_unix: Option<i64>,
+    /// `same` / `behind` / `at_min` / `ahead` / `unknown`。
+    version_status: String,
+    /// 健康圆点与判定依据；无报告时也有颜色（灰）。
+    health: NodeHealthBody,
+}
+
+/// `/admin/api/nodes` 的 health 字段（规格 §7）。
+#[derive(Serialize)]
+struct NodeHealthBody {
+    /// `red` / `yellow` / `blue` / `green` / `gray`。
+    color: String,
+    /// 命中的条件（中文，悬停展示）；灰点也带原因。
+    reasons: Vec<String>,
+    /// 报告年龄（秒）；无报告为 null。
+    report_age_secs: Option<u64>,
+    direct_peers: Option<u32>,
+    /// (node_id, reason)；报告缺省为空。
+    relayed_peers: Vec<RelayedPeerBody>,
+    udp4_ok: Option<bool>,
+    udp6_ok: Option<bool>,
+    has_stun_mapping: Option<bool>,
+    nat: Option<String>,
+    default_route_virtual: Option<bool>,
+    suspicious_endpoint: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct RelayedPeerBody {
+    node_id: String,
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -500,20 +545,103 @@ async fn list_nodes(
     };
     rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.node_id.cmp(&b.node_id)));
     let hub = state.console.hub.as_ref();
+    let console_health = state.console.health.as_ref();
     let nodes = rows
         .into_iter()
-        .map(|row| NodeBody {
-            online: hub.is_some_and(|hub| hub.is_online(&row.node_id)),
-            node_id: row.node_id,
-            name: row.name,
-            ipv4: row.ipv4,
-            ipv6: row.ipv6,
-            tags: row.tags,
-            owner_user: row.owner_user,
-            expires_at_unix: row.expires_at_unix,
-            revoked: row.revoked,
-            revoked_at_unix: row.revoked_at_unix,
-            created_at_unix: row.created_at_unix,
+        .map(|row| {
+            let online = hub.is_some_and(|hub| hub.is_online(&row.node_id));
+            // 内存中的 last_seen 比 5 分钟批量的库里值新鲜。
+            let last_seen_unix = console_health
+                .and_then(|health| health.last_seen(&row.node_id))
+                .or(row.last_seen_unix);
+            let (version_status, health) = match console_health {
+                Some(health) => {
+                    let status = crate::health::version_status(
+                        row.node_version.as_deref(),
+                        env!("CARGO_PKG_VERSION"),
+                        health.protocol_version(&row.node_id),
+                        hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+                    );
+                    let received = health.fresh_report(&row.node_id);
+                    let age_secs = received.as_ref().map(|r| r.at.elapsed().as_secs());
+                    let dot = crate::health::health_dot(&crate::health::DotInput {
+                        online,
+                        report: received
+                            .as_ref()
+                            .map(|received| (&received.report, received.at.elapsed().as_secs())),
+                        version_status: status,
+                    });
+                    // 结构体字面量里 relayed_peers 会整体移动报告，先 clone 一份
+                    // 供其余字段逐项取用。
+                    let report = received.map(|received| received.report.clone());
+                    let relayed_peers = report
+                        .as_ref()
+                        .map(|report| {
+                            report
+                                .relayed_peers
+                                .iter()
+                                .map(|(node_id, reason)| RelayedPeerBody {
+                                    node_id: node_id.clone(),
+                                    reason: reason.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let body = NodeHealthBody {
+                        color: dot.0.as_str().to_string(),
+                        reasons: dot.1,
+                        report_age_secs: age_secs,
+                        direct_peers: report.as_ref().map(|report| report.direct_peers),
+                        relayed_peers,
+                        udp4_ok: report.as_ref().map(|report| report.udp4_ok),
+                        udp6_ok: report.as_ref().map(|report| report.udp6_ok),
+                        has_stun_mapping: report.as_ref().map(|report| report.has_stun_mapping),
+                        nat: report.as_ref().map(|report| report.nat.clone()),
+                        default_route_virtual: report
+                            .as_ref()
+                            .map(|report| report.default_route_virtual),
+                        suspicious_endpoint: report
+                            .as_ref()
+                            .map(|report| report.suspicious_endpoint),
+                    };
+                    (status.as_str().to_string(), body)
+                }
+                None => (
+                    crate::health::VersionStatus::Unknown.as_str().to_string(),
+                    NodeHealthBody {
+                        color: crate::health::DotColor::Gray.as_str().to_string(),
+                        reasons: vec!["等待上报（hzd < 0.3 或刚启动）".to_string()],
+                        report_age_secs: None,
+                        direct_peers: None,
+                        relayed_peers: Vec::new(),
+                        udp4_ok: None,
+                        udp6_ok: None,
+                        has_stun_mapping: None,
+                        nat: None,
+                        default_route_virtual: None,
+                        suspicious_endpoint: None,
+                    },
+                ),
+            };
+            NodeBody {
+                online,
+                node_id: row.node_id,
+                name: row.name,
+                ipv4: row.ipv4,
+                ipv6: row.ipv6,
+                tags: row.tags,
+                owner_user: row.owner_user,
+                expires_at_unix: row.expires_at_unix,
+                revoked: row.revoked,
+                revoked_at_unix: row.revoked_at_unix,
+                created_at_unix: row.created_at_unix,
+                version: row.node_version,
+                os: row.os,
+                arch: row.arch,
+                last_seen_unix,
+                version_status,
+                health,
+            }
         })
         .collect();
     json_ok(&NodeListBody { nodes })
@@ -1702,6 +1830,123 @@ mod tests {
         assert!(!set_cookie("sabc", false).contains("Secure"));
     }
 
+    /// #73 验收：`/admin/api/nodes` 的 health 字段正确；旧 Node（无 Health
+    /// Report）灰点与「未知」版本。
+    #[tokio::test]
+    async fn admin_api_nodes_carry_version_platform_and_health() {
+        let store = Store::open_in_memory(AddressConfig::default())
+            .await
+            .unwrap();
+        let alpha = store
+            .register_node(&[1u8; 32], &[2u8; 32], "alpha", &[], None, None)
+            .await
+            .unwrap();
+        let beta = store
+            .register_node(&[3u8; 32], &[4u8; 32], "beta", &[], None, None)
+            .await
+            .unwrap();
+        store
+            .update_node_runtime(
+                &alpha.id,
+                Some("0.3.0 (a1b2c3d)"),
+                Some("macos"),
+                Some("aarch64"),
+            )
+            .await
+            .unwrap();
+        // beta 不带版本：旧 Node。
+
+        let hub = Arc::new(crate::map_stream::MapHub::new());
+        let health = Arc::new(crate::health::HealthCenter::new());
+        let _alpha_stream = hub.register(alpha.id.clone());
+        let _beta_stream = hub.register(beta.id.clone());
+        // alpha：健康报告（黄——nat=hard）+ 当前协议版本 → same。
+        health.note_protocol(&alpha.id, hz_proto::PROTOCOL_VERSION);
+        health.note_report(
+            &alpha.id,
+            crate::health::NodeHealth {
+                udp4_ok: true,
+                udp6_ok: false,
+                has_stun_mapping: true,
+                nat: "hard".to_string(),
+                default_route_virtual: false,
+                suspicious_endpoint: false,
+                direct_peers: 2,
+                relayed_peers: vec![
+                    ("n-x".to_string(), "handshake_timeout".to_string()),
+                    ("n-y".to_string(), "punch_pending".to_string()),
+                ],
+            },
+        );
+        // beta：在线但从未上报（旧 Node）→ 灰。
+        let console = ConsoleState::with_runtime(
+            OpsConfig::default(),
+            hub,
+            Arc::new(Metrics::new().unwrap()),
+            health,
+        );
+
+        let idp = spawn_idp(&["hznet_admins@localhost"]).await;
+        let (base, _handle) = start_with(Some(oidc_for(&idp)), store, console).await;
+        let client = http();
+        let cookie = login_cookie(&client, &base, &idp).await;
+
+        let listed: serde_json::Value = client
+            .get(format!("{base}/admin/api/nodes"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = listed["nodes"].as_array().unwrap();
+        let alpha_row = rows.iter().find(|row| row["node_id"] == alpha.id).unwrap();
+        let beta_row = rows.iter().find(|row| row["node_id"] == beta.id).unwrap();
+
+        assert_eq!(alpha_row["version"], "0.3.0 (a1b2c3d)");
+        assert_eq!(alpha_row["os"], "macos");
+        assert_eq!(alpha_row["arch"], "aarch64");
+        assert_eq!(alpha_row["version_status"], "same");
+        assert!(alpha_row["last_seen_unix"].as_i64().unwrap() > 0);
+        assert_eq!(alpha_row["health"]["color"], "yellow", "{alpha_row}");
+        let reasons = alpha_row["health"]["reasons"].as_array().unwrap();
+        assert!(
+            reasons.iter().any(|r| r.as_str().unwrap().contains("hard")),
+            "nat=hard 计入黄色条件：{reasons:?}"
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("punch_pending")),
+            "punch_pending 不标黄：{reasons:?}"
+        );
+        assert_eq!(alpha_row["health"]["direct_peers"], 2);
+        assert_eq!(
+            alpha_row["health"]["relayed_peers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            alpha_row["health"]["relayed_peers"][0]["reason"],
+            "handshake_timeout"
+        );
+        assert_eq!(alpha_row["health"]["nat"], "hard");
+        assert_eq!(alpha_row["health"]["udp4_ok"], true);
+        assert_eq!(alpha_row["health"]["suspicious_endpoint"], false);
+        assert!(alpha_row["health"]["report_age_secs"].as_u64().unwrap() < 90);
+
+        // 旧 Node：版本未知、灰点「等待上报」。
+        assert_eq!(beta_row["version"], serde_json::Value::Null);
+        assert_eq!(beta_row["version_status"], "unknown");
+        assert_eq!(beta_row["health"]["color"], "gray");
+        let reasons = beta_row["health"]["reasons"].as_array().unwrap();
+        assert_eq!(reasons[0], "等待上报（hzd < 0.3 或刚启动）");
+        assert_eq!(beta_row["health"]["relayed_peers"], serde_json::json!([]));
+    }
+
     fn write_cert(dir: &std::path::Path, name: &str, extra: &[&str]) {
         let sub = dir.join(name);
         std::fs::create_dir_all(&sub).unwrap();
@@ -1806,7 +2051,12 @@ echo "已备份 fake"
             backup_timeout: std::time::Duration::from_millis(800),
             ..OpsConfig::default()
         };
-        let console = ConsoleState::with_runtime(ops, hub, metrics);
+        let console = ConsoleState::with_runtime(
+            ops,
+            hub,
+            metrics,
+            Arc::new(crate::health::HealthCenter::new()),
+        );
 
         let idp = spawn_idp(&["hznet_admins@localhost"]).await;
         let (base, _handle) = start_with(Some(oidc_for(&idp)), store.clone(), console).await;

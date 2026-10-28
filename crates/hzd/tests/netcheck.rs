@@ -35,7 +35,8 @@ async fn idle_daemon_answers_netcheck_without_guessing_nat() {
     assert_eq!(result["udp"]["ipv4"]["ok"], false);
     assert_eq!(result["udp"]["ipv4"]["error"], "数据面未启动");
     assert_eq!(result["udp"]["ipv6"]["error"], "数据面未启动");
-    assert_eq!(result["stun"]["nat"], "无法判断");
+    // 无 STUN 目标时不猜测（#76：取值 easy/hard/unknown）。
+    assert_eq!(result["stun"]["nat"], "unknown");
     assert!(result["stun"]["mapped"].as_array().unwrap().is_empty());
     assert!(result["endpoints"].is_array());
     assert!(result["peers"].is_array());

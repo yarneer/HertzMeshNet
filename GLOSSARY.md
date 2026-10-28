@@ -78,6 +78,10 @@ _Avoid_: P2P 连接, 中继模式
 Node 周期上报给 Coordination Server 的直连能力与路径状态摘要：UDP 外发是否可用、是否拿到公网映射、上报的 Endpoint 是否可疑，以及哪些对端正走 Relayed Path、原因是什么。只描述"能不能直连、为什么不能"，不含业务流量内容。
 _Avoid_: Telemetry, Heartbeat, 心跳, 遥测
 
+**Port Map（端口映射）**:
+hzd 经 PCP / NAT-PMP / UPnP IGD 向出口路由器为 WireGuard 端口申请的稳定公网映射，作为优先级高于 STUN 的 Endpoint 候选上报。映射返回的外网地址不是公网（私网 / CGNAT / 198.18.0.0/15）时判定为多重 NAT，不上报该候选。
+_Avoid_: 端口转发, DMZ, UPnP 映射（UPnP 只是三种协议之一）
+
 ### 访问控制
 
 **Policy**:

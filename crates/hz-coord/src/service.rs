@@ -27,7 +27,8 @@ use tonic::{Request, Response, Status};
 
 use crate::admin_http::{ConsoleState, OpsConfig};
 use crate::authkey;
-use crate::challenge::{CHALLENGE_TTL, Challenge, ChallengeCache};
+use crate::challenge::{CHALLENGE_TTL, Challenge, ChallengeCache, NodeRuntime};
+use crate::health::{HealthCenter, NodeHealth, run_last_seen_flush};
 use crate::http::{DistConfig, DistState, HttpHandle, HttpState, serve_http};
 use crate::login::{LOGIN_TTL, LoginRegistry, PollResult};
 use crate::map_stream::{MapHub, MapPushConfig, node_info_from, run_fan_out};
@@ -190,11 +191,14 @@ pub struct ServeHandle {
     connections: Arc<LiveConnections>,
     pub http_addr: Option<SocketAddr>,
     pub metrics_addr: Option<SocketAddr>,
+    /// Health Report 内存表（#69 v0.3）：测试与嵌入方检查报告是否进内存用。
+    pub health: Arc<HealthCenter>,
     shutdown: tokio::sync::watch::Sender<bool>,
     http: Option<HttpHandle>,
     metrics: Option<MetricsHandle>,
     join: tokio::task::JoinHandle<()>,
     fan_out: tokio::task::JoinHandle<()>,
+    last_seen_flush: tokio::task::JoinHandle<()>,
 }
 
 impl ServeHandle {
@@ -202,6 +206,7 @@ impl ServeHandle {
         // 先停产生者再断连接：多线程运行时下 close_all 与 abort 之间没有
         // 原子性，中间新产出的帧仍可能被连接任务刷给客户端。
         self.fan_out.abort();
+        self.last_seen_flush.abort();
         self.connections.close_all();
         let _ = self.shutdown.send(true);
         if let Some(http) = &self.http {
@@ -228,6 +233,9 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     let hub = Arc::new(MapHub::new());
     // 健康页与 /metrics 读同一份计数；HTTP 面先于指标监听拉起，所以先建好。
     let metrics = Arc::new(Metrics::new()?);
+    // Health Report 内存表 + last_seen（#69 v0.3 / ADR-0009）：gRPC、Admin
+    // Console 与指标面共用同一份。
+    let health = Arc::new(HealthCenter::new());
 
     let dist_state = match config.dist {
         Some(dist_config) => Some(Arc::new(DistState::build(&dist_config)?)),
@@ -251,7 +259,12 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
             login_node_ttl_secs: config.login_node_ttl_secs,
             dist: dist_state,
             admin: crate::admin_http::AdminGate::default(),
-            console: ConsoleState::with_runtime(config.ops.clone(), hub.clone(), metrics.clone()),
+            console: ConsoleState::with_runtime(
+                config.ops.clone(),
+                hub.clone(),
+                metrics.clone(),
+                health.clone(),
+            ),
         });
         let http = serve_http(http_listen, http_state).await?;
         let base = login_base_url(
@@ -269,7 +282,16 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     };
     let http_addr = http_handle.as_ref().map(|http| http.local_addr);
     let metrics_handle = match config.metrics_listen {
-        Some(listen) => Some(serve_metrics(listen, hub.clone(), metrics.clone()).await?),
+        Some(listen) => Some(
+            serve_metrics(
+                listen,
+                hub.clone(),
+                metrics.clone(),
+                health.clone(),
+                store.clone(),
+            )
+            .await?,
+        ),
         None => None,
     };
     let metrics_addr = metrics_handle.as_ref().map(|metrics| metrics.local_addr);
@@ -282,18 +304,25 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         login_ttl: config.login_ttl,
         login_base,
         metrics,
+        health: health.clone(),
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     let fan_out = tokio::spawn(run_fan_out(
-        store,
-        hub,
+        store.clone(),
+        hub.clone(),
         MapPushConfig {
             keepalive_every: config.map_keepalive,
             sweep_every: config.map_sweep,
         },
+    ));
+    // last_seen 批量落库（#71）：离线条目 5 秒内落库，在线条目 5 分钟一批。
+    let last_seen_flush = tokio::spawn(run_last_seen_flush(
+        store.clone(),
+        hub.clone(),
+        health.clone(),
     ));
 
     let mut server = tonic::transport::Server::builder();
@@ -322,6 +351,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
     Ok(ServeHandle {
         local_addr,
         connections,
+        health,
         shutdown: shutdown_tx,
         http: http_handle,
         http_addr,
@@ -329,6 +359,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         metrics_addr,
         join,
         fan_out,
+        last_seen_flush,
     })
 }
 
@@ -406,6 +437,8 @@ struct CoordServiceImpl {
     /// 一次性登录链接的基地址；None 表示未配置交互式登录的 HTTP 面。
     login_base: Option<String>,
     metrics: Arc<Metrics>,
+    /// Health Report 内存表 + last_seen / 版本缓存（#69 v0.3）。
+    health: Arc<HealthCenter>,
 }
 
 impl CoordServiceImpl {
@@ -490,7 +523,7 @@ impl CoordServiceImpl {
         let signature: [u8; 64] = req_challenge_signature
             .try_into()
             .map_err(|_| Status::invalid_argument("challenge_signature 必须是 64 字节"))?;
-        Self::take_verified_challenge(
+        let challenge = Self::take_verified_challenge(
             &self.challenges,
             &machine_key_pub,
             req_hostname,
@@ -512,7 +545,39 @@ impl CoordServiceImpl {
         {
             return Err(Status::permission_denied("Node 已过期，请重新登录"));
         }
+        self.note_node_activity(&record, &challenge.runtime, Some(req_protocol_version))
+            .await;
         Ok(record)
+    }
+
+    /// 认证后的公共记账（#71）：last_seen 内存更新；Hello 携带的版本/平台
+    /// 有变化时落库；协议版本记入内存（供「已到协议支持下限」判定）。
+    /// protocol_version 为 None 表示该请求不携带（RegisterAuthKeyRequest），
+    /// 下一次 Map 订阅 / Endpoint 上报会补上。
+    async fn note_node_activity(
+        &self,
+        record: &crate::store::NodeRecord,
+        runtime: &NodeRuntime,
+        protocol_version: Option<u32>,
+    ) {
+        self.health.note_seen(&record.id);
+        if let Some(version) = protocol_version {
+            self.health.note_protocol(&record.id, version);
+        }
+        if runtime.node_version.is_some() && self.health.remember_runtime(&record.id, runtime) {
+            if let Err(error) = self
+                .store
+                .update_node_runtime(
+                    &record.id,
+                    runtime.node_version.as_deref(),
+                    runtime.os.as_deref(),
+                    runtime.arch.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(%error, node_id = %record.id, "persist node runtime failed");
+            }
+        }
     }
 }
 
@@ -530,7 +595,16 @@ impl Coord for CoordServiceImpl {
             .machine_key_pub
             .try_into()
             .map_err(|_| Status::invalid_argument("machine_key_pub 必须是 32 字节"))?;
-        let (nonce, _expires) = self.challenges.issue(machine_key_pub, req.hostname);
+        // Hello 携带的版本/平台挂在挑战上（#71）：Hello 本身不认证，认证 rpc
+        // 取走挑战时才随身份落库。
+        let runtime = NodeRuntime {
+            node_version: req.node_version,
+            os: req.os,
+            arch: req.arch,
+        };
+        let (nonce, _expires) = self
+            .challenges
+            .issue(machine_key_pub, req.hostname, runtime);
         let challenge_expires_unix = system_time_to_unix(SystemTime::now() + CHALLENGE_TTL);
         Ok(Response::new(HelloResponse {
             challenge_nonce: nonce.to_vec(),
@@ -637,6 +711,8 @@ impl Coord for CoordServiceImpl {
             })?;
 
         tracing::info!(node_id = %record.id, name = %record.name, "node registered");
+        self.note_node_activity(&record, &challenge.runtime, None)
+            .await;
         if !crate::admin::has_tag(&record.tags) {
             // v0.1.4 之前签发的无 Tag Key 仍可用（兼容），但注册出的 Node 既无
             // 归属也无 Tag，Policy 覆盖不到它；处置见 runbook。
@@ -843,6 +919,8 @@ impl Coord for CoordServiceImpl {
 
         // 打开即登记进推送枢纽；首条全量快照与后续差量都由 fan-out 任务按序投递，
         // 接收端断开时投递失败、登记随之移除。
+        self.note_node_activity(&record, &challenge.runtime, Some(req.protocol_version))
+            .await;
         let rx = self.map_hub.register(record.id.clone());
         tracing::info!(node_id = %record.id, "network map stream opened");
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
@@ -945,7 +1023,7 @@ impl Coord for CoordServiceImpl {
             .challenge_signature
             .try_into()
             .map_err(|_| Status::invalid_argument("challenge_signature 必须是 64 字节"))?;
-        Self::take_verified_challenge(
+        let challenge = Self::take_verified_challenge(
             &self.challenges,
             &machine_key_pub,
             &req.hostname,
@@ -968,6 +1046,8 @@ impl Coord for CoordServiceImpl {
         {
             return Err(Status::permission_denied("Node 已过期，请重新登录"));
         }
+        self.note_node_activity(&record, &challenge.runtime, Some(req.protocol_version))
+            .await;
 
         // 边界输入：addr 必须是 IP 字面量、port 在范围内、kind 未知按 lan 兜底。
         let stored = req
@@ -990,6 +1070,7 @@ impl Coord for CoordServiceImpl {
                     .map(|kind| match kind {
                         hz_proto::EndpointKind::Stun => "stun",
                         hz_proto::EndpointKind::V6 => "v6",
+                        hz_proto::EndpointKind::PortMap => "portmap",
                         _ => "lan",
                     })
                     .unwrap_or("lan");
@@ -1007,6 +1088,11 @@ impl Coord for CoordServiceImpl {
                 report.punch_attempts as u64,
                 report.punch_success as u64,
             );
+        }
+        // Health Report（#72 / OB-2）只进内存（ADR-0009）；90 秒未更新即过期。
+        if let Some(health) = req.health {
+            self.health
+                .note_report(&record.id, NodeHealth::from(health));
         }
         self.store
             .update_udp_endpoints(&record.id, &stored)
@@ -1311,15 +1397,23 @@ impl Coord for CoordServiceImpl {
                 Status::internal("列出 Node 失败")
             })?
             .into_iter()
-            .map(|row| AdminNodeInfo {
-                node_id: row.node_id,
-                name: row.name,
-                ipv4: row.ipv4,
-                ipv6: row.ipv6,
-                tags: row.tags,
-                owner_user: row.owner_user,
-                expires_at_unix: row.expires_at_unix,
-                revoked: row.revoked,
+            .map(|row| {
+                // last_seen 优先取内存值（比 5 分钟批量的库里值新鲜）。
+                let last_seen_unix = self.health.last_seen(&row.node_id).or(row.last_seen_unix);
+                AdminNodeInfo {
+                    node_id: row.node_id,
+                    name: row.name,
+                    ipv4: row.ipv4,
+                    ipv6: row.ipv6,
+                    tags: row.tags,
+                    owner_user: row.owner_user,
+                    expires_at_unix: row.expires_at_unix,
+                    revoked: row.revoked,
+                    node_version: row.node_version,
+                    os: row.os,
+                    arch: row.arch,
+                    last_seen_unix,
+                }
             })
             .collect();
         Ok(Response::new(ListNodesResponse { nodes }))

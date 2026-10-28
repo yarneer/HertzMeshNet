@@ -70,6 +70,9 @@ async fn signed_challenge(
             protocol_version: PROTOCOL_VERSION,
             machine_key_pub: keys.machine.verifying_key().to_bytes().to_vec(),
             hostname: hostname.to_owned(),
+            node_version: None,
+            os: None,
+            arch: None,
         })
         .await
         .unwrap()

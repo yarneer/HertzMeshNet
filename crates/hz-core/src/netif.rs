@@ -6,7 +6,7 @@
 //! 出口变化后的重绑不在本模块（见 #9/#16）。
 
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::net::Ipv4Addr;
 use std::os::fd::AsFd;
 #[cfg(target_os = "macos")]
@@ -284,6 +284,58 @@ pub(crate) fn parse_route_get_interface(text: &str) -> Option<String> {
         .map(str::trim_start)
         .find_map(|line| line.strip_prefix("interface:"))
         .map(|name| name.trim().to_string())
+}
+
+/// `route -n get default` 文本 → 网关地址（gateway: 行）。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_route_get_gateway(text: &str) -> Option<Ipv4Addr> {
+    text.lines()
+        .map(str::trim_start)
+        .find_map(|line| line.strip_prefix("gateway:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `/proc/net/route` 文本 → 默认路由的网关（Gateway 列，hex）。
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_default_gateway(table: &str) -> Option<Ipv4Addr> {
+    for line in table.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let dest = u32::from_str_radix(fields[1], 16).ok()?;
+        let mask = u32::from_str_radix(fields[7], 16).ok()?;
+        if dest == 0 && mask == 0 {
+            let gateway = u32::from_str_radix(fields[2], 16).ok()?;
+            return Some(Ipv4Addr::from(gateway.swap_bytes()));
+        }
+    }
+    None
+}
+
+/// 默认路由的网关地址（端口映射的 NAT-PMP/PCP/UPnP 对端，#77）。
+/// 探测不到返回 None（无网关 = 大概率没有可映射的 NAT）。
+pub fn default_gateway_v4() -> Option<Ipv4Addr> {
+    #[cfg(target_os = "linux")]
+    {
+        let table = std::fs::read_to_string("/proc/net/route").ok()?;
+        parse_default_gateway(&table)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+            .ok()?;
+        parse_route_get_gateway(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 /// `netstat -rn -f inet` 文本 → 全部默认路由的网卡名（按出现顺序，

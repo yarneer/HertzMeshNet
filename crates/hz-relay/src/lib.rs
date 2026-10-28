@@ -32,6 +32,31 @@ const SESSION_DEPTH: usize = 128;
 /// 每 Node 的 Relay 限速默认值（FR-9：默认 10 Mbps、可配置）。
 pub const DEFAULT_RATE_LIMIT_MBPS: u64 = 10;
 
+/// STUN 的缺省监听端口（#76）：3478 之外再开 3479，两个目标让 Node 比较
+/// 映射端口得到 NAT 形态（easy / hard）。未放行 3479 的旧部署只是让
+/// `nat=unknown`，不影响其他功能。
+pub const DEFAULT_STUN_LISTENS: [&str; 2] = ["0.0.0.0:3478", "0.0.0.0:3479"];
+
+/// 逐个绑定 STUN 监听并启动应答循环（FR-8 / #76）。返回实际绑定的地址
+/// （与入参一致，测试可用 127.0.0.1:0 拿临时端口）。非回环监听绑物理出口
+/// 网卡（FR-7）；回环监听（测试）不绑——绑了物理网卡就收不到回环包。
+pub async fn start_stun(listens: &[String]) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut bound = Vec::new();
+    for listen in listens {
+        let addr: SocketAddr = listen
+            .parse()
+            .map_err(|e| anyhow::anyhow!("无效的 STUN 监听地址 {listen}：{e}"))?;
+        let sock = Arc::new(tokio::net::UdpSocket::bind(addr).await?);
+        if !addr.ip().is_loopback() {
+            hz_core::netif::bind_to_physical_egress(sock.as_ref());
+        }
+        bound.push(sock.local_addr()?);
+        tokio::spawn(hz_core::stun::serve(sock));
+    }
+    tracing::info!(?bound, "stun servers listening");
+    Ok(bound)
+}
+
 pub struct RelayConfig {
     pub listen: SocketAddr,
     pub tls: Option<ServerTlsConfig>,

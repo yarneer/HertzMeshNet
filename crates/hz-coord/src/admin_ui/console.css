@@ -135,6 +135,61 @@ tr.revoked td {
   color: GrayText;
 }
 
+/* 健康圆点（#73）：颜色即状态，悬停显示命中条件（title 由 console.js 填）。 */
+.dot {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  border: 1px solid GrayText;
+  vertical-align: middle;
+}
+
+.dot-red {
+  background: #d5402b;
+}
+
+.dot-yellow {
+  background: #e0a400;
+}
+
+.dot-blue {
+  background: #2d6cdf;
+}
+
+.dot-green {
+  background: #2e9e4f;
+}
+
+.dot-gray {
+  background: Canvas;
+}
+
+/* 节点详情行（点名称展开）：与主行同宽，浅底区分。 */
+tr.detail td {
+  background: ButtonFace;
+}
+
+tr.detail .detail-title {
+  font-weight: 700;
+  margin: 0.4rem 0 0.15rem;
+}
+
+tr.detail dl.detail-dl {
+  grid-template-columns: 10rem 1fr;
+  margin: 0.15rem 0 0.5rem;
+}
+
+tr.detail ul {
+  margin: 0.15rem 0 0.5rem;
+  padding-left: 1.25rem;
+}
+
+td.node-name {
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
 code,
 pre {
   font-family: ui-monospace, monospace;
