@@ -1,5 +1,5 @@
 //! Endpoint 收集（FR-8）。三种来源：
-//! Lan = 非虚拟网卡的 IPv4 + WireGuard 端口；Stun = 从共享 socket 向 Relay
+//! Lan = 非虚拟网卡的 IPv4 + WireGuard 端口（不含 198.18.0.0/15）；Stun = 从共享 socket 向 Relay
 //! 主机的 UDP 3478 查询得到的公网映射；V6 = 网卡上的全球单播 IPv6（v6 无 NAT
 //! 预期）。收集结果经 ReportEndpoints 上报 Coordination Server，随 Network
 //! Map 下发给对端，对端据此排候选序（V6 优先、Stun 次之、Lan 兜底）。
@@ -99,12 +99,48 @@ fn dedup(endpoints: Vec<DiscoveredEndpoint>) -> Vec<DiscoveredEndpoint> {
 }
 
 fn usable_lan_v4(ip: Ipv4Addr) -> bool {
-    !ip.is_unspecified()
+    // 198.18.0.0/15 是第三方 TUN 类网络工具的假地址，不是局域网出口。
+    !crate::outer_dns::is_fake_ip(&IpAddr::V4(ip))
+        && !ip.is_unspecified()
         && !ip.is_broadcast()
         && !ip.is_loopback()
         && !ip.is_link_local()
         && !ip.is_multicast()
         && !ip.is_documentation()
+}
+
+/// 候选源地址能否作为上报的 LAN Endpoint。
+/// `198.18.0.0/15` 与虚拟网卡上的地址一律拒绝。
+pub(crate) fn accept_lan_candidate(iface: &str, ip: IpAddr) -> bool {
+    if crate::netif::is_virtual_iface(iface) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => usable_lan_v4(v4),
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// 从候选里取物理出口网卡上的 IPv4。出口不明、或该网卡上没有可用地址时
+/// 返回 None（不上报，而不是改报另一张网卡或一个假地址）。
+pub(crate) fn select_lan_source<'a>(
+    candidates: impl IntoIterator<Item = (&'a str, IpAddr)>,
+    egress: Option<&str>,
+) -> Option<IpAddr> {
+    let egress = egress?;
+    candidates
+        .into_iter()
+        .find_map(|(iface, ip)| (iface == egress && accept_lan_candidate(iface, ip)).then_some(ip))
+}
+
+/// 当前物理出口网卡上应上报的 LAN 地址。与 [`interface_addrs`] 同一套网卡枚举。
+pub(crate) fn reported_lan_ip() -> Option<IpAddr> {
+    let egress = crate::netif::physical_egress();
+    let listed = enumerated_addrs();
+    select_lan_source(
+        listed.iter().map(|(name, ip)| (name.as_str(), *ip)),
+        egress.as_deref(),
+    )
 }
 
 /// 全球单播 IPv6（2000::/3）：排除 ULA、链路本地、组播与未指定地址。
@@ -113,10 +149,19 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xe000) == 0x2000 && !ip.is_unspecified()
 }
 
-/// 非虚拟网卡上的全部地址（getifaddrs）。虚拟网卡名沿用
-/// [`crate::netif`] 的排除表——第三方 TUN 类网络工具的地址不是我们的出口。
-/// 收集 Endpoint 与网络变化侦测（netwatch 的快照比对）共用。
+/// 非虚拟网卡上的全部地址（getifaddrs）。虚拟网卡判定与
+/// [`crate::netif::physical_egress`] 相同——第三方 TUN 类网络工具的地址
+/// 不是我们的出口。收集 Endpoint 与网络变化侦测（netwatch 的快照比对）共用。
 pub(crate) fn interface_addrs() -> Vec<IpAddr> {
+    enumerated_addrs()
+        .into_iter()
+        .filter(|(name, _)| !crate::netif::is_virtual_iface(name))
+        .map(|(_, ip)| ip)
+        .collect()
+}
+
+/// 全部网卡地址（含虚拟网卡），供 LAN Endpoint 选择与 [`interface_addrs`] 共用。
+fn enumerated_addrs() -> Vec<(String, IpAddr)> {
     use std::ffi::CStr;
     let mut out = Vec::new();
     unsafe {
@@ -135,10 +180,7 @@ pub(crate) fn interface_addrs() -> Vec<IpAddr> {
             if ifa.ifa_addr.is_null() {
                 continue;
             }
-            let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-            if crate::netif::is_virtual_name(&name) {
-                continue;
-            }
+            let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
             let family = (*ifa.ifa_addr).sa_family as i32;
             let ip = match family {
                 libc::AF_INET => {
@@ -151,7 +193,7 @@ pub(crate) fn interface_addrs() -> Vec<IpAddr> {
                 }
                 _ => continue,
             };
-            out.push(ip);
+            out.push((name, ip));
         }
         libc::freeifaddrs(head);
     }
@@ -209,6 +251,61 @@ mod tests {
             order,
             vec![EndpointKind::V6, EndpointKind::Stun, EndpointKind::Lan]
         );
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn lan_source_rejects_fake_ip_and_virtual_nic() {
+        let lan = ip("192.168.31.63");
+        assert!(
+            !accept_lan_candidate("en0", ip("198.18.0.1")),
+            "198.18.0.0/15 不能当 LAN Endpoint"
+        );
+        assert!(!accept_lan_candidate("eth0", ip("198.19.255.255")));
+        assert!(
+            !accept_lan_candidate("utun4", lan),
+            "虚拟网卡上的地址不能当 LAN Endpoint"
+        );
+        assert!(!accept_lan_candidate("tun0", lan));
+        assert!(!accept_lan_candidate("en0", ip("127.0.0.1")));
+        assert!(accept_lan_candidate("en0", lan));
+        assert!(accept_lan_candidate("eth0", ip("10.0.0.8")));
+        assert!(!usable_lan_v4(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(usable_lan_v4(Ipv4Addr::new(192, 168, 31, 63)));
+    }
+
+    #[test]
+    fn egress_change_reselects_physical_address_and_drops_unusable() {
+        let wifi = ip("192.168.31.63");
+        let wired = ip("10.0.0.8");
+        let fake = ip("198.18.0.1");
+        let on_wifi = [("en0", wifi), ("utun4", fake)];
+        assert_eq!(select_lan_source(on_wifi, Some("en0")), Some(wifi));
+        // 同一张物理网卡上假地址与真实地址并存时，只留真实地址。
+        let mixed = [("en0", fake), ("en0", wifi)];
+        assert_eq!(select_lan_source(mixed, Some("en0")), Some(wifi));
+
+        let on_wired = [("en0", wifi), ("en5", wired), ("utun4", fake)];
+        assert_eq!(
+            select_lan_source(on_wired, Some("en5")),
+            Some(wired),
+            "出口从 en0 换到 en5 后应改报新网卡地址"
+        );
+        let poisoned = [("en5", fake), ("utun4", wired)];
+        assert_eq!(
+            select_lan_source(poisoned, Some("en5")),
+            None,
+            "新出口上只剩假地址时不上报"
+        );
+        assert_eq!(
+            select_lan_source(poisoned, Some("utun4")),
+            None,
+            "虚拟网卡即使被当成出口也不上报"
+        );
+        assert_eq!(select_lan_source(on_wired, None), None);
     }
 
     #[test]

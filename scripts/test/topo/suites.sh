@@ -685,6 +685,23 @@ assert_suite_proxysim() {
   wait_pair_mutual_view "$a" "$b" || return 1
   b4=$(peer_field "$a" ipv4); a4=$(peer_field "$b" ipv4)
 
+  note "断言：上报的 LAN Endpoint 不在 198.18.0.0/15（#64）"
+  local log lan_line
+  log="$ART_DIR/hz-node-$a.log"
+  wait_for_log "$log" "reporting lan endpoint" "$a 上报 LAN Endpoint" 30 || return 1
+  lan_line=$(grep "reporting lan endpoint" "$log" | tail -1)
+  if grep -Eq '198\.1[89]\.' <<<"$lan_line"; then
+    fail "${a}：LAN Endpoint 落在 198.18.0.0/15（${lan_line}）"
+  else
+    pass "${a}：LAN Endpoint 不在 198.18.0.0/15（${lan_line}）"
+  fi
+  wait_for_log "$log" "collected endpoints" "$a 收集 Endpoint" 30 || return 1
+  if grep "collected endpoints" "$log" | grep -Eq '198\.1[89]\.'; then
+    fail "${a}：收集到的 Endpoint 含 198.18.0.0/15"
+  else
+    pass "${a}：收集到的 Endpoint 不含 198.18.0.0/15"
+  fi
+
   note "断言 1：黑洞之下 STUN 仍发现真实出口公网 Endpoint（≠ 198.18.0.1 黑洞地址）"
   wait_for_log "$ART_DIR/hz-node-$a.log" "stun mapped endpoint discovered" "$a STUN 映射发现" 90 || return 1
   expected="203.0.113.1$(nat_num_of fullcone):$(reg_field "$a" 5)"
