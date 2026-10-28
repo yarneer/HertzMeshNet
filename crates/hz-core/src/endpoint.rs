@@ -149,6 +149,14 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xe000) == 0x2000 && !ip.is_unspecified()
 }
 
+/// 非虚拟网卡上有全球单播 IPv6。链路本地与 ULA 不算可直连的地址。
+pub fn has_usable_ipv6() -> bool {
+    interface_addrs().into_iter().any(|ip| match ip {
+        IpAddr::V6(v6) => is_global_v6(v6),
+        IpAddr::V4(_) => false,
+    })
+}
+
 /// 非虚拟网卡上的全部地址（getifaddrs）。虚拟网卡判定与
 /// [`crate::netif::physical_egress`] 相同——第三方 TUN 类网络工具的地址
 /// 不是我们的出口。收集 Endpoint 与网络变化侦测（netwatch 的快照比对）共用。

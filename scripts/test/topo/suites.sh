@@ -475,6 +475,21 @@ assert_suite_direct() {
   note "断言 5：hzd 仍只持一个 UDP socket（打洞复用）"
   assert_single_udp_socket "$a" "$b"
 
+  note "断言 6：直连场景 hz netcheck --json 报告 UDP 可用、对端路径为 direct"
+  if hz_cli "$a" netcheck --json >"$ART_DIR/netcheck-$a.json" 2>"$ART_DIR/netcheck-$a.err" \
+    && python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+udp = d["udp"]["ipv4"]
+assert udp["ok"] is True, udp
+peers = d.get("peers") or []
+assert peers and all(p.get("path") == "direct" for p in peers), peers
+' "$ART_DIR/netcheck-$a.json"; then
+    pass "${a}：hz netcheck --json UDP 可用且对端 direct"
+  else
+    fail "${a}：hz netcheck --json 不符合直连预期：$(tr '\n' ' ' <"$ART_DIR/netcheck-$a.json") $(tr '\n' ' ' <"$ART_DIR/netcheck-$a.err")"
+  fi
+
   unset HZD_NODE_EXTRA
   (( FAILURES == 0 ))
 }

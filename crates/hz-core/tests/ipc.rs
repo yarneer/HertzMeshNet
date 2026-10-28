@@ -123,6 +123,7 @@ fn read_only_methods_are_open_to_any_local_user() {
     let (hzd_uid, someone) = (0, 501);
     assert!(ipc::authorize("status", someone, hzd_uid).is_ok());
     assert!(ipc::authorize("ping", someone, hzd_uid).is_ok());
+    assert!(ipc::authorize("netcheck", someone, hzd_uid).is_ok());
 }
 
 #[test]

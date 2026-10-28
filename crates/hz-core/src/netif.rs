@@ -5,6 +5,7 @@
 //! （socket2 把这两个选项闸在非默认 feature 后面，这里直接经 libc setsockopt）。
 //! 出口变化后的重绑不在本模块（见 #9/#16）。
 
+use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", test))]
 use std::net::Ipv4Addr;
 use std::os::fd::AsFd;
@@ -84,6 +85,33 @@ pub(crate) fn pick_egress(
         .iter()
         .find(|r| !is_virtual(&r.iface))
         .map(|r| r.iface.clone())
+}
+
+/// 默认路由由谁持有，以及物理出口是不是另一张网卡。
+/// `virtual_holds_default` 为真表示虚拟网卡夺走了默认路由。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutePicture {
+    pub physical: Option<String>,
+    pub default_route: Option<String>,
+    pub virtual_holds_default: bool,
+}
+
+/// 从已解析的路由表得出 [`RoutePicture`]。默认路由取 metric 最小的那条，
+/// 不跳过虚拟网卡——跳过是 [`pick_egress`] 的事，这里要说出谁拿走了默认路由。
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn picture_of(routes: &[RouteEntry], is_virtual: &dyn Fn(&str) -> bool) -> RoutePicture {
+    let mut defaults: Vec<&RouteEntry> = routes
+        .iter()
+        .filter(|r| r.dest.is_unspecified() && r.mask.is_unspecified())
+        .collect();
+    defaults.sort_by_key(|r| r.metric);
+    let default_route = defaults.first().map(|route| route.iface.clone());
+    let virtual_holds_default = default_route.as_deref().is_some_and(is_virtual);
+    RoutePicture {
+        physical: pick_egress(routes, is_virtual),
+        default_route,
+        virtual_holds_default,
+    }
 }
 
 /// 持有地址 `ip` 的本机网卡名（getifaddrs）。用于 `hz status` 指出 HzNet
@@ -167,6 +195,31 @@ pub fn physical_egress() -> Option<String> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+/// 物理出口与默认路由持有者。读路由表，不需要 root。
+pub fn route_picture() -> RoutePicture {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(table) = std::fs::read_to_string("/proc/net/route") else {
+            return RoutePicture::default();
+        };
+        picture_of(&parse_route_table(&table), &is_virtual_iface)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let default_route = egress_from_route_get();
+        let virtual_holds_default = default_route.as_deref().is_some_and(is_virtual_iface);
+        RoutePicture {
+            physical: physical_egress(),
+            default_route,
+            virtual_holds_default,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        RoutePicture::default()
     }
 }
 
@@ -534,5 +587,41 @@ mod tests {
             entry("docker0", "172.17.0.0", "255.255.0.0", 0),
         ];
         assert_eq!(pick_egress(&routes, &is_virtual_name), None);
+    }
+
+    #[test]
+    fn picture_names_the_virtual_nic_that_stole_the_default_route() {
+        let routes = vec![
+            entry("tun0", "0.0.0.0", "0.0.0.0", 0),
+            entry("eth0", "0.0.0.0", "0.0.0.0", 10),
+            entry("eth0", "172.21.0.0", "255.255.0.0", 0),
+        ];
+        let picture = picture_of(&routes, &is_virtual_name);
+        assert_eq!(picture.physical.as_deref(), Some("eth0"));
+        assert_eq!(picture.default_route.as_deref(), Some("tun0"));
+        assert!(picture.virtual_holds_default);
+    }
+
+    #[test]
+    fn picture_is_quiet_when_the_physical_nic_holds_the_default_route() {
+        let routes = vec![entry("eth0", "0.0.0.0", "0.0.0.0", 0)];
+        let picture = picture_of(&routes, &is_virtual_name);
+        assert_eq!(picture.physical.as_deref(), Some("eth0"));
+        assert_eq!(picture.default_route.as_deref(), Some("eth0"));
+        assert!(!picture.virtual_holds_default);
+    }
+
+    #[test]
+    fn picture_still_finds_physical_when_only_the_virtual_nic_has_a_default() {
+        let routes = vec![
+            entry("proxytun", "0.0.0.0", "0.0.0.0", 0),
+            entry("proxytun", "198.18.0.0", "255.255.255.252", 0),
+            entry("eth0", "172.21.0.0", "255.255.0.0", 0),
+        ];
+        let is_virtual = |name: &str| is_virtual_name(name) || name == "proxytun";
+        let picture = picture_of(&routes, &is_virtual);
+        assert_eq!(picture.default_route.as_deref(), Some("proxytun"));
+        assert!(picture.virtual_holds_default);
+        assert_eq!(picture.physical.as_deref(), Some("eth0"));
     }
 }
