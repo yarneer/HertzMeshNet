@@ -196,7 +196,7 @@ impl StunRouter {
                 .expect("stun pending poisoned")
                 .remove(&txid);
         };
-        sock.send_to(&request, server)
+        crate::wire::send_udp(sock, &request, server)
             .await
             .with_context(|| format!("stun request send to {server} failed"))?;
         let mapped = tokio::time::timeout(RESPONSE_TIMEOUT, rx).await;
@@ -253,9 +253,14 @@ pub async fn serve(sock: Arc<UdpSocket>) -> anyhow::Result<()> {
                 return Err(error.into());
             }
         };
-        if let Some(response) = binding_response(&buf[..len], from) {
-            if let Err(error) = sock.send_to(&response, from).await {
-                tracing::warn!(%from, %error, "stun server reply failed");
+        let peer = crate::wire::dual_stack_peer_addr(from);
+        if let Some(response) = binding_response(&buf[..len], peer) {
+            if let Err(error) = crate::wire::send_udp(&sock, &response, peer).await {
+                tracing::warn!(
+                    from = %peer,
+                    error = %format!("{error:#}"),
+                    "stun server reply failed"
+                );
             }
         }
     }

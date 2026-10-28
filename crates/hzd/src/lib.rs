@@ -1252,7 +1252,8 @@ async fn collect_and_report(
                 Some(mapped)
             }
             Err(error) => {
-                tracing::warn!(%server, %error, "stun query failed");
+                // {:#} 打出 anyhow 整条链，否则只剩 context，底层 errno 被吞。
+                tracing::warn!(%server, error = %format!("{error:#}"), "stun query failed");
                 None
             }
         },

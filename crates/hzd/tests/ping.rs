@@ -42,10 +42,8 @@ fn spec_for(peer: &Side, node_id: &str) -> PeerSpec {
     PeerSpec {
         node_id: node_id.to_owned(),
         node_key_pub: NodePublicKey::from(&peer.secret).to_bytes(),
-        // 双栈绑定的 local_addr 是未指定的 [::]:port；v6 socket 发往 v4
-        // 目标必须用 v4-mapped 形式（::ffff:127.0.0.1）。
         endpoints: vec![SocketAddr::new(
-            IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
             peer.engine.local_addr().port(),
         )],
         dst_addrs: vec![IpAddr::V4(peer.v4), IpAddr::V6(peer.v6)],

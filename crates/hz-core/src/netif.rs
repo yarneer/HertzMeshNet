@@ -257,8 +257,9 @@ fn egress_from_netstat() -> Option<String> {
 }
 
 /// macOS 的 IP_BOUND_IF / IPV6_BOUND_IF：值是网卡索引（u32）。无需特权。
-/// is_v6 决定用 IPV6_BOUND_IF（双栈 v6 socket 上 v4-mapped 流量同样受约束）
-/// 还是 IP_BOUND_IF。
+/// is_v6 为真时用 IPV6_BOUND_IF（AF_INET6，含关闭 v6only 的双栈 socket），
+/// 否则用 IP_BOUND_IF。双栈 socket 向 IPv4 地址 sendto 在 macOS 返回 EINVAL，
+/// 未设置 IPV6_BOUND_IF 时同样失败；IPv4 必须先写成 v4-mapped 再发（#63）。
 #[cfg(target_os = "macos")]
 fn bound_if<S: AsFd>(socket: &S, iface: &str, is_v6: bool) -> std::io::Result<()> {
     let name = std::ffi::CString::new(iface).map_err(|_| {
