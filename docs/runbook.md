@@ -15,6 +15,7 @@
         TCP 443 ──────┼──────── nginx stream（ssl_preread 按 SNI 分流）
         TCP 80  ──────┼──────── nginx http（ACME HTTP-01 + 跳转 https）
         UDP 3478 ─────┼──────── hz-relay（STUN，直接监听）
+        UDP 51820 ────┼──────── hzd（云主机自身作为 Node 时，WireGuard 直连，§6.2）
                       │
         coord.<域名> ─┤→ 127.0.0.1:8443  nginx https（终止 TLS）
                       │      ├─ /hz.v1.Coord/*  ─→ grpc(h2c) → 127.0.0.1:50051  hz-coord（gRPC 明文）
@@ -32,6 +33,7 @@
 | 443 | TCP | nginx stream | 三个子域名按 SNI 分流（FR-6/FR-9/ADR-0004） |
 | 80 | TCP | nginx http | ACME HTTP-01 验证、跳转 https |
 | 3478 | UDP | hz-relay | STUN 公网 Endpoint 发现（FR-8） |
+| 51820 | UDP | hzd | 云主机自身作为 Node 时的 WireGuard 直连；须用 `HZD_WG_PORT` 固定（§6.2） |
 | 9100 / 9101 | TCP | hz-coord / hz-relay | Prometheus /metrics，仅本机 |
 
 **gRPC 为什么可以这样代理（代码事实，非猜测）**：Node 侧 hzd 以
@@ -49,8 +51,8 @@ Relay 与 Kanidm 需要 TLS 透传，因为它们各自在进程内终止 TLS（
 1. **大陆云主机**一台（阿里云/腾讯云等，独立公网 IP，Ubuntu 22.04+/Debian 12）。
 2. **已备案域名**一个：大陆主机对外提供 80/443 服务必须使用已备案域名。
 3. **DNS 三条 A 记录**：`coord.<域名>`、`relay.<域名>`、`auth.<域名>` → 公网 IP。
-4. **安全组**放行：TCP 443、TCP 80、UDP 3478（其余端口一律不开；9100/9101 只绑
-   127.0.0.1，不入安全组）。
+4. **安全组**放行：TCP 443、TCP 80、UDP 3478；云主机自身作为 Node（§6.2）时再放行
+   UDP 51820（其余端口一律不开；9100/9101 只绑 127.0.0.1，不入安全组）。
 5. **分发目录 `dist/`**（不在 git 里，见 `.gitignore`）：布局
    `dist/<平台>/{hzd,hz}` 与 `dist/linux-x86_64/{hz-coord,hz-relay,hzd,hz}`。
    两个来源：
@@ -266,6 +268,34 @@ sudo hz up --auth-key <Auth Key>
 hz status
 ```
 
+**固定 WireGuard 端口并放行安全组。** hzd 的 UDP 端口缺省随机（`HZD_WG_PORT`
+未设置时由内核分配，每次重启都会变）。云主机的安全组只放行 §2.4 列出的端口，
+随机端口进不来：打洞信令照常往来（日志有 `punch ack received`），但其他 Node
+发往云主机的 WireGuard 握手全部超时（日志反复出现 `HANDSHAKE(REKEY_TIMEOUT)`），
+所有 Node 到云主机都只能走 Relayed Path。家宽 Linux 与 macOS Node 在 NAT 后面
+靠打洞直连，不需要这一步。
+
+```sh
+echo 'HZD_WG_PORT=51820' | sudo tee -a /etc/default/hzd
+sudo systemctl restart hzd
+ss -lnup | grep ':51820\b'          # 应见 hzd
+```
+
+然后在云厂商控制台的安全组里放行 **UDP 51820**（入方向，来源 0.0.0.0/0；如果
+本机还开了 ufw/firewalld，也要放行同一端口）。重跑 install.sh 升级时这一行会
+原样保留（§7.3）。
+
+验证：在任意一个其他 Node 上执行
+
+```sh
+hz status       # 云主机一行应为 Direct Path (IPv4)，Endpoint 是 <公网 IP>:51820
+hz netcheck     # 对端列表里云主机为 Direct Path，最近打洞：成功
+```
+
+仍是 Relayed Path 时，先在云主机上 `sudo tcpdump -ni any udp port 51820`，再从
+其他 Node `hz ping <云主机 Node Name>`：抓不到包说明安全组或本机防火墙仍在拦截；
+抓得到包但握手不成，查 hzd 日志。
+
 ### 6.3 其他 Linux Node（如家宽后的机器）
 
 ```sh
@@ -470,7 +500,7 @@ AC3 的三步（需要你自己的三台机器；Policy 以"dev 组可访问 db 
 | 打开登录链接后 Kanidm 登录页 404（如 `/ui/login/begin`），或换无痕窗口才能登录 | 证书仍是一张覆盖三个子域名的多 SAN 证书，浏览器把 auth 的请求合并进了 coord 的连接：按 §3「已部署环境的迁移」换成单域名证书并更新 nginx 配置，然后重启浏览器 |
 | `hz login` 打印的登录链接是 `http://127.0.0.1:…` | hz-coord 低于 v0.1.4，或 `/etc/default/hz-coord` 缺 `--public-url https://coord.<域名>`（v0.1.4 起登录链接按它拼接，缺省时取 `--oidc-redirect-uri` 的主机） |
 | 配置 Policy 后某台 Node 与所有 Node 都不通，`hz node list` 显示「归属 User：无（Tag 注册）」「Tags：无」 | 它是用 v0.1.4 之前签发的无 Tag Auth Key 注册的，Policy 覆盖不到；按 §6.5 处置 |
-| Node 注册成功但彼此不通 | `hz status` 看路径；Relayed Path 不通查 `journalctl -u hz-relay` 与 `/etc/default/hz-relay` 的 token 是否仍为 `@RELAY_TOKEN@`（重跑 §6.1）；直连不成立时确认安全组放行 UDP 3478（STUN） |
+| Node 注册成功但彼此不通 | `hz status` 看路径；Relayed Path 不通查 `journalctl -u hz-relay` 与 `/etc/default/hz-relay` 的 token 是否仍为 `@RELAY_TOKEN@`（重跑 §6.1）；直连不成立时确认安全组放行 UDP 3478（STUN）；只有到云主机这一个对端不直连时，按 §6.2 固定 `HZD_WG_PORT` 并放行 UDP 51820；先跑 `hz netcheck` 看 UDP 外发与上报的 Endpoint |
 | `*.hznet.internal` 解析失败 | 本机是否运行第三方 TUN 类工具（§8）；macOS 看 `/etc/resolver/hznet.internal`；`hzd` 停止时系统普通 DNS 应不受影响（FR-5 AC） |
 | STUN 发现的 Endpoint 是第三方工具的出口 | hzd 外层流量应绑物理网卡（FR-7）；确认没有把 hzd 的流量导入第三方 TUN 类网络工具的虚拟网卡 |
 | hzd 日志 `stun query failed server=198.18.x.x` 或连 coord/relay 失败 | 系统 DNS 被第三方工具接管：确认日志出现"改用引导 DNS"；引导 DNS 不可达时配置 `HZD_BOOTSTRAP_DNS`（§8） |
