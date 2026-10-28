@@ -1,8 +1,21 @@
 use hz_core::paths;
+use hz_core::version;
 use tracing_subscriber::EnvFilter;
 
+fn main() -> anyhow::Result<()> {
+    // 在 runtime 之前返回。再往下会初始化 tracing，并创建 state 目录、密钥和 socket。
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{}", version::cli_version_line());
+        return Ok(());
+    }
+    daemon()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn daemon() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("install-launchd") {
         let plist_path = args

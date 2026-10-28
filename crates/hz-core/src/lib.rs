@@ -20,4 +20,5 @@ pub mod relay_client;
 pub mod status;
 pub mod stun;
 pub mod tun;
+pub mod version;
 pub mod wire;

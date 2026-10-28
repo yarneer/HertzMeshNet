@@ -4,6 +4,7 @@ use hz_core::ipc::{self, Request, Response};
 use hz_core::netcheck::{self, NetcheckReport};
 use hz_core::paths;
 use hz_core::status::{NodeStatus, RegisteredInfo};
+use hz_core::version;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -169,6 +170,14 @@ enum PolicyCommand {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     restore_default_sigpipe();
+    // clap 默认印 `hz <semver>`。规格要求与 hzd 同一行，所以在 parse 之前处理。
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{}", version::cli_version_line());
+        return std::process::ExitCode::SUCCESS;
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Status { json } => status(json).await,
