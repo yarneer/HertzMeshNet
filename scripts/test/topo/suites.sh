@@ -1674,7 +1674,7 @@ assert_suite_handshaketimeout() {
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
 
-  note "人为阻断：在 $b 的 NAT 丢弃 WG 端口入方向（模拟云主机安全组未放行 UDP $HZ_WG_PORT）"
+  note "人为阻断：在 $b 的 NAT 丢弃 WG 端口入方向（模拟云主机安全组未放行 UDP ${HZ_WG_PORT}）"
   natnum=$(nat_num_of "$(reg_field "$b" 2)")
   ip netns exec "hz-nat$natnum" nft insert rule ip "hz-nat$natnum" filterin udp dport "$HZ_WG_PORT" drop
   pass "已在 hz-nat$natnum 的 forward 链首插入 udp dport $HZ_WG_PORT drop（仅入方向）"
@@ -1715,7 +1715,7 @@ except Exception:
     | awk -v port="$HZ_WG_PORT" '$0 ~ "udp dport "port" drop" {for (i = 1; i <= NF; i++) if ($i == "handle") print $(i+1)}' | head -1)
   if [[ -n $handle ]]; then
     ip netns exec "hz-nat$natnum" nft delete rule ip "hz-nat$natnum" filterin handle "$handle"
-    pass "已删除 hz-nat$natnum filterin 的 drop 规则（handle $handle）"
+    pass "已删除 hz-nat$natnum filterin 的 drop 规则（handle ${handle}）"
   else
     fail "找不到 drop 规则的 handle，无法撤销"
     return 1
@@ -1768,7 +1768,7 @@ assert_suite_portmapdirect() {
   a_lan=$(reg_field "$a" 4)
   stub_log="$ART_DIR/natpmp-stub.log"
 
-  note "前置：在 $table（对称 NAT，外网 $wan_ip）里跑 NAT-PMP 应答器 + 端口钉扎"
+  note "前置：在 ${table}（对称 NAT，外网 ${wan_ip}）里跑 NAT-PMP 应答器 + 端口钉扎"
   ip netns exec "$table" setsid python3 - "$wan_ip" "$a_lan" "$HZ_WG_PORT" "$table" > "$stub_log" 2>&1 <<'PY' &
 import socket
 import subprocess
@@ -1825,7 +1825,7 @@ while True:
         print("NAT-PMP map %d -> %s:%d (pinned)" % (internal, wan_ip, ext), flush=True)
     # 其余报文（PCP 等）不答：hzd 2 秒超时后落到 NAT-PMP。
 PY
-  pass "NAT-PMP 应答器已在 $table:5351 启动（外网 $wan_ip，映射目标 $a_lan:$HZ_WG_PORT）"
+  pass "NAT-PMP 应答器已在 $table:5351 启动（外网 ${wan_ip}，映射目标 $a_lan:${HZ_WG_PORT}）"
 
   start_pair_with_relay "$a" "$b" || return 1
   wait_pair_mutual_view "$a" "$b" || return 1
@@ -1835,7 +1835,7 @@ PY
   if grep -q "NAT-PMP map" "$stub_log" 2>/dev/null; then
     pass "应答器记录到映射申请：$(grep 'NAT-PMP map' "$stub_log" | tail -1)"
   else
-    fail "应答器未记录映射申请（见 $stub_log）"
+    fail "应答器未记录映射申请（见 ${stub_log}）"
   fi
 
   note "断言 2：对称 × 端口受限组合靠 PortMap 候选建立 Direct Path"
