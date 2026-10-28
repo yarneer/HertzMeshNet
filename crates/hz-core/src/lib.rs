@@ -6,6 +6,7 @@ pub mod endpoint;
 pub mod ipc;
 pub mod keys;
 pub mod map;
+pub mod netcheck;
 pub mod netif;
 pub mod netwatch;
 #[cfg(target_os = "macos")]

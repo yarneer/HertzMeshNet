@@ -204,7 +204,8 @@ sudo rm -rf "/Library/Application Support/hzd" /Library/Logs/hzd.log /etc/resolv
   恢复后 `hz status` 应正常输出。若 `bootstrap` 报 `Bootstrap failed: 5: Input/output error`，说明旧进程还没退出完，等几秒再执行一次。
 - **安装脚本报「未获知服务器地址」**：脚本是从 GitHub 下载的原件，按第 2 节带上 `HZNET_COORD_URL` 与 `HZNET_COORD_ADDR` 再运行。
 - **注册时报「Auth Key 已使用」或「Auth Key 已过期」**：一次性 Key 只能用一次，过期 Key 向签发人重新要一把。
-- **`hz` 命令提示「需要管理员权限，请用 sudo 执行」**：`hz status`、`hz ping` 是只读查询，普通用户即可执行；`hz up`、`hz login`、Policy、Auth Key 与 Node 管理会以本 Node 的身份改动状态，需要 `sudo`。
+- **`hz` 命令提示「需要管理员权限，请用 sudo 执行」**：`hz status`、`hz ping`、`hz netcheck` 是只读查询，普通用户即可执行；`hz up`、`hz login`、Policy、Auth Key 与 Node 管理会以本 Node 的身份改动状态，需要 `sudo`。
+- **只能走中转（一直是 Relayed Path）**：先运行 `hz netcheck`（只读，不需要 root）。它会一次给出物理出口和默认路由持有者、IPv4/IPv6 UDP 外发是否失败及底层错误（例如 `IPv4 UDP 外发失败：EINVAL`）、STUN 映射与 NAT 类型、上报给 Coordination Server 的 Endpoint（`198.18.0.0/15`、回环、虚拟网卡地址会标出）、是否有可用 IPv6、到 Relay 的 RTT，以及每个对端的路径和最近一次打洞结果。加 `--json` 给脚本用。
 - **`hz status` 提示「流量被其他隧道接管」或「名字解析被接管」**：本机有其他网络工具在接管路由或 DNS，见第 10 节。
 - **macOS 上注册成功但 ping 不通**：`hzd` 需要 root 创建 utun；确认它是经 launchd 以 root 运行的（`sudo launchctl print system/com.hznet.hzd`）。
 - **改了地址段要重装吗**：地址段是服务器侧的部署决定（runbook §9）。Node 无需配置，注册响应会携带生效段。

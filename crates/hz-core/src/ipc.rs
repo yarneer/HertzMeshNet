@@ -101,7 +101,7 @@ impl Drop for SocketGuard {
 
 /// 任何本机用户都可发起的只读请求（#26）。其余请求以本 Node 的身份改动
 /// 状态或读取 Policy、Node 列表等管理信息，只允许 root 或与 hzd 同一用户。
-const READ_ONLY_METHODS: &[&str] = &["status", "ping"];
+const READ_ONLY_METHODS: &[&str] = &["status", "ping", "netcheck"];
 
 /// 按调用方 uid 判定能否执行 `method`：只读请求放行；其余要求调用方是
 /// root 或与 hzd 同一用户（hzd 以普通用户运行的开发与测试场景）。

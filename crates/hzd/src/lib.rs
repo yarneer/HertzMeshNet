@@ -21,6 +21,7 @@ use hz_core::endpoint::{self, DiscoveredEndpoint};
 use hz_core::ipc::{self, Handler};
 use hz_core::keys::{KeyStore, NodeStaticSecret};
 use hz_core::map::{MapNode, NetworkMapCache};
+use hz_core::netcheck::{self, EndpointNote, NetcheckReport, StunReport, UdpProbe, UdpReport};
 use hz_core::netwatch::{self, NetEvent};
 use hz_core::path::{PathEvent, PathManager, PeerEndpoints};
 use hz_core::policy::{InboundGate, InboundPolicyView};
@@ -202,6 +203,8 @@ struct Daemon {
     policy_gate: Arc<InboundGate>,
     /// 路径管理的累计打洞计数（FR-12 打洞成功率的上报源）。
     punch: Arc<StdMutex<PunchCounters>>,
+    /// 每个对端最近一次打洞结果（`hz netcheck` 用）。
+    punch_last: Arc<StdMutex<HashMap<String, String>>>,
     /// 等待中的 ping 探针（应答到达时唤醒）。
     probes: Arc<ping::Probes>,
     /// 本 Node 已被 Admin 吊销（区别于过期：重新登录救不回来）。
@@ -286,6 +289,7 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         use_relay: Arc::new(StdMutex::new(HashMap::new())),
         policy_gate: Arc::new(InboundGate::new()),
         punch: Arc::new(StdMutex::new(PunchCounters::default())),
+        punch_last: Arc::new(StdMutex::new(HashMap::new())),
         probes: Arc::new(ping::Probes::default()),
         revoked: StdMutex::new(false),
         egress_epoch: EgressEpoch::new(),
@@ -370,6 +374,10 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "缺少 node 参数（Node Name 或 node id）".to_string())?;
             ping_peer(&daemon, target).await
+        }
+        "netcheck" => {
+            let report = collect_netcheck(&daemon).await;
+            serde_json::to_value(&report).map_err(|error| error.to_string())
         }
         "up" => {
             let registered = daemon
@@ -1006,6 +1014,7 @@ async fn start_dataplane(
         daemon.own_endpoints.clone(),
         daemon.use_relay.clone(),
         daemon.punch.clone(),
+        daemon.punch_last.clone(),
         engine.clone(),
         keys.clone(),
         &info.node_id,
@@ -1193,39 +1202,283 @@ fn spawn_relay_supervisor(
     });
 }
 
-/// STUN 服务器的 `host:port`：显式 HZD_STUN_ADDR 优先，否则从 HZD_RELAY_ADDR
-/// 的主机推导（FR-8：STUN 与 Relay 同主机，UDP 3478）。地址可以是主机名或 IP，
-/// 每轮查询前经 [`resolve_stun`] 解析。
-fn stun_server_target() -> Option<String> {
-    let raw = std::env::var("HZD_STUN_ADDR").ok().or_else(|| {
-        let relay = std::env::var("HZD_RELAY_ADDR").ok()?;
-        let host_port = relay
-            .rsplit_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or(&relay);
-        let host = host_port
-            .rsplit_once(':')
-            .map(|(host, _)| host)
-            .unwrap_or(host_port);
-        Some(format!("{host}:3478"))
-    })?;
-    Some(raw)
+/// STUN 服务器列表。`HZD_STUN_ADDR` 显式设置时按逗号拆开（可多个，供
+/// netcheck 比较映射端口）；未设置时从 `HZD_RELAY_ADDR` 的主机推导
+/// UDP 3478（FR-8：STUN 与 Relay 同主机）。周期收集只用第一个。
+fn stun_server_targets() -> Vec<String> {
+    match std::env::var("HZD_STUN_ADDR") {
+        Ok(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(_) => relay_stun_target().into_iter().collect(),
+    }
 }
 
-/// 每轮解析 STUN 地址：经外层解析器（系统 DNS 返回假地址时改问引导 DNS，
-/// 失败沿用缓存，#23），在阻塞线程池里做，不占用异步 worker。
-async fn resolve_stun(target: &str) -> Option<SocketAddr> {
+fn stun_server_target() -> Option<String> {
+    stun_server_targets().into_iter().next()
+}
+
+fn relay_stun_target() -> Option<String> {
+    let relay = std::env::var("HZD_RELAY_ADDR").ok()?;
+    let host_port = relay
+        .rsplit_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&relay);
+    let host = host_port
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(host_port);
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!("{host}:3478"))
+    }
+}
+
+/// 解析一个 STUN 目标的全部地址（A 与 AAAA）。经外层解析器（系统 DNS
+/// 返回假地址时改问引导 DNS，#23），在阻塞线程池里做。
+async fn resolve_stun_all(target: &str) -> Vec<SocketAddr> {
     let owned = target.to_string();
     match tokio::task::spawn_blocking(move || hz_core::outer_dns::resolve_host_port(&owned)).await {
-        Ok(Ok(addrs)) => addrs.into_iter().next(),
+        Ok(Ok(addrs)) => addrs,
         Ok(Err(error)) => {
             tracing::warn!(%target, %error, "STUN 服务器地址解析失败");
-            None
+            Vec::new()
         }
         Err(error) => {
             tracing::warn!(%target, %error, "STUN 地址解析任务异常");
-            None
+            Vec::new()
         }
+    }
+}
+
+/// 每轮解析 STUN 地址：取 [`resolve_stun_all`] 的第一个。
+async fn resolve_stun(target: &str) -> Option<SocketAddr> {
+    resolve_stun_all(target).await.into_iter().next()
+}
+
+async fn all_stun_addrs() -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for target in stun_server_targets() {
+        for addr in resolve_stun_all(&target).await {
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
+}
+
+fn offline_udp() -> UdpProbe {
+    UdpProbe {
+        ok: false,
+        stage: Some("query".to_string()),
+        error: Some("数据面未启动".to_string()),
+        mapped: None,
+    }
+}
+
+struct FamilyProbe {
+    head: UdpProbe,
+    mapped: Vec<SocketAddr>,
+    rtt_ms: Option<f64>,
+}
+
+async fn probe_family(engine: &SocketEngine, targets: &[SocketAddr]) -> FamilyProbe {
+    if targets.is_empty() {
+        return FamilyProbe {
+            head: UdpProbe {
+                ok: false,
+                stage: Some("query".to_string()),
+                error: Some("无该族 STUN 目标".to_string()),
+                mapped: None,
+            },
+            mapped: Vec::new(),
+            rtt_ms: None,
+        };
+    }
+    let mut head = None;
+    let mut mapped = Vec::new();
+    let mut rtt_ms = None;
+    for server in targets {
+        let started = std::time::Instant::now();
+        match engine.stun_query(*server).await {
+            Ok(addr) => {
+                if head.is_none() {
+                    head = Some(UdpProbe {
+                        ok: true,
+                        stage: None,
+                        error: None,
+                        mapped: Some(addr.to_string()),
+                    });
+                    rtt_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                mapped.push(addr);
+            }
+            Err(error) => {
+                if head.is_none() {
+                    let (stage, token) = netcheck::classify_udp_error(&error);
+                    let send_failed = stage == "send";
+                    head = Some(UdpProbe {
+                        ok: false,
+                        stage: Some(stage.to_string()),
+                        error: Some(token),
+                        mapped: None,
+                    });
+                    // 同一 socket 上这一族的发送都会以同样的 errno 失败。
+                    if send_failed {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    FamilyProbe {
+        head: head.expect("targets non-empty"),
+        mapped,
+        rtt_ms,
+    }
+}
+
+async fn probe_stun(
+    engine: &SocketEngine,
+    targets: &[SocketAddr],
+) -> (UdpReport, StunReport, Option<f64>) {
+    let v4: Vec<SocketAddr> = targets
+        .iter()
+        .copied()
+        .filter(|addr| addr.is_ipv4())
+        .collect();
+    let v6: Vec<SocketAddr> = targets
+        .iter()
+        .copied()
+        .filter(|addr| addr.is_ipv6())
+        .collect();
+    let ipv4 = probe_family(engine, &v4).await;
+    let ipv6 = probe_family(engine, &v6).await;
+    let ports: Vec<u16> = ipv4.mapped.iter().map(|addr| addr.port()).collect();
+    let mut mapped = Vec::new();
+    mapped.extend(ipv4.mapped.iter().map(|addr| addr.to_string()));
+    mapped.extend(ipv6.mapped.iter().map(|addr| addr.to_string()));
+    let stun = StunReport {
+        targets: targets.len(),
+        mapped,
+        nat: netcheck::nat_verdict(v4.len(), &ports).to_string(),
+    };
+    (
+        UdpReport {
+            ipv4: ipv4.head,
+            ipv6: ipv6.head,
+        },
+        stun,
+        ipv4.rtt_ms.or(ipv6.rtt_ms),
+    )
+}
+
+fn noted_endpoints(found: &[DiscoveredEndpoint]) -> Vec<EndpointNote> {
+    found
+        .iter()
+        .map(|endpoint| {
+            let on_virtual = hz_core::netif::interface_with_addr(endpoint.addr.ip())
+                .is_some_and(|name| hz_core::netif::is_virtual_iface(&name));
+            EndpointNote {
+                addr: endpoint.addr.to_string(),
+                kind: endpoint.kind.as_str().to_string(),
+                suspicious: netcheck::suspicions(endpoint.addr.ip(), on_virtual)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn peer_notes(daemon: &Daemon) -> Vec<hz_core::netcheck::PeerNote> {
+    if daemon.is_expired() {
+        return Vec::new();
+    }
+    let own = daemon.registration_info().map(|info| info.node_id);
+    let reports: HashMap<String, PeerReport> = daemon
+        .engine
+        .lock()
+        .expect("engine poisoned")
+        .as_ref()
+        .map(|engine| {
+            engine
+                .peer_reports()
+                .into_iter()
+                .map(|report| (report.node_id.clone(), report))
+                .collect()
+        })
+        .unwrap_or_default();
+    let punch = daemon
+        .punch_last
+        .lock()
+        .expect("punch last poisoned")
+        .clone();
+    daemon
+        .map_cache
+        .snapshot()
+        .into_iter()
+        .filter(|node| own.as_deref() != Some(node.node_id.as_str()))
+        .map(|node| hz_core::netcheck::PeerNote {
+            path: reports.get(&node.node_id).map(|report| {
+                if report.use_relay {
+                    "relay".to_string()
+                } else {
+                    "direct".to_string()
+                }
+            }),
+            punch: punch.get(&node.node_id).cloned(),
+            name: node.name,
+            node_id: node.node_id,
+        })
+        .collect()
+}
+
+async fn collect_netcheck(daemon: &Daemon) -> NetcheckReport {
+    let egress = hz_core::netif::route_picture();
+    let ipv6_usable = hz_core::endpoint::has_usable_ipv6();
+    let endpoints = {
+        let found = daemon
+            .own_endpoints
+            .lock()
+            .expect("own endpoints poisoned")
+            .clone();
+        noted_endpoints(&found)
+    };
+    let peers = peer_notes(daemon);
+    let engine = daemon.engine.lock().expect("engine poisoned").clone();
+    let targets = all_stun_addrs().await;
+    let (udp, stun, relay_rtt_ms) = match &engine {
+        Some(engine) => probe_stun(engine, &targets).await,
+        None => {
+            let v4 = targets.iter().filter(|addr| addr.is_ipv4()).count();
+            (
+                UdpReport {
+                    ipv4: offline_udp(),
+                    ipv6: offline_udp(),
+                },
+                StunReport {
+                    targets: targets.len(),
+                    mapped: Vec::new(),
+                    nat: netcheck::nat_verdict(v4, &[]).to_string(),
+                },
+                None,
+            )
+        }
+    };
+    NetcheckReport {
+        egress,
+        udp,
+        stun,
+        endpoints,
+        ipv6_usable,
+        relay_rtt_ms,
+        peers,
     }
 }
 
@@ -1379,6 +1632,7 @@ fn spawn_path_task(
     own_slot: Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
     use_relay_slot: Arc<StdMutex<HashMap<String, bool>>>,
     punch_slot: Arc<StdMutex<PunchCounters>>,
+    punch_last: Arc<StdMutex<HashMap<String, String>>>,
     engine: Arc<SocketEngine>,
     keys: Arc<KeyStore>,
     own_node_id: &str,
@@ -1420,6 +1674,7 @@ fn spawn_path_task(
                     &own_slot,
                     &use_relay_slot,
                     &punch_slot,
+                    &punch_last,
                     &keys,
                     &peers,
                     event,
@@ -1470,11 +1725,13 @@ fn peer_endpoint_view(cache: &NetworkMapCache, own_node_id: &str) -> Vec<PeerVie
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_path_event(
     engine: &Arc<SocketEngine>,
     own_slot: &Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
     use_relay_slot: &Arc<StdMutex<HashMap<String, bool>>>,
     punch_slot: &Arc<StdMutex<PunchCounters>>,
+    punch_last: &Arc<StdMutex<HashMap<String, String>>>,
     keys: &Arc<KeyStore>,
     peers: &[PeerView],
     event: PathEvent,
@@ -1482,6 +1739,11 @@ async fn apply_path_event(
     let forced = force_relay();
     match event {
         PathEvent::SetUseRelay { node_id, use_relay } => {
+            note_punch(
+                punch_last,
+                &node_id,
+                if use_relay { "fallback" } else { "success" },
+            );
             if !use_relay {
                 // 打洞成功一次（Relayed → Direct 的升级，FR-12 成功率分子）。
                 punch_slot
@@ -1521,12 +1783,14 @@ async fn apply_path_event(
         }
         PathEvent::SendOffer { node_id } => {
             if forced {
+                note_punch(punch_last, &node_id, "skipped");
                 return;
             }
             // 一轮打洞（Offer + 握手并发，FR-12 成功率分母）。
             punch_slot.lock().expect("punch counters poisoned").attempts += 1;
             let Some(relay) = engine.relay_client() else {
                 tracing::debug!(%node_id, "punch offer skipped: no relay transport");
+                note_punch(punch_last, &node_id, "skipped");
                 return;
             };
             let Some(peer) = peers.iter().find(|peer| peer.endpoints.node_id == node_id) else {
@@ -1548,6 +1812,7 @@ async fn apply_path_event(
                 candidates,
             };
             relay.send_datagram(&node_id, codec.seal(&offer)).await;
+            note_punch(punch_last, &node_id, "attempted");
         }
         PathEvent::SendAck { node_id, chosen } => {
             if forced {
@@ -1564,6 +1829,12 @@ async fn apply_path_event(
             relay.send_datagram(&node_id, codec.seal(&ack)).await;
         }
     }
+}
+
+fn note_punch(slot: &StdMutex<HashMap<String, String>>, node_id: &str, result: &str) {
+    slot.lock()
+        .expect("punch last poisoned")
+        .insert(node_id.to_string(), result.to_string());
 }
 
 /// 处理一条入站打洞信令：对每个在册对端试解密（帧不带明文发送方，AEAD
@@ -2192,5 +2463,56 @@ mod endpoint_strings_tests {
             endpoint_strings(&slot(&["10.1.1.1:51820"]), &boot),
             vec!["10.1.1.1:51820".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod netcheck_probe_tests {
+    use std::sync::Arc;
+
+    use hz_core::keys::NodeStaticSecret;
+    use hz_core::stun;
+    use hz_core::wire::SocketEngine;
+    use rand_core::OsRng;
+
+    use super::probe_stun;
+
+    /// hzd 侧查询：共享 socket 上的 STUN 探测把 IPv4 成功与映射地址写进报告，
+    /// 两个目标端口一致时 NAT 判为端点无关，没有 IPv6 目标时不猜测。
+    #[tokio::test]
+    async fn two_loopback_stun_targets_report_ipv4_udp_and_same_mapped_port() {
+        let engine = Arc::new(
+            SocketEngine::bind_with(NodeStaticSecret::random_from_rng(OsRng), 0, false)
+                .await
+                .unwrap(),
+        );
+        let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(8);
+        let runner = engine.clone();
+        let pump = tokio::spawn(async move {
+            let _ = runner.run(tunnel_tx).await;
+        });
+
+        let mut tasks = Vec::new();
+        let mut targets = Vec::new();
+        for _ in 0..2 {
+            let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            targets.push(sock.local_addr().unwrap());
+            tasks.push(tokio::spawn(stun::serve(sock)));
+        }
+
+        let (udp, stun_report, rtt) = probe_stun(&engine, &targets).await;
+        pump.abort();
+        for task in tasks {
+            task.abort();
+        }
+
+        assert!(udp.ipv4.ok, "IPv4 STUN 应成功：{:?}", udp.ipv4);
+        let mapped: std::net::SocketAddr = udp.ipv4.mapped.as_deref().unwrap().parse().unwrap();
+        assert_eq!(mapped.port(), engine.local_addr().port());
+        assert!(!udp.ipv6.ok);
+        assert_eq!(udp.ipv6.error.as_deref(), Some("无该族 STUN 目标"));
+        assert_eq!(stun_report.targets, 2);
+        assert_eq!(stun_report.nat, "端点无关");
+        assert!(rtt.is_some());
     }
 }

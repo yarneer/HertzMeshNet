@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use hz_core::coord_client::DEFAULT_COORD_ADDR;
 use hz_core::ipc::{self, Request, Response};
+use hz_core::netcheck::{self, NetcheckReport};
 use hz_core::paths;
 use hz_core::status::{NodeStatus, RegisteredInfo};
 use std::net::IpAddr;
@@ -63,6 +64,12 @@ enum Command {
     Ping {
         /// 对端 Node Name 或 node id
         node: String,
+    },
+    /// 诊断直连能力（只读，向运行中的 hzd 查询）
+    Netcheck {
+        /// 输出 JSON（脚本用）
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -176,6 +183,7 @@ async fn main() -> std::process::ExitCode {
         Command::Invite { command } => invite(command).await,
         Command::Node { command } => node(command).await,
         Command::Ping { node } => ping(node).await,
+        Command::Netcheck { json } => netcheck(json).await,
     }
 }
 
@@ -854,6 +862,41 @@ async fn ping(node: String) -> std::process::ExitCode {
     };
     println!("{name} 往返 {rtt_ms:.1} ms，路径 {path_label}");
     std::process::ExitCode::SUCCESS
+}
+
+/// `hz netcheck`（#65）：向 hzd 要一份只读诊断，人类可读或 `--json`。
+async fn netcheck(json_output: bool) -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = Request::new(1, "netcheck", serde_json::json!({}));
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = match response {
+        Response::Ok { result, .. } => result,
+        Response::Error { error, .. } => {
+            eprintln!("hzd 返回错误：{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        return std::process::ExitCode::SUCCESS;
+    }
+    match serde_json::from_value::<NetcheckReport>(result) {
+        Ok(report) => {
+            println!("{}", netcheck::format_report(&report));
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("无法解析 hzd 应答：{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 /// 发往 HzNet 的流量没有走 HzNet 网卡（#25）。
