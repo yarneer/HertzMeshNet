@@ -74,6 +74,10 @@ _Avoid_: Address（与 Node Address 混淆）, Candidate
 两个 Node 之间流量的实际走向：经由某个 Endpoint 直达，或经由 Relay 中转。
 _Avoid_: P2P 连接, 中继模式
 
+**Health Report**:
+Node 周期上报给 Coordination Server 的直连能力与路径状态摘要：UDP 外发是否可用、是否拿到公网映射、上报的 Endpoint 是否可疑，以及哪些对端正走 Relayed Path、原因是什么。只描述"能不能直连、为什么不能"，不含业务流量内容。
+_Avoid_: Telemetry, Heartbeat, 心跳, 遥测
+
 ### 访问控制
 
 **Policy**:
