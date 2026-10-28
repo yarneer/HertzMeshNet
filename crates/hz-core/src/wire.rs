@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use tokio::net::UdpSocket;
@@ -1200,51 +1200,11 @@ async fn send_to_relay(relay: &StdMutex<Option<Arc<RelayClient>>>, sends: Vec<Re
     }
 }
 
-/// 本机朝 Coordination Server 方向的源 IP + WireGuard 端口，作为上报的 LAN Endpoint。
-/// 用临时 UDP socket connect 目标地址，让内核替我们选出路由源地址。
-pub async fn lan_endpoint(coord_addr: &str, wg_port: u16) -> anyhow::Result<SocketAddr> {
-    let target = coord_probe_target(coord_addr)?;
-    let probe = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .context("bind probe socket failed")?;
-    probe
-        .connect(target)
-        .await
-        .with_context(|| format!("connect probe socket to {target} failed"))?;
-    let local = probe
-        .local_addr()
-        .context("query probe local addr failed")?;
-    if local.ip().is_unspecified() {
-        bail!("无法确定朝向 {target} 的本机地址");
-    }
-    Ok(SocketAddr::new(local.ip(), wg_port))
-}
-
-/// 解析 Coordination Server 地址（允许带 scheme 与主机名）到探测用 SocketAddr。
-/// DNS 解析只在启动时做一次，阻塞可接受。
-fn coord_probe_target(coord_addr: &str) -> anyhow::Result<SocketAddr> {
-    let (scheme, host_port) = match coord_addr.split_once("://") {
-        Some((scheme, rest)) => (scheme, rest),
-        None => ("", coord_addr),
-    };
-    let has_port = host_port
-        .rsplit_once(':')
-        .is_some_and(|(_, tail)| tail.parse::<u16>().is_ok());
-    // to_socket_addrs 只接受 host:port；省略端口的公网地址（如
-    // https://coord.example.com）按 scheme 补默认端口，与 tonic URI 的
-    // 缺省端口规则一致（http 80 / 其余 443）。
-    let target = if has_port {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:{}", if scheme == "http" { 80 } else { 443 })
-    };
-    crate::outer_dns::resolve_host_port(&target)
-        .with_context(|| format!("无法解析 Coordination Server 地址：{coord_addr}"))?
-        .into_iter()
-        .next()
-        .context(format!(
-            "Coordination Server 地址未解析出任何结果：{coord_addr}"
-        ))
+/// 物理出口网卡上的 IPv4 + WireGuard 端口，作为上报的 LAN Endpoint。
+/// 与 Endpoint 收集共用同一套网卡枚举，且只取物理出口网卡上的地址；
+/// `198.18.0.0/15` 与虚拟网卡地址不采用。没有可用地址时返回 None。
+pub fn lan_endpoint(wg_port: u16) -> Option<SocketAddr> {
+    crate::endpoint::reported_lan_ip().map(|ip| SocketAddr::new(ip, wg_port))
 }
 
 #[cfg(test)]
@@ -1252,25 +1212,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coord_probe_target_strips_scheme_and_accepts_hostnames() {
-        assert_eq!(
-            coord_probe_target("http://127.0.0.1:443").unwrap(),
-            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
+    fn lan_endpoint_if_any_is_not_fake_or_virtual() {
+        let Some(addr) = lan_endpoint(51820) else {
+            return;
+        };
+        assert_eq!(addr.port(), 51820);
+        assert!(
+            !crate::outer_dns::is_fake_ip(&addr.ip()),
+            "LAN Endpoint 落在 198.18.0.0/15：{addr}"
         );
-        assert_eq!(
-            coord_probe_target("127.0.0.1:443").unwrap(),
-            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
-        );
-        // 省略端口的公网形态：按 scheme 补默认端口（runbook 的 HZD_COORD_ADDR 即此形态）
-        assert_eq!(
-            coord_probe_target("https://127.0.0.1").unwrap(),
-            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(
-            coord_probe_target("http://127.0.0.1").unwrap(),
-            "127.0.0.1:80".parse::<SocketAddr>().unwrap()
-        );
-        assert!(coord_probe_target("no-port-here").is_err());
+        if let Some(iface) = crate::netif::interface_with_addr(addr.ip()) {
+            assert!(
+                !crate::netif::is_virtual_iface(&iface),
+                "LAN Endpoint 在虚拟网卡 {iface} 上：{addr}"
+            );
+        }
     }
 
     #[test]

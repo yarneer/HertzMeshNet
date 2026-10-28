@@ -950,8 +950,8 @@ async fn start_dataplane(
         tracing::warn!("egress binding disabled by HZD_BIND_EGRESS=0");
     }
     let engine = Arc::new(SocketEngine::bind_with(keys.node(), port, bind_to_egress).await?);
-    let endpoint = lan_endpoint(coord_addr, engine.local_addr().port()).await?;
-    tracing::info!(%endpoint, "reporting lan endpoint");
+    let boot_endpoint = Arc::new(StdMutex::new(None));
+    publish_lan_endpoint(engine.local_addr().port(), &boot_endpoint);
 
     if let Ok(relay_addr) = std::env::var("HZD_RELAY_ADDR") {
         if !relay_addr.is_empty() {
@@ -977,7 +977,7 @@ async fn start_dataplane(
         daemon.clone(),
         engine.clone(),
         info.node_id.clone(),
-        endpoint.to_string(),
+        boot_endpoint.clone(),
         coord_addr.to_string(),
         daemon.policy_gate.clone(),
     );
@@ -997,7 +997,9 @@ async fn start_dataplane(
         engine.clone(),
         coord_addr.to_string(),
     );
-    spawn_net_recovery(daemon, engine.clone(), coord_addr);
+    #[cfg(target_os = "macos")]
+    let boot_for_watch = boot_endpoint.clone();
+    spawn_net_recovery(daemon, engine.clone(), coord_addr, boot_endpoint);
     spawn_path_task(
         daemon.map_cache.clone(),
         daemon.map_signal.clone(),
@@ -1009,7 +1011,7 @@ async fn start_dataplane(
         &info.node_id,
     );
     #[cfg(target_os = "macos")]
-    spawn_egress_watch();
+    spawn_egress_watch(daemon, engine.clone(), coord_addr, boot_for_watch);
     *daemon.engine.lock().expect("engine poisoned") = Some(engine);
     Ok(())
 }
@@ -1082,20 +1084,48 @@ mod effective_v4_cidr_tests {
     }
 }
 
-/// macOS 出口监视的守护进程侧消费：保住监视任务的生命周期并留痕。
-/// 已有长连 socket 的重绑随 #9 的跨平台监视合流。
+/// 重算 LAN Endpoint 并记日志。没有可用地址时清空槽位，避免继续上报旧值。
+fn publish_lan_endpoint(port: u16, slot: &StdMutex<Option<SocketAddr>>) {
+    let endpoint = lan_endpoint(port);
+    *slot.lock().expect("lan endpoint poisoned") = endpoint;
+    match endpoint {
+        Some(endpoint) => tracing::info!(%endpoint, "reporting lan endpoint"),
+        None => tracing::info!("no usable lan endpoint on physical egress; not reporting one"),
+    }
+}
+
+/// macOS 出口监视：物理出口变化后重算 LAN Endpoint 并重新上报。
+/// 已有长连 socket 的重绑仍随跨平台监视合流（#16）。
 #[cfg(target_os = "macos")]
-fn spawn_egress_watch() {
+fn spawn_egress_watch(
+    daemon: &Arc<Daemon>,
+    engine: Arc<SocketEngine>,
+    coord_addr: &str,
+    boot: Arc<StdMutex<Option<SocketAddr>>>,
+) {
+    let state_dir = daemon.state_dir.clone();
+    let own_slot = daemon.own_endpoints.clone();
+    let punch = daemon.punch.clone();
+    let coord_addr = coord_addr.to_string();
+    let stun_target = stun_server_target();
     tokio::spawn(async move {
         let mut events = hz_core::netwatch_mac::spawn_watcher();
         while let Some(event) = events.recv().await {
-            tracing::info!(
-                ?event,
-                "egress changed; sockets created from now on bind the new egress"
-            );
+            tracing::info!(?event, "egress changed; recomputing lan endpoint");
+            publish_lan_endpoint(engine.local_addr().port(), &boot);
+            collect_and_report(
+                &state_dir,
+                &own_slot,
+                &punch,
+                &engine,
+                &coord_addr,
+                stun_target.as_deref(),
+            )
+            .await;
         }
     });
 }
+
 /// Relay 传输监督（#7 单连 → #8 断线重连 → #9 出口变化强拔）：连上后挂到
 /// 引擎；流断开按退避重连；物理出口变化（egress_epoch）不等 TCP 死亡立刻
 /// 重拨。CA 路径（HZD_RELAY_CA_PATH）指向私有 CA 的 PEM。
@@ -1274,7 +1304,12 @@ async fn collect_and_report(
 /// 映射）→ 递增出口代数（Map 订阅与 Relay 长连接立刻重拨）→ 唤醒路径任务
 /// 重启打洞。全部动作幂等，事件风暴下重复执行也收敛到同一终态。
 /// 非 Linux 上 netwatch 无事件（#16），本任务随即退出。
-fn spawn_net_recovery(daemon: &Arc<Daemon>, engine: Arc<SocketEngine>, coord_addr: &str) {
+fn spawn_net_recovery(
+    daemon: &Arc<Daemon>,
+    engine: Arc<SocketEngine>,
+    coord_addr: &str,
+    boot: Arc<StdMutex<Option<SocketAddr>>>,
+) {
     let state_dir = daemon.state_dir.clone();
     let own_slot = daemon.own_endpoints.clone();
     let punch = daemon.punch.clone();
@@ -1301,6 +1336,7 @@ fn spawn_net_recovery(daemon: &Arc<Daemon>, engine: Arc<SocketEngine>, coord_add
                 }
             }
             engine.reset_direct_rx();
+            publish_lan_endpoint(engine.local_addr().port(), &boot);
             // 换网瞬间路由可能尚未收敛：STUN 限次重试，给出口几秒钟。
             for round in 0..3 {
                 collect_and_report(
@@ -1778,10 +1814,10 @@ fn spawn_tunnel_drain(
 async fn note_revocation(
     daemon: &Arc<Daemon>,
     state_dir: &std::path::Path,
-    endpoint: &str,
+    endpoints: Vec<String>,
     coord_addr: &str,
 ) {
-    match open_network_map_stream(state_dir, vec![endpoint.to_string()], coord_addr).await {
+    match open_network_map_stream(state_dir, endpoints, coord_addr).await {
         Err(error) if error.to_string().contains("已吊销") => {
             tracing::warn!(%error, "node revoked by admin");
             *daemon.revoked.lock().expect("revoked poisoned") = true;
@@ -1793,8 +1829,8 @@ async fn note_revocation(
 /// Network Map 消费任务（FR-6）：启动即用本地缓存配置数据面（Coordination
 /// Server 不可达也照常），然后循环 订阅 → 消费差量/全量 → 断线退避重连。
 /// 每次重连都重新走挑战认证并重报 Endpoint（服务端在流打开时落库）；Endpoint
-/// 取共享槽里的最新收集结果（出口变化后重拨不会把启动时的旧地址写回去），
-/// 槽为空才退回启动时探测的 LAN Endpoint。
+/// 取共享槽里的最新收集结果（出口变化后重拨不会把旧地址写回去），
+/// 槽为空才退回最近一次算出的 LAN Endpoint（没有可用地址则不上报）。
 /// Map 有实际变化时唤醒路径任务（打洞轮次紧跟对端 Endpoint 更新）。
 /// 到期反应（FR-3）：自己出现在 removed 差量、或订阅被服务端以「已过期」
 /// 拒绝时，转入 Expired 并拆掉对端，随后驻留轮询——不退避重连浪费连接，
@@ -1804,7 +1840,7 @@ fn spawn_map_task(
     daemon: Arc<Daemon>,
     engine: Arc<SocketEngine>,
     own_node_id: String,
-    boot_endpoint: String,
+    boot_endpoint: Arc<StdMutex<Option<SocketAddr>>>,
     coord_addr: String,
     policy_gate: Arc<InboundGate>,
 ) {
@@ -1888,11 +1924,8 @@ fn spawn_map_task(
                             }
                             if removed_own {
                                 daemon.mark_expired(&engine);
-                                let probe_endpoint = endpoint_strings(&own_slot, &boot_endpoint)
-                                    .into_iter()
-                                    .next()
-                                    .unwrap_or_default();
-                                note_revocation(&daemon, &state_dir, &probe_endpoint, &coord_addr)
+                                let probe_endpoints = endpoint_strings(&own_slot, &boot_endpoint);
+                                note_revocation(&daemon, &state_dir, probe_endpoints, &coord_addr)
                                     .await;
                                 break;
                             }
@@ -1923,20 +1956,24 @@ fn spawn_map_task(
 }
 
 /// Map 订阅随流携带的 Endpoint 字符串：共享槽的最新收集结果；空槽（收集
-/// 尚未跑过）退回启动时探测的 LAN Endpoint。服务端在流打开时整体覆盖
-/// 落库，必须给最新值，否则出口变化后的重拨会把旧地址写回去。
+/// 尚未跑过）退回最近一次 LAN Endpoint。没有可用地址时给空列表——服务端
+/// 接受空上报，不能塞一个空字符串或已经失效的旧地址。
 fn endpoint_strings(
     own_slot: &Arc<StdMutex<Vec<DiscoveredEndpoint>>>,
-    boot_endpoint: &str,
+    boot_endpoint: &Arc<StdMutex<Option<SocketAddr>>>,
 ) -> Vec<String> {
     let collected = own_slot.lock().expect("own endpoints poisoned").clone();
-    if collected.is_empty() {
-        return vec![boot_endpoint.to_string()];
+    if !collected.is_empty() {
+        return collected
+            .into_iter()
+            .map(|found| found.addr.to_string())
+            .collect();
     }
-    collected
-        .into_iter()
-        .map(|found| found.addr.to_string())
-        .collect()
+    boot_endpoint
+        .lock()
+        .expect("lan endpoint poisoned")
+        .map(|addr| vec![addr.to_string()])
+        .unwrap_or_default()
 }
 
 /// 用缓存当前快照对账数据面（含自己之外的全部对端）。use_relay 是路径管理
@@ -2107,5 +2144,53 @@ mod up_coord_addr_tests {
         );
         assert_eq!(up_coord_addr(None, Some(""), Some("")), DEFAULT_COORD_ADDR);
         assert_eq!(up_coord_addr(None, None, None), DEFAULT_COORD_ADDR);
+    }
+}
+
+#[cfg(test)]
+mod endpoint_strings_tests {
+    use super::*;
+    use hz_core::endpoint::EndpointKind;
+
+    fn slot(addrs: &[&str]) -> Arc<StdMutex<Vec<DiscoveredEndpoint>>> {
+        Arc::new(StdMutex::new(
+            addrs
+                .iter()
+                .map(|text| DiscoveredEndpoint {
+                    addr: text.parse().unwrap(),
+                    kind: EndpointKind::Lan,
+                })
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn missing_lan_endpoint_is_omitted() {
+        let boot = Arc::new(StdMutex::new(None));
+        assert!(endpoint_strings(&slot(&[]), &boot).is_empty());
+    }
+
+    #[test]
+    fn boot_lan_endpoint_tracks_egress_and_yields_to_collection() {
+        let boot = Arc::new(StdMutex::new(Some("192.168.31.63:51820".parse().unwrap())));
+        assert_eq!(
+            endpoint_strings(&slot(&[]), &boot),
+            vec!["192.168.31.63:51820".to_string()]
+        );
+        *boot.lock().expect("lan endpoint poisoned") = Some("10.0.0.8:51820".parse().unwrap());
+        assert_eq!(
+            endpoint_strings(&slot(&[]), &boot),
+            vec!["10.0.0.8:51820".to_string()],
+            "出口变化后重算的地址要出现在下一次上报里"
+        );
+        *boot.lock().expect("lan endpoint poisoned") = None;
+        assert!(
+            endpoint_strings(&slot(&[]), &boot).is_empty(),
+            "重算后没有可用地址时不再上报旧值"
+        );
+        assert_eq!(
+            endpoint_strings(&slot(&["10.1.1.1:51820"]), &boot),
+            vec!["10.1.1.1:51820".to_string()]
+        );
     }
 }

@@ -34,6 +34,21 @@ pub fn is_virtual_name(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+/// 虚拟网卡：名称前缀，加上 Linux 上 sysfs `tun_flags`（表外名字的 tun 也算）。
+pub fn is_virtual_iface(name: &str) -> bool {
+    if is_virtual_name(name) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        is_tun_device(name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Linux：tun/tap 字符设备创建的接口会在 sysfs 暴露 tun_flags，
 /// 无论第三方 TUN 类网络工具给它起什么名字都能识别。
 #[cfg(target_os = "linux")]
@@ -121,9 +136,7 @@ pub fn physical_egress() -> Option<String> {
     {
         let table = std::fs::read_to_string("/proc/net/route").ok()?;
         let routes = parse_route_table(&table);
-        let picked = pick_egress(&routes, &|name| {
-            is_virtual_name(name) || is_tun_device(name)
-        });
+        let picked = pick_egress(&routes, &is_virtual_iface);
         match picked {
             Some(iface) => {
                 tracing::debug!(%iface, "physical egress interface detected");
@@ -138,7 +151,7 @@ pub fn physical_egress() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let picked = egress_from_route_get()
-            .filter(|name| !is_virtual_name(name))
+            .filter(|name| !is_virtual_iface(name))
             .or_else(egress_from_netstat);
         match picked {
             Some(iface) => {
@@ -253,7 +266,7 @@ fn egress_from_netstat() -> Option<String> {
         .ok()?;
     parse_netstat_default_ifaces(&String::from_utf8_lossy(&output.stdout))
         .into_iter()
-        .find(|name| !is_virtual_name(name))
+        .find(|name| !is_virtual_iface(name))
 }
 
 /// macOS 的 IP_BOUND_IF / IPV6_BOUND_IF：值是网卡索引（u32）。无需特权。
