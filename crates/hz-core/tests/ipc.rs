@@ -122,7 +122,13 @@ async fn socket_is_connectable_by_any_local_user() {
 // 管理档（带 Auth Key 的 up、policy/authkey/invite/node）只给 root / 同 uid。
 // ---------------------------------------------------------------------------
 
-fn auth(method: &str, params: serde_json::Value, peer: u32, daemon: u32, console: Option<u32>) -> Result<(), String> {
+fn auth(
+    method: &str,
+    params: serde_json::Value,
+    peer: u32,
+    daemon: u32,
+    console: Option<u32>,
+) -> Result<(), String> {
     ipc::authorize_request(&Request::new(1, method, params), peer, daemon, console)
 }
 
@@ -155,17 +161,53 @@ fn permission_tiers_table() {
         ("down", no_params.clone(), console_user, console, true),
         ("down", no_params.clone(), other_user, console, false),
         ("subscribe", no_params.clone(), console_user, console, true),
-        ("diagnostics", no_params.clone(), console_user, console, true),
+        (
+            "diagnostics",
+            no_params.clone(),
+            console_user,
+            console,
+            true,
+        ),
         // 管理档：up 带 Auth Key 即使 console 用户也拒绝（提示 sudo）。
         ("up", auth_key.clone(), console_user, console, false),
         ("up", auth_key.clone(), console_user, no_console, false),
-        ("policy_push", no_params.clone(), console_user, console, false),
-        ("policy_get", no_params.clone(), console_user, console, false),
-        ("authkey_create", no_params.clone(), console_user, console, false),
-        ("invite_create", no_params.clone(), console_user, console, false),
+        (
+            "policy_push",
+            no_params.clone(),
+            console_user,
+            console,
+            false,
+        ),
+        (
+            "policy_get",
+            no_params.clone(),
+            console_user,
+            console,
+            false,
+        ),
+        (
+            "authkey_create",
+            no_params.clone(),
+            console_user,
+            console,
+            false,
+        ),
+        (
+            "invite_create",
+            no_params.clone(),
+            console_user,
+            console,
+            false,
+        ),
         ("node_list", no_params.clone(), console_user, console, false),
         // 未知方法归管理档：不因三档放开。
-        ("future_admin_thing", no_params.clone(), console_user, console, false),
+        (
+            "future_admin_thing",
+            no_params.clone(),
+            console_user,
+            console,
+            false,
+        ),
         // root 与 hzd 同 uid 对所有档放行。
         ("up", auth_key.clone(), 0, no_console, true),
         ("policy_push", no_params.clone(), 0, no_console, true),
@@ -186,8 +228,19 @@ fn permission_tiers_table() {
 #[test]
 fn root_and_daemon_user_pass_every_tier_without_console() {
     let daemon = 501u32;
-    for method in ["up", "down", "subscribe", "diagnostics", "login_poll", "policy_push"] {
-        let params = if method == "up" { json!({"auth_key": "HZ-..."}) } else { json!({}) };
+    for method in [
+        "up",
+        "down",
+        "subscribe",
+        "diagnostics",
+        "login_poll",
+        "policy_push",
+    ] {
+        let params = if method == "up" {
+            json!({"auth_key": "HZ-..."})
+        } else {
+            json!({})
+        };
         assert!(
             auth(method, params, 0, daemon, None).is_ok(),
             "root 可执行 {method}"
@@ -212,15 +265,28 @@ fn rejection_messages_distinguish_console_session_from_sudo() {
         "成员档拒绝应同时说明登录会话与 sudo 两条路：{member}"
     );
     let member_no_console = auth("up", json!({}), console_user, daemon, None).unwrap_err();
-    assert!(member_no_console.contains("登录会话"), "{member_no_console}");
+    assert!(
+        member_no_console.contains("登录会话"),
+        "{member_no_console}"
+    );
 
-    let admin = auth("up", json!({"auth_key": "HZ-..."}), console_user, daemon, console).unwrap_err();
+    let admin = auth(
+        "up",
+        json!({"auth_key": "HZ-..."}),
+        console_user,
+        daemon,
+        console,
+    )
+    .unwrap_err();
     assert!(
         admin.contains("sudo") && !admin.contains("登录会话"),
         "管理档拒绝应只引导 sudo：{admin}"
     );
     let admin_unknown = auth("policy_push", json!({}), other, daemon, console).unwrap_err();
-    assert!(admin_unknown.contains("sudo") && !admin_unknown.contains("登录会话"), "{admin_unknown}");
+    assert!(
+        admin_unknown.contains("sudo") && !admin_unknown.contains("登录会话"),
+        "{admin_unknown}"
+    );
 }
 
 /// loginctl 会话清单 → 交互式用户：带 seat 的会话命中，SSH/后台会话排除。
@@ -242,8 +308,8 @@ fn console_uid_picks_the_first_seated_session() {
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc as StdArc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hz_core::ipc::{serve_with, stream_handler};
 
@@ -327,7 +393,12 @@ async fn client_disconnect_stops_the_stream_and_frees_the_handler() {
         async move {
             // 先推一条，然后持续推送；客户端在第一条后断开，
             // 后续 send 失败必须让 handler 退出（finished 置位）。
-            let _ = sender.send(Response::Ok { id: 1, result: json!({"step": 1}) }).await;
+            let _ = sender
+                .send(Response::Ok {
+                    id: 1,
+                    result: json!({"step": 1}),
+                })
+                .await;
             for step in 2..1000u64 {
                 if sender
                     .send(Response::Ok {

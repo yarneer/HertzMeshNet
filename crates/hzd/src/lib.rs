@@ -100,6 +100,60 @@ pub struct MapPeer {
 #[derive(Clone)]
 struct EgressEpoch(tokio::sync::watch::Sender<u64>);
 
+/// Desired State（#81 / MC-1）：User 对本机数据面的期望，`up` / `down`。
+/// 持久化在 state_dir 的 desired_state.json；缺省（旧安装升级、文件损坏）
+/// 视为 `up`——不因读写问题改变旧行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DesiredState {
+    Up,
+    Down,
+}
+
+impl DesiredState {
+    fn as_str(self) -> &'static str {
+        match self {
+            DesiredState::Up => "up",
+            DesiredState::Down => "down",
+        }
+    }
+}
+
+const DESIRED_STATE_FILE: &str = "desired_state.json";
+
+fn load_desired_state(state_dir: &Path) -> DesiredState {
+    let text = std::fs::read_to_string(state_dir.join(DESIRED_STATE_FILE)).unwrap_or_default();
+    match serde_json::from_str::<DesiredStateWrapper>(&text) {
+        Ok(wrapper) => wrapper.state,
+        // 缺失 / 损坏 / 旧版本没有该文件：一律按 up（缺省语义）。
+        Err(_) => DesiredState::Up,
+    }
+}
+
+fn save_desired_state(state_dir: &Path, state: DesiredState) -> anyhow::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = state_dir.join(DESIRED_STATE_FILE);
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(serde_json::to_string_pretty(&DesiredStateWrapper { state })?.as_bytes())?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DesiredStateWrapper {
+    state: DesiredState,
+}
+
 impl EgressEpoch {
     fn new() -> Self {
         Self(tokio::sync::watch::Sender::new(0))
@@ -134,7 +188,10 @@ struct RouteRepairNote {
 /// 路由占用时重新安装（#24）。
 /// 路由正常时只读不写、不打日志；自检本身出错只在错误变化时告警一次。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn spawn_route_guard(tun: Arc<Tun>, mut egress: tokio::sync::watch::Receiver<u64>) {
+fn spawn_route_guard(
+    tun: Arc<Tun>,
+    mut egress: tokio::sync::watch::Receiver<u64>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(ROUTE_CHECK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -183,7 +240,7 @@ fn spawn_route_guard(tun: Arc<Tun>, mut egress: tokio::sync::watch::Receiver<u64
                 Err(error) => tracing::warn!(%error, "HzNet 路由自检任务异常"),
             }
         }
-    });
+    })
 }
 
 /// 每个对端的打洞信令观察（Relay 原因判定的输入，规格 §4）：路径任务在
@@ -229,6 +286,16 @@ struct Daemon {
     revoked: StdMutex<bool>,
     /// 物理出口变化代数：长连接任务据此强制重拨（见类型注释）。
     egress_epoch: EgressEpoch,
+    /// Desired State（#81）：up / down。
+    desired_state: StdMutex<DesiredState>,
+    /// 数据面监督句柄（#81）：down 时取消并等待全部数据面任务退出。
+    dataplane: StdMutex<Option<DataplaneHandle>>,
+}
+
+/// start_dataplane 的可停机句柄：cancel 后监督任务 abort 全部数据面子任务。
+struct DataplaneHandle {
+    cancel: tokio::sync::watch::Sender<bool>,
+    supervisor: tokio::task::JoinHandle<()>,
 }
 
 impl Daemon {
@@ -285,6 +352,10 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
             Arc::new(NetworkMapCache::empty(&state_dir))
         }
     };
+    let desired_state = load_desired_state(&state_dir);
+    if desired_state == DesiredState::Down {
+        tracing::info!("desired state is down; dataplane stays down until `hz up`");
+    }
     let daemon = Arc::new(Daemon {
         state_dir,
         registration: StdMutex::new(
@@ -313,11 +384,16 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         probes: Arc::new(ping::Probes::default()),
         revoked: StdMutex::new(false),
         egress_epoch: EgressEpoch::new(),
+        desired_state: StdMutex::new(desired_state),
+        dataplane: StdMutex::new(None),
     });
 
-    // 开机即已注册：直接拉起数据面；coord 地址取注册时记下的，其次环境变量。
+    // 开机即已注册且 Desired State 为 up：直接拉起数据面（#81：down 时保持
+    // 断开，`hz up` 才恢复）；coord 地址取注册时记下的，其次环境变量。
     // 上次运行期间是否已过期不落盘：由 Map 订阅被拒（已过期）在线发现。
-    let boot_info = daemon.registration_info();
+    let boot_info = daemon
+        .registration_info()
+        .filter(|_| desired_state == DesiredState::Up);
     if let Some(info) = boot_info {
         let coord_addr = daemon
             .coord_addr
@@ -370,6 +446,13 @@ async fn handle_request(
             let mut value = serde_json::to_value(status).map_err(|e| e.to_string())?;
             value["peers"] =
                 serde_json::to_value(peers_view(&daemon)).map_err(|e| e.to_string())?;
+            value["desired_state"] = serde_json::json!(
+                daemon
+                    .desired_state
+                    .lock()
+                    .expect("desired state poisoned")
+                    .as_str()
+            );
             value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
             value["revoked"] = serde_json::json!(*daemon.revoked.lock().expect("revoked poisoned"));
             // #25：最近一次运行中路由修复与引导 DNS 回退，供 hz status 汇报。
@@ -399,6 +482,15 @@ async fn handle_request(
             let report = collect_netcheck(&daemon).await;
             serde_json::to_value(&report).map_err(|error| error.to_string())
         }
+        "down" => {
+            // #81：停数据面（断 Network Map 流、停止上报、尽拆 TUN/DNS 接入），
+            // 保留注册与密钥；持久化 `down`，重启后保持断开。
+            shutdown_dataplane(&daemon).await;
+            *daemon.desired_state.lock().expect("desired state poisoned") = DesiredState::Down;
+            save_desired_state(&daemon.state_dir, DesiredState::Down)
+                .map_err(|error| format!("写入 Desired State 失败：{error:#}"))?;
+            Ok(serde_json::json!({ "desired_state": "down" }))
+        }
         "up" => {
             let registered = daemon
                 .coord_addr
@@ -410,6 +502,29 @@ async fn handle_request(
                 registered.as_deref(),
                 std::env::var("HZD_COORD_ADDR").ok().as_deref(),
             );
+
+            // #81：已注册（未过期）时 up 只是恢复数据面并写 `up`——不重新
+            // 注册、不轮换 Node Key、不换 Coordination Server（显式 --coord
+            // 被忽略）。过期态仍走原注册路径，由 coord 拒绝并指向重新登录。
+            let registered = daemon.registration_info().filter(|_| !daemon.is_expired());
+            if let Some(info) = registered {
+                *daemon.desired_state.lock().expect("desired state poisoned") = DesiredState::Up;
+                save_desired_state(&daemon.state_dir, DesiredState::Up)
+                    .map_err(|error| format!("写入 Desired State 失败：{error:#}"))?;
+                if daemon.engine.lock().expect("engine poisoned").is_none() {
+                    let coord_addr = daemon
+                        .coord_addr
+                        .lock()
+                        .expect("coord addr poisoned")
+                        .clone()
+                        .filter(|addr| !addr.is_empty())
+                        .unwrap_or(coord_addr);
+                    if let Err(error) = start_dataplane(&daemon, &keys, &info, &coord_addr).await {
+                        tracing::error!(%error, "dataplane startup failed after up");
+                    }
+                }
+                return serde_json::to_value(info).map_err(|e| e.to_string());
+            }
 
             let invite_code = request
                 .params
@@ -817,6 +932,11 @@ async fn finish_registration(
 ) -> Result<Value, String> {
     save_registration(&daemon.state_dir, &info, coord_addr)
         .map_err(|error| format!("{error:#}"))?;
+    // 注册即接入（#81）：Desired State 写 `up`。
+    *daemon.desired_state.lock().expect("desired state poisoned") = DesiredState::Up;
+    if let Err(error) = save_desired_state(&daemon.state_dir, DesiredState::Up) {
+        tracing::warn!(%error, "persist desired state failed");
+    }
     *daemon.registration.lock().expect("registration poisoned") = Session::Registered(info.clone());
     *daemon.coord_addr.lock().expect("coord addr poisoned") = Some(coord_addr.to_string());
     tracing::info!(node_id = %info.node_id, name = %info.name, "node registered");
@@ -981,34 +1101,36 @@ async fn start_dataplane(
     let boot_endpoint = Arc::new(StdMutex::new(None));
     publish_lan_endpoint(engine.local_addr().port(), &boot_endpoint);
 
+    // 全部数据面子任务的句柄（#81）：监督任务持有，down 时逐个 abort。
+    let mut tasks = Vec::new();
     if let Ok(relay_addr) = std::env::var("HZD_RELAY_ADDR") {
         if !relay_addr.is_empty() {
-            spawn_relay_supervisor(
+            tasks.push(spawn_relay_supervisor(
                 &engine,
                 keys,
                 &info.node_id,
                 &relay_addr,
                 daemon.egress_epoch.clone(),
-            );
+            ));
         }
     }
 
-    spawn_tun_bridge(
+    tasks.extend(spawn_tun_bridge(
         &engine,
         info,
         &daemon.map_cache,
         &daemon.policy_gate,
         daemon.probes.clone(),
         daemon.egress_epoch.receiver(),
-    );
-    spawn_map_task(
+    ));
+    tasks.push(spawn_map_task(
         daemon.clone(),
         engine.clone(),
         info.node_id.clone(),
         boot_endpoint.clone(),
         coord_addr.to_string(),
         daemon.policy_gate.clone(),
-    );
+    ));
     // 段内 DNS 应答地址：注册响应携带（#20）；旧服务端回落规格 A2 固定值。
     let dns_v4 = info
         .dns_v4
@@ -1017,13 +1139,25 @@ async fn start_dataplane(
         .unwrap_or(hz_core::dns::DNS_BIND_V4);
     if let Err(error) = dns::spawn(daemon.map_cache.clone(), dns_v4).await {
         tracing::warn!(%error, "dns responder unavailable");
+    } else {
+        // 已启动过（幂等）时 up 恢复也要重新挂辅助地址与 resolver 接入。
+        dns::reactivate(dns_v4);
     }
-    spawn_endpoint_collector(daemon.clone(), engine.clone(), coord_addr.to_string());
+    tasks.push(spawn_endpoint_collector(
+        daemon.clone(),
+        engine.clone(),
+        coord_addr.to_string(),
+    ));
     #[cfg(target_os = "macos")]
     let boot_for_watch = boot_endpoint.clone();
-    spawn_net_recovery(daemon, engine.clone(), coord_addr, boot_endpoint);
-    spawn_portmap(daemon.clone(), engine.clone());
-    spawn_path_task(
+    tasks.push(spawn_net_recovery(
+        daemon,
+        engine.clone(),
+        coord_addr,
+        boot_endpoint,
+    ));
+    tasks.push(spawn_portmap(daemon.clone(), engine.clone()));
+    tasks.push(spawn_path_task(
         daemon.map_cache.clone(),
         daemon.map_signal.clone(),
         daemon.own_endpoints.clone(),
@@ -1034,11 +1168,55 @@ async fn start_dataplane(
         engine.clone(),
         keys.clone(),
         &info.node_id,
-    );
+    ));
     #[cfg(target_os = "macos")]
-    spawn_egress_watch(daemon, engine.clone(), coord_addr, boot_for_watch);
+    tasks.push(spawn_egress_watch(
+        daemon,
+        engine.clone(),
+        coord_addr,
+        boot_for_watch,
+    ));
+
+    // 监督任务：down 的取消信号一到就 abort 全部子任务（SocketEngine、TUN
+    // 随句柄 drop 关闭；portmap 的 Drop 守卫在 abort 引发的 future drop 中
+    // 尽力删除映射），然后等待它们退出。
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let supervisor = tokio::spawn(async move {
+        if cancel_rx.changed().await.is_ok() {
+            for task in &tasks {
+                task.abort();
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    });
+    *daemon.dataplane.lock().expect("dataplane poisoned") = Some(DataplaneHandle {
+        cancel: cancel_tx,
+        supervisor,
+    });
     *daemon.engine.lock().expect("engine poisoned") = Some(engine);
     Ok(())
+}
+
+/// 停掉数据面（#81 `down`）：取消监督任务 → abort 全部子任务（Network Map
+/// 流随之断开、上报停止、Relay/STUN/TUN 尽拆）→ 还原系统 DNS 接入 →
+/// 移除引擎引用。幂等：未运行时是空操作。
+async fn shutdown_dataplane(daemon: &Arc<Daemon>) {
+    let handle = daemon.dataplane.lock().expect("dataplane poisoned").take();
+    if let Some(handle) = handle {
+        let _ = handle.cancel.send(true);
+        // abort 全部子任务通常在毫秒级；给慢路径留 10 秒。
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle.supervisor).await;
+    }
+    daemon.engine.lock().expect("engine poisoned").take();
+    dns::deactivate();
+    daemon
+        .own_endpoints
+        .lock()
+        .expect("own endpoints poisoned")
+        .clear();
+    tracing::info!("dataplane stopped (desired state down)");
 }
 
 /// 生效 IPv4 段（FR-4）：注册响应携带的值为权威（与坐标分配一致），
@@ -1127,7 +1305,7 @@ fn spawn_egress_watch(
     engine: Arc<SocketEngine>,
     coord_addr: &str,
     boot: Arc<StdMutex<Option<SocketAddr>>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let daemon = daemon.clone();
     let coord_addr = coord_addr.to_string();
     tokio::spawn(async move {
@@ -1137,7 +1315,7 @@ fn spawn_egress_watch(
             publish_lan_endpoint(engine.local_addr().port(), &boot);
             collect_and_report(&daemon, &engine, &coord_addr).await;
         }
-    });
+    })
 }
 
 /// Relay 传输监督（#7 单连 → #8 断线重连 → #9 出口变化强拔）：连上后挂到
@@ -1149,7 +1327,7 @@ fn spawn_relay_supervisor(
     node_id: &str,
     relay_addr: &str,
     egress_epoch: EgressEpoch,
-) {
+) -> tokio::task::JoinHandle<()> {
     let ca_pem = match std::env::var("HZD_RELAY_CA_PATH") {
         Ok(path) if !path.is_empty() => match std::fs::read_to_string(&path) {
             Ok(pem) => Some(pem),
@@ -1204,7 +1382,7 @@ fn spawn_relay_supervisor(
             tokio::time::sleep(jittered(backoff)).await;
             backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
         }
-    });
+    })
 }
 
 /// STUN 服务器列表。`HZD_STUN_ADDR` 显式设置时按逗号拆开（可多个，供
@@ -1543,10 +1721,10 @@ fn portmap_gateway_endpoint() -> Option<std::net::SocketAddr> {
 
 /// 端口映射监督任务（#77）：申请 → 发布 PortMap 候选 → 租期过半续租；
 /// 物理出口变化时立即重新申请；任务结束（hzd 退出）时尽力删除映射。
-fn spawn_portmap(daemon: Arc<Daemon>, engine: Arc<SocketEngine>) {
+fn spawn_portmap(daemon: Arc<Daemon>, engine: Arc<SocketEngine>) -> tokio::task::JoinHandle<()> {
     if !portmap_enabled() {
         tracing::debug!("portmap disabled by HZD_PORTMAP=0");
-        return;
+        return tokio::spawn(async {});
     }
     let egress = daemon.egress_epoch.receiver();
     tokio::spawn(async move {
@@ -1690,7 +1868,7 @@ fn spawn_portmap(daemon: Arc<Daemon>, engine: Arc<SocketEngine>) {
                 }
             }
         }
-    });
+    })
 }
 
 /// 把端口映射候选并入 own_endpoints（替换既有 PortMap 项；无映射时移除）。
@@ -1712,14 +1890,18 @@ fn merge_portmap_into(daemon: &Arc<Daemon>) {
 /// 结果同时存进共享槽供打洞信令取本机候选；打洞累计计数随上报携带（FR-12）；
 /// Health Report（#72 / OB-2）同帧上报，netcheck 六项与 Relay 原因在本帧
 /// 现场判定。收集动作本身抽成 [`collect_and_report`]，网络变化恢复序列即时复用。
-fn spawn_endpoint_collector(daemon: Arc<Daemon>, engine: Arc<SocketEngine>, coord_addr: String) {
+fn spawn_endpoint_collector(
+    daemon: Arc<Daemon>,
+    engine: Arc<SocketEngine>,
+    coord_addr: String,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(ENDPOINT_COLLECT_EVERY);
         loop {
             ticker.tick().await;
             collect_and_report(&daemon, &engine, &coord_addr).await;
         }
-    });
+    })
 }
 
 /// 一轮 STUN 探测的结论：Endpoint 候选 + Health Report 的 netcheck 输入。
@@ -1907,7 +2089,7 @@ fn spawn_net_recovery(
     engine: Arc<SocketEngine>,
     coord_addr: &str,
     boot: Arc<StdMutex<Option<SocketAddr>>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let daemon = daemon.clone();
     let map_signal = daemon.map_signal.clone();
     let egress_epoch = daemon.egress_epoch.clone();
@@ -1955,7 +2137,7 @@ fn spawn_net_recovery(
             egress_epoch.bump();
             map_signal.notify_one();
         }
-    });
+    })
 }
 
 /// 路径管理任务（FR-8）：每秒推进状态机 + Map 变化、打洞信令即时唤醒。
@@ -1973,7 +2155,7 @@ fn spawn_path_task(
     engine: Arc<SocketEngine>,
     keys: Arc<KeyStore>,
     own_node_id: &str,
-) {
+) -> tokio::task::JoinHandle<()> {
     let own_node_id = own_node_id.to_string();
     let (punch_tx, punch_rx) = mpsc::channel::<Vec<u8>>(64);
     engine.set_punch_handler(punch_tx);
@@ -2020,7 +2202,7 @@ fn spawn_path_task(
                 .await;
             }
         }
-    });
+    })
 }
 
 /// 路径任务的对端视图：Endpoint 分组 + 数据面公钥（打洞信令加密用）。
@@ -2259,16 +2441,18 @@ fn spawn_tun_bridge(
     gate: &Arc<InboundGate>,
     probes: Arc<ping::Probes>,
     egress: tokio::sync::watch::Receiver<u64>,
-) {
+) -> Vec<tokio::task::JoinHandle<()>> {
+    // down（#81）靠监督任务 abort 这些句柄拆数据面：全部子任务都要收进 Vec。
+    let mut tasks = Vec::new();
     let (to_tunnel_tx, to_tunnel_rx) = mpsc::channel::<Vec<u8>>(256);
-    tokio::spawn({
+    tasks.push(tokio::spawn({
         let engine = engine.clone();
         async move {
             if let Err(error) = engine.run(to_tunnel_tx).await {
                 tracing::error!(%error, "wireguard engine loop exited");
             }
         }
-    });
+    }));
     let own_v4: Option<std::net::Ipv4Addr> = info.ipv4.parse().ok();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2282,8 +2466,13 @@ fn spawn_tun_bridge(
                     ipv6 = %info.ipv6,
                     "registration holds invalid address, skip tun setup"
                 );
-                spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
-                return;
+                tasks.push(spawn_tunnel_drain(
+                    engine.clone(),
+                    probes,
+                    own_v4,
+                    to_tunnel_rx,
+                ));
+                return tasks;
             }
         };
         let tun_config = TunConfig {
@@ -2294,8 +2483,8 @@ fn spawn_tun_bridge(
         match Tun::setup(&tun_config) {
             Ok(tun) => {
                 let device = tun.device();
-                spawn_route_guard(Arc::new(tun), egress.clone());
-                tokio::spawn({
+                tasks.push(spawn_route_guard(Arc::new(tun), egress.clone()));
+                tasks.push(tokio::spawn({
                     let device = device.clone();
                     let cache = cache.clone();
                     let gate = gate.clone();
@@ -2349,11 +2538,11 @@ fn spawn_tun_bridge(
                             }
                         }
                     }
-                });
+                }));
                 let engine = engine.clone();
                 let cache = cache.clone();
                 let gate = gate.clone();
-                tokio::spawn(async move {
+                tasks.push(tokio::spawn(async move {
                     let mut buf = vec![0u8; 65_535];
                     // 出方向流登记（回包放行依据）与入方向共用对端索引口径。
                     let mut index_version = u64::MAX;
@@ -2388,19 +2577,30 @@ fn spawn_tun_bridge(
                             }
                         }
                     }
-                });
+                }));
             }
             Err(error) => {
                 tracing::warn!(%error, "tun setup failed, running without data plane forwarding");
-                spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
+                tasks.push(spawn_tunnel_drain(
+                    engine.clone(),
+                    probes,
+                    own_v4,
+                    to_tunnel_rx,
+                ));
             }
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (cache, gate, egress);
-        spawn_tunnel_drain(engine.clone(), probes, own_v4, to_tunnel_rx);
+        tasks.push(spawn_tunnel_drain(
+            engine.clone(),
+            probes,
+            own_v4,
+            to_tunnel_rx,
+        ));
     }
+    tasks
 }
 
 /// 入方向：取包的源地址（对端身份索引的键）。
@@ -2428,7 +2628,7 @@ fn spawn_tunnel_drain(
     probes: Arc<ping::Probes>,
     own_v4: Option<std::net::Ipv4Addr>,
     mut rx: mpsc::Receiver<Vec<u8>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
             if let Some(v4) = own_v4 {
@@ -2437,7 +2637,7 @@ fn spawn_tunnel_drain(
                 }
             }
         }
-    });
+    })
 }
 
 /// 从 Map 消失后向服务端问一次，区分吊销与到期（removed 差量不携带原因，
@@ -2475,7 +2675,7 @@ fn spawn_map_task(
     boot_endpoint: Arc<StdMutex<Option<SocketAddr>>>,
     coord_addr: String,
     policy_gate: Arc<InboundGate>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let state_dir = daemon.state_dir.clone();
     let cache = daemon.map_cache.clone();
     let map_signal = daemon.map_signal.clone();
@@ -2584,7 +2784,7 @@ fn spawn_map_task(
                 backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
             }
         }
-    });
+    })
 }
 
 /// Map 订阅随流携带的 Endpoint 字符串：共享槽的最新收集结果；空槽（收集
@@ -2746,6 +2946,38 @@ fn save_registration(
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod desired_state_tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_corrupt_file_defaults_to_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_desired_state(dir.path()), DesiredState::Up);
+        std::fs::write(dir.path().join(DESIRED_STATE_FILE), "not json").unwrap();
+        assert_eq!(load_desired_state(dir.path()), DesiredState::Up);
+        std::fs::write(dir.path().join(DESIRED_STATE_FILE), r#"{"state":"down"}"#).unwrap();
+        assert_eq!(load_desired_state(dir.path()), DesiredState::Down);
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        save_desired_state(dir.path(), DesiredState::Down).unwrap();
+        assert_eq!(load_desired_state(dir.path()), DesiredState::Down);
+        save_desired_state(dir.path(), DesiredState::Up).unwrap();
+        assert_eq!(load_desired_state(dir.path()), DesiredState::Up);
+        // 权限 0600，与 registration.json 一致。
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join(DESIRED_STATE_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }
 
 #[cfg(test)]

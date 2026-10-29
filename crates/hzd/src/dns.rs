@@ -523,6 +523,49 @@ impl ShutdownGuard {
             }
         }
     }
+
+    /// up 恢复（#81）：换入新的接入快照（apply 已把文件写好，旧的不需要还原）。
+    fn replace(&self, integration: Integration) {
+        self.0
+            .lock()
+            .expect("dns guard poisoned")
+            .replace(integration);
+    }
+}
+
+/// 进程级接入快照槽：down 主动还原 / up 重新接入共用（#81）。
+static GUARD: std::sync::OnceLock<Arc<ShutdownGuard>> = std::sync::OnceLock::new();
+
+/// down（#81）：还原系统 DNS 接入（/etc/resolver 条目或 resolv.conf 快照），
+/// 幂等；应答器与辅助地址不动（接口随数据面拆除消失）。
+pub fn deactivate() {
+    if let Some(guard) = GUARD.get() {
+        guard.restore();
+    }
+}
+
+/// up 恢复（#81）：hz0 是新建接口，辅助地址重新挂；resolver 接入重新写。
+/// 应答器由 [`spawn`] 幂等保证只起一次。
+pub fn reactivate(dns_v4: std::net::Ipv4Addr) {
+    if let Err(error) = hz_core::tun::add_secondary_addr(&dns_v4) {
+        tracing::warn!(%error, "re-add dns secondary addr failed (tun not ready?)");
+    }
+    let allow_fallback = matches!(
+        std::env::var("HZD_DNS_RESOLVCONF_FALLBACK").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let integration = Integration::apply(
+        &SystemDnsPaths::system(),
+        &ResolvedConfig {
+            suffix: hz_core::dns::dns_suffix(),
+            dns_addr: dns_v4,
+        },
+        Mechanism::system(),
+        allow_fallback,
+    );
+    if let Some(guard) = GUARD.get() {
+        guard.replace(integration);
+    }
 }
 
 impl Drop for ShutdownGuard {
@@ -566,7 +609,9 @@ pub async fn spawn(cache: Arc<NetworkMapCache>, dns_v4: Ipv4Addr) -> anyhow::Res
         Mechanism::system(),
         allow_fallback,
     );
-    spawn_signal_task(Arc::new(ShutdownGuard(StdMutex::new(Some(integration)))));
+    let guard = Arc::new(ShutdownGuard(StdMutex::new(Some(integration))));
+    let _ = GUARD.set(guard.clone());
+    spawn_signal_task(guard);
     Ok(())
 }
 

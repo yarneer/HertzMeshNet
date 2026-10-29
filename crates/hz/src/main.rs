@@ -65,6 +65,8 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// 断开 HzNet（#81）：停数据面但保留注册与密钥；hz up 恢复
+    Down,
     /// 探测一个对端：显示往返时延与当前路径（FR-12）
     Ping {
         /// 对端 Node Name 或 node id
@@ -187,6 +189,7 @@ async fn main() -> std::process::ExitCode {
         Command::Authkey { command } => authkey(command).await,
         Command::Invite { command } => invite(command).await,
         Command::Node { command } => node(command).await,
+        Command::Down => down().await,
         Command::Ping { node } => ping(node).await,
         Command::Netcheck { json } => netcheck(json).await,
     }
@@ -643,6 +646,7 @@ async fn status(json_output: bool) -> std::process::ExitCode {
                 } else {
                     println!("已过期，请执行 hz login 重新登录");
                 }
+                print_desired_state(&result);
                 print_identity(&info);
                 if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
                     println!("网内域名后缀：{suffix}");
@@ -833,6 +837,31 @@ fn endpoint_is_v6(endpoint: &str) -> bool {
     endpoint
         .parse::<std::net::SocketAddr>()
         .is_ok_and(|addr| addr.is_ipv6())
+}
+
+/// `hz down`（#81）：请 hzd 停掉数据面并持久化 Desired State = down。
+async fn down() -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = Request::new(4, "down", serde_json::json!({}));
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match response {
+        Response::Ok { result, .. } => {
+            let state = result["desired_state"].as_str().unwrap_or("down");
+            println!("已断开（desired_state={state}）；注册与密钥保留，hz up 恢复连接");
+            std::process::ExitCode::SUCCESS
+        }
+        Response::Error { error, .. } => {
+            eprintln!("{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 /// `hz ping`（FR-12）：显示往返时延与这次探测所走的路径。
@@ -1126,6 +1155,14 @@ fn print_peers(result: &serde_json::Value) {
             endpoint,
             handshake
         );
+    }
+}
+
+/// Desired State（#81）：区分「有意断开」与「故障」——down 是用户意愿，
+/// up 时不额外刷屏。
+fn print_desired_state(result: &serde_json::Value) {
+    if result.get("desired_state").and_then(|v| v.as_str()) == Some("down") {
+        println!("状态：已断开（hz down 所致，hz up 恢复；注册与密钥保留）");
     }
 }
 

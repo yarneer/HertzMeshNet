@@ -193,6 +193,8 @@ pub struct ServeHandle {
     pub metrics_addr: Option<SocketAddr>,
     /// Health Report 内存表（#69 v0.3）：测试与嵌入方检查报告是否进内存用。
     pub health: Arc<HealthCenter>,
+    /// Network Map 推送枢纽（#81）：测试断言流断开 / 在线态用。
+    pub hub: Arc<MapHub>,
     shutdown: tokio::sync::watch::Sender<bool>,
     http: Option<HttpHandle>,
     metrics: Option<MetricsHandle>,
@@ -352,6 +354,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         local_addr,
         connections,
         health,
+        hub,
         shutdown: shutdown_tx,
         http: http_handle,
         http_addr,

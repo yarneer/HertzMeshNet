@@ -71,8 +71,7 @@ where
 /// （流结束）或客户端断开（后续 send 失败，应尽快返回以释放资源）。
 type StreamFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-pub type StreamHandler =
-    Arc<dyn Fn(Request, mpsc::Sender<Response>) -> StreamFuture + Send + Sync>;
+pub type StreamHandler = Arc<dyn Fn(Request, mpsc::Sender<Response>) -> StreamFuture + Send + Sync>;
 
 /// 把 async 闭包包成 StreamHandler 的助手。
 pub fn stream_handler<F, Fut>(f: F) -> StreamHandler
@@ -179,8 +178,8 @@ pub fn authorize_request(
     if READ_ONLY_METHODS.contains(&method) || peer_uid == 0 || peer_uid == daemon_uid {
         return Ok(());
     }
-    let member_method = method == "up" && !request_carries_auth_key(request)
-        || MEMBER_METHODS.contains(&method);
+    let member_method =
+        method == "up" && !request_carries_auth_key(request) || MEMBER_METHODS.contains(&method);
     if member_method {
         if console_uid == Some(peer_uid) {
             Ok(())
@@ -201,7 +200,9 @@ pub fn current_console_uid() -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata("/dev/console").ok().map(|meta| meta.uid())
+        std::fs::metadata("/dev/console")
+            .ok()
+            .map(|meta| meta.uid())
     }
     #[cfg(target_os = "linux")]
     {
