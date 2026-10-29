@@ -26,6 +26,9 @@ enum Command {
         /// 输出 hzd 应答的原始 JSON（脚本用）
         #[arg(long)]
         json: bool,
+        /// 持续监视：订阅 hzd 状态推送，变化实时刷新（Ctrl-C 退出，#83）
+        #[arg(long)]
+        watch: bool,
     },
     /// 注册本机（FR-1：带 --auth-key 用 Auth Key；否则走交互式登录 FR-2）
     Up {
@@ -184,7 +187,8 @@ async fn main() -> std::process::ExitCode {
     restore_default_sigpipe();
     let cli = Cli::parse();
     match cli.command {
-        Command::Status { json } => status(json).await,
+        Command::Status { json, watch } if watch => status_watch(json).await,
+        Command::Status { json, .. } => status(json).await,
         Command::Up {
             auth_key,
             invite,
@@ -642,42 +646,7 @@ async fn status(json_output: bool) -> std::process::ExitCode {
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             std::process::ExitCode::SUCCESS
         }
-        Response::Ok { result, .. } => match serde_json::from_value::<NodeStatus>(result.clone()) {
-            Ok(NodeStatus::Unregistered) => {
-                println!("未加入 HzNet");
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(NodeStatus::Expired(info)) => {
-                if result.get("revoked").and_then(|v| v.as_bool()) == Some(true) {
-                    println!("已吊销：本 Node 已被 Admin 吊销，无法通信；重新加入需以新身份注册");
-                } else {
-                    println!("已过期，请执行 hz login 重新登录");
-                }
-                print_desired_state(&result);
-                print_identity(&info);
-                if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
-                    println!("网内域名后缀：{suffix}");
-                }
-                print_peers(&result);
-                std::process::ExitCode::SUCCESS
-            }
-            Ok(NodeStatus::Registered(info)) => {
-                println!("已加入 HzNet");
-                print_desired_state(&result);
-                print_identity(&info);
-                if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
-                    println!("网内域名后缀：{suffix}");
-                }
-                print_peers(&result);
-                print_conflicts(&detect_conflicts(&info, &result));
-                print_diagnostics(&result);
-                std::process::ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("无法解析 hzd 应答：{error}");
-                std::process::ExitCode::FAILURE
-            }
-        },
+        Response::Ok { result, .. } => print_status_human(&result),
         Response::Error { error, .. } => {
             eprintln!("hzd 返回错误：{error}");
             std::process::ExitCode::FAILURE
@@ -845,6 +814,102 @@ fn endpoint_is_v6(endpoint: &str) -> bool {
     endpoint
         .parse::<std::net::SocketAddr>()
         .is_ok_and(|addr| addr.is_ipv6())
+}
+
+/// 一份完整 status 快照的人类可读渲染（一次性输出与 --watch 刷新共用）。
+fn print_status_human(result: &serde_json::Value) -> std::process::ExitCode {
+    match serde_json::from_value::<NodeStatus>(result.clone()) {
+        Ok(NodeStatus::Unregistered) => {
+            println!("未加入 HzNet");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(NodeStatus::Expired(info)) => {
+            if result.get("revoked").and_then(|v| v.as_bool()) == Some(true) {
+                println!("已吊销：本 Node 已被 Admin 吊销，无法通信；重新加入需以新身份注册");
+            } else {
+                println!("已过期，请执行 hz login 重新登录");
+            }
+            print_desired_state(result);
+            print_identity(&info);
+            if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
+                println!("网内域名后缀：{suffix}");
+            }
+            print_peers(result);
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(NodeStatus::Registered(info)) => {
+            println!("已加入 HzNet");
+            print_desired_state(result);
+            print_identity(&info);
+            if let Some(suffix) = result.get("dns_suffix").and_then(|v| v.as_str()) {
+                println!("网内域名后缀：{suffix}");
+            }
+            print_peers(result);
+            print_conflicts(&detect_conflicts(&info, result));
+            print_diagnostics(result);
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("无法解析 hzd 应答：{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `hz status --watch`（#83）：订阅 hzd 的状态推送，逐行快照实时刷新。
+/// 每份快照整屏重画；--json 时每份快照打一段 pretty JSON。hzd 断开
+/// （流结束）或 45 秒无任何推送（心跳兜底该是 15 秒）时报错退出。
+async fn status_watch(json_output: bool) -> std::process::ExitCode {
+    use std::io::IsTerminal;
+    use std::io::Write;
+
+    // 重定向到文件 / 管道时不打清屏转义（避免污染输出），逐份打印。
+    let interactive = std::io::stdout().is_terminal();
+    let socket = paths::socket_path();
+    let mut rx =
+        match ipc::request_stream(&socket, Request::new(1, "subscribe", serde_json::json!({})))
+            .await
+        {
+            Ok(rx) => rx,
+            Err(error) => {
+                eprintln!("无法连接 hzd：hzd 是否在运行？");
+                eprintln!("详细信息：{error:#}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+    loop {
+        let received = tokio::time::timeout(std::time::Duration::from_secs(45), rx.recv()).await;
+        match received {
+            Ok(Some(Response::Ok { result, .. })) => {
+                if json_output {
+                    // 每份快照一行紧凑 JSON（NDJSON 兼容），脚本可逐行消费。
+                    println!("{}", serde_json::to_string(&result).unwrap());
+                    continue;
+                }
+                if interactive {
+                    // 终端下整屏重画：光标归位 + 清屏，再打印完整快照。
+                    print!("\x1b[H\x1b[2J");
+                }
+                if print_status_human(&result) == std::process::ExitCode::FAILURE {
+                    return std::process::ExitCode::FAILURE;
+                }
+                let _ = std::io::stdout().flush();
+            }
+            // 流结束：hzd 关闭连接或进程退出。
+            Ok(None) => {
+                eprintln!("hzd 已断开订阅（hzd 退出或连接关闭）");
+                return std::process::ExitCode::FAILURE;
+            }
+            Ok(Some(Response::Error { error, .. })) => {
+                eprintln!("hzd 返回错误：{error}");
+                return std::process::ExitCode::FAILURE;
+            }
+            Err(_) => {
+                eprintln!("45 秒未收到任何推送（心跳应为 15 秒一份），订阅疑似中断");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
 }
 
 /// `hz down`（#81）：请 hzd 停掉数据面并持久化 Desired State = down。

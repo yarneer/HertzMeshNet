@@ -67,16 +67,19 @@ where
     Arc::new(move |request| Box::pin(f(request)))
 }
 
+/// 流式方法往连接写响应的出口（一请求多响应，#95）。
+pub type ResponseSink = mpsc::Sender<Response>;
+
 /// 流式方法：对同一请求 id 经 sender 逐行推送 [`Response`]，直到函数返回
 /// （流结束）或客户端断开（后续 send 失败，应尽快返回以释放资源）。
 type StreamFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-pub type StreamHandler = Arc<dyn Fn(Request, mpsc::Sender<Response>) -> StreamFuture + Send + Sync>;
+pub type StreamHandler = Arc<dyn Fn(Request, ResponseSink) -> StreamFuture + Send + Sync>;
 
 /// 把 async 闭包包成 StreamHandler 的助手。
 pub fn stream_handler<F, Fut>(f: F) -> StreamHandler
 where
-    F: Fn(Request, mpsc::Sender<Response>) -> Fut + Send + Sync + 'static,
+    F: Fn(Request, ResponseSink) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     Arc::new(move |request, sender| Box::pin(f(request, sender)))

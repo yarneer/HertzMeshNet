@@ -431,7 +431,93 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
             Box::pin(handle_request(request, daemon, keys))
         })
     };
-    ipc::serve(&socket_path, handler).await
+    // subscribe（#83 / MC-3）：IPC 第一个流式方法，同一请求 id 下逐行推完整
+    // status 快照；macOS Client App 驱动 UI 的唯一数据源。
+    let mut streams: HashMap<String, ipc::StreamHandler> = HashMap::new();
+    let subscribe_daemon = daemon.clone();
+    streams.insert(
+        "subscribe".to_string(),
+        ipc::stream_handler(move |request: ipc::Request, sender: ipc::ResponseSink| {
+            let daemon = subscribe_daemon.clone();
+            async move {
+                subscribe_loop(daemon, request.id, sender).await;
+            }
+        }),
+    );
+    ipc::serve_with(&socket_path, handler, Arc::new(streams)).await
+}
+
+/// 订阅的节拍（#83，规格 §3.3）：每秒对比一次完整 status 快照，变化即推
+/// ——两次推送间隔天然 ≥ 1 秒（快速连续变化合并为下一拍的一份）；连续
+/// 15 拍无变化推一次心跳快照。取轮询对比而非在各状态迁移点埋信号：埋点
+/// 会漏（未来新增状态源时），而快照对比让一切影响 status 的变化自动可
+/// 见，1 秒延迟对终端 / App 刷新无感；status 组装只是几次锁与小型快照，
+/// 每订阅者每秒一次的成本可忽略。建立时立即推一份（首拍 last 为空）。
+/// 订阅者断开时 send 失败即返回（EOF 哨兵同样兜底），不影响 hzd 与其他
+/// 订阅者——每条订阅连接一个独立的本循环。
+async fn subscribe_loop(daemon: Arc<Daemon>, id: u64, sender: ipc::ResponseSink) {
+    const BEAT: Duration = Duration::from_secs(1);
+    const HEARTBEAT_BEATS: u32 = 15;
+    let mut ticker = tokio::time::interval(BEAT);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last: Option<String> = None;
+    let mut beats_since_push: u32 = 0;
+    loop {
+        ticker.tick().await;
+        beats_since_push += 1;
+        let Ok(mut snapshot) = status_value(&daemon).await else {
+            continue;
+        };
+        // 未注册分支的 status 不带 desired_state（契约锁定为纯
+        // {"registered":false}）；订阅快照按规格「额外带 desired_state」补齐，
+        // App 的 UI 状态机对每份快照都能读到同一字段。
+        if snapshot.get("desired_state").is_none() {
+            snapshot["desired_state"] = desired_state_json(&daemon);
+        }
+        let fingerprint = diff_fingerprint(&snapshot);
+        let changed = last.as_deref() != Some(fingerprint.as_str());
+        if !changed && beats_since_push < HEARTBEAT_BEATS {
+            continue;
+        }
+        if sender
+            .send(ipc::Response::Ok {
+                id,
+                result: snapshot,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        last = Some(fingerprint);
+        beats_since_push = 0;
+    }
+}
+
+fn desired_state_json(daemon: &Daemon) -> Value {
+    serde_json::json!(
+        daemon
+            .desired_state
+            .lock()
+            .expect("desired state poisoned")
+            .as_str()
+    )
+}
+
+/// 快照的对比指纹（#83 评审）：推送判断用，推送本身仍是完整快照。
+/// 剔除随墙钟单调的字段——`handshake_secs` 每秒递增，若参与对比，有握手
+/// 对端的节点每一拍都"有变化"，15 秒心跳退化为每秒推送。剔出对比后，
+/// 握手年龄刷新仍随心跳（15 秒）到达订阅者。
+fn diff_fingerprint(snapshot: &Value) -> String {
+    let mut scrubbed = snapshot.clone();
+    if let Some(peers) = scrubbed.get_mut("peers").and_then(Value::as_array_mut) {
+        for peer in peers {
+            if let Some(fields) = peer.as_object_mut() {
+                fields.remove("handshake_secs");
+            }
+        }
+    }
+    serde_json::to_string(&scrubbed).unwrap_or_default()
 }
 
 async fn handle_request(
@@ -2999,6 +3085,37 @@ mod desired_state_tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod subscribe_diff_tests {
+    use super::*;
+
+    /// handshake_secs 随墙钟递增不构成"变化"（否则心跳退化为每秒推送）。
+    #[test]
+    fn diff_fingerprint_ignores_monotonic_handshake_age() {
+        let a = serde_json::json!({
+            "registered": true,
+            "desired_state": "up",
+            "peers": [{"name": "mini", "path": "direct", "handshake_secs": 3}],
+        });
+        let mut b = a.clone();
+        b["peers"][0]["handshake_secs"] = serde_json::json!(4);
+        assert_eq!(diff_fingerprint(&a), diff_fingerprint(&b));
+
+        // 真实变化（路径翻转 / desired_state / 对端增删）仍构成变化。
+        let mut c = a.clone();
+        c["peers"][0]["path"] = serde_json::json!("relay");
+        assert_ne!(diff_fingerprint(&a), diff_fingerprint(&c));
+        let mut d = a.clone();
+        d["desired_state"] = serde_json::json!("down");
+        assert_ne!(diff_fingerprint(&a), diff_fingerprint(&d));
+        let mut e = a.clone();
+        e["peers"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": "other", "path": "relay"
+        }));
+        assert_ne!(diff_fingerprint(&a), diff_fingerprint(&e));
     }
 }
 
