@@ -303,7 +303,9 @@ impl Engine {
                 return out;
             };
             self.prefer_endpoint(&node_id, from);
-            self.note_direct_rx(&node_id);
+            // 发起包只证明对端发得出。入方向被安全组丢弃时对端仍会重发握手，
+            // 若记成直连存活，本机会被拉回 Direct，handshake_timeout 报不出来。
+            // 记账留给握手响应和传输报文（对端确实收到了我们发出的包）。
             self.register_own_index(&node_id, &response);
             out.to_network.push(NetworkSend {
                 node_id,

@@ -124,14 +124,16 @@ peer_addresses() { # peer_addresses <a> <b>：打印对端视角的 v4/v6 Node A
 }
 
 assert_single_udp_socket() { # assert_single_udp_socket <node...>
+  # 只数数据面端口。端口映射（#77）另有发往网关的短命 UDP，换网后会立刻重申请，
+  # 探测窗口里多一个 fd 不代表数据面 socket 被重绑复制。
   local node ns count
   for node in "$@"; do
     ns=$(node_ns "$node")
-    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
+    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep hzd | grep -cE ':${HZ_WG_PORT}[[:space:]]' || true")
     if [[ $count == 1 ]]; then
       pass "${node}：hzd 恰好 1 个 UDP socket（WireGuard/打洞/STUN 共用，ADR-0002）"
     else
-      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
+      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，端口 ${HZ_WG_PORT}）"
     fi
   done
 }
@@ -229,15 +231,7 @@ assert_suite_lan() {
   done
 
   note "断言 4：hzd 仅持有唯一 UDP socket（WireGuard 与打洞共用，ADR-0002）"
-  for node in "$a" "$b"; do
-    ns=$(node_ns "$node")
-    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
-    if [[ $count == 1 ]]; then
-      pass "${node}：hzd 恰好 1 个 UDP socket"
-    else
-      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
-    fi
-  done
+  assert_single_udp_socket "$a" "$b"
 
   (( FAILURES == 0 ))
 }
@@ -1674,7 +1668,7 @@ assert_suite_handshaketimeout() {
   wait_for_log "$ART_DIR/hz-node-$a.log" "path=direct" "$a 升级 Direct Path" 90 || return 1
   wait_for_log "$ART_DIR/hz-node-$b.log" "path=direct" "$b 升级 Direct Path" 90 || return 1
 
-  note "人为阻断：在 $b 的 NAT 丢弃 WG 端口入方向（模拟云主机安全组未放行 UDP $HZ_WG_PORT）"
+  note "人为阻断：在 $b 的 NAT 丢弃 WG 端口入方向（模拟云主机安全组未放行 UDP ${HZ_WG_PORT}）"
   natnum=$(nat_num_of "$(reg_field "$b" 2)")
   ip netns exec "hz-nat$natnum" nft insert rule ip "hz-nat$natnum" filterin udp dport "$HZ_WG_PORT" drop
   pass "已在 hz-nat$natnum 的 forward 链首插入 udp dport $HZ_WG_PORT drop（仅入方向）"
@@ -1703,7 +1697,14 @@ except Exception:
   fi
 
   note "断言 2：coord 指标按原因计数（hz_coord_relayed_paths{reason=\"handshake_timeout\"} ≥ 1，黄点由该原因驱动）"
-  metrics=$(ip netns exec "$WAN_NS" curl -s http://127.0.0.1:9100/metrics || true)
+  # Health Report 每 30 秒一帧。断言 1 的 netcheck 往往在下一帧之前就命中，
+  # 此时 coord 里还是上一帧的 punch_pending；阻断必须保持到这一帧发出。
+  metrics=""
+  for i in $(seq 1 80); do # 最多 40 秒
+    metrics=$(ip netns exec "$WAN_NS" curl -s http://127.0.0.1:9100/metrics || true)
+    grep -q 'hz_coord_relayed_paths{reason="handshake_timeout"} [1-9]' <<<"$metrics" && break
+    sleep 0.5
+  done
   if grep -q 'hz_coord_relayed_paths{reason="handshake_timeout"} [1-9]' <<<"$metrics"; then
     pass "coord 指标已按原因计数 handshake_timeout"
   else
@@ -1715,7 +1716,7 @@ except Exception:
     | awk -v port="$HZ_WG_PORT" '$0 ~ "udp dport "port" drop" {for (i = 1; i <= NF; i++) if ($i == "handle") print $(i+1)}' | head -1)
   if [[ -n $handle ]]; then
     ip netns exec "hz-nat$natnum" nft delete rule ip "hz-nat$natnum" filterin handle "$handle"
-    pass "已删除 hz-nat$natnum filterin 的 drop 规则（handle $handle）"
+    pass "已删除 hz-nat$natnum filterin 的 drop 规则（handle ${handle}）"
   else
     fail "找不到 drop 规则的 handle，无法撤销"
     return 1
@@ -1768,7 +1769,7 @@ assert_suite_portmapdirect() {
   a_lan=$(reg_field "$a" 4)
   stub_log="$ART_DIR/natpmp-stub.log"
 
-  note "前置：在 $table（对称 NAT，外网 $wan_ip）里跑 NAT-PMP 应答器 + 端口钉扎"
+  note "前置：在 ${table}（对称 NAT，外网 ${wan_ip}）里跑 NAT-PMP 应答器 + 端口钉扎"
   ip netns exec "$table" setsid python3 - "$wan_ip" "$a_lan" "$HZ_WG_PORT" "$table" > "$stub_log" 2>&1 <<'PY' &
 import socket
 import subprocess
@@ -1825,7 +1826,7 @@ while True:
         print("NAT-PMP map %d -> %s:%d (pinned)" % (internal, wan_ip, ext), flush=True)
     # 其余报文（PCP 等）不答：hzd 2 秒超时后落到 NAT-PMP。
 PY
-  pass "NAT-PMP 应答器已在 $table:5351 启动（外网 $wan_ip，映射目标 $a_lan:$HZ_WG_PORT）"
+  pass "NAT-PMP 应答器已在 $table:5351 启动（外网 ${wan_ip}，映射目标 $a_lan:${HZ_WG_PORT}）"
 
   start_pair_with_relay "$a" "$b" || return 1
   wait_pair_mutual_view "$a" "$b" || return 1
@@ -1835,7 +1836,7 @@ PY
   if grep -q "NAT-PMP map" "$stub_log" 2>/dev/null; then
     pass "应答器记录到映射申请：$(grep 'NAT-PMP map' "$stub_log" | tail -1)"
   else
-    fail "应答器未记录映射申请（见 $stub_log）"
+    fail "应答器未记录映射申请（见 ${stub_log}）"
   fi
 
   note "断言 2：对称 × 端口受限组合靠 PortMap 候选建立 Direct Path"

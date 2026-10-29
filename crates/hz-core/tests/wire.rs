@@ -379,13 +379,24 @@ fn direct_rx_age_tracks_udp_reception_only() {
     );
 
     let init = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"hello"));
-    let _ = deliver(&init, &mut engine_b, a.udp);
+    let response = deliver(&init, &mut engine_b, a.udp);
+    assert!(
+        engine_b
+            .direct_rx_ages()
+            .get(name)
+            .copied()
+            .flatten()
+            .is_none(),
+        "仅收到握手发起包不算直连存活：对端安全组丢弃入方向时仍会发出发起包"
+    );
+    let flushed = deliver(&response, &mut engine_a, b.udp);
+    let _ = deliver(&flushed, &mut engine_b, a.udp);
     let age = engine_b
         .direct_rx_ages()
         .get(name)
         .copied()
         .flatten()
-        .expect("收到对端直连握手后 direct_rx 必须有值");
+        .expect("握手完成后的传输报文必须点亮 direct_rx");
     assert!(age < Duration::from_secs(5));
 
     // 伪造对端身份的报文解不开，不应点亮 direct_rx。
@@ -722,6 +733,18 @@ fn reset_direct_rx_makes_path_manager_fall_back_and_re_punch() {
         .expect("恢复序列应能重新发出打洞握手");
     let answered = engine_b.handle_udp(a.udp, &punch);
     assert_eq!(answered.to_network.len(), 1, "对端必须应答恢复后的打洞握手");
+    assert!(
+        engine_b
+            .direct_rx_ages()
+            .get(name)
+            .copied()
+            .flatten()
+            .is_none(),
+        "打洞发起包单独不点亮 direct_rx"
+    );
+    let _ = engine_a.handle_udp(b.udp, &answered.to_network[0].datagram);
+    let follow = engine_a.send_ip_packet(&udp_v4_packet(a.v4, b.v4, b"alive"));
+    let _ = deliver(&follow, &mut engine_b, a.udp);
     assert!(
         engine_b
             .direct_rx_ages()

@@ -530,6 +530,19 @@ mod tests {
     }
 
     #[test]
+    fn route_get_output_yields_the_gateway_line() {
+        let text =
+            "   route to: default\n              gateway: 192.168.3.1\n           interface: en0\n";
+        assert_eq!(
+            parse_route_get_gateway(text),
+            Some("192.168.3.1".parse().unwrap()),
+            "gateway: 行有前导空格也要能解析"
+        );
+        assert_eq!(parse_route_get_gateway("no such line"), None);
+        assert_eq!(parse_route_get_gateway("gateway: not-an-ip"), None);
+    }
+
+    #[test]
     fn netstat_defaults_keep_virtual_first_and_physical_second() {
         assert_eq!(
             parse_netstat_default_ifaces(NETSTAT_WITH_VIRTUAL_DEFAULT),
