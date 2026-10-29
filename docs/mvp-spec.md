@@ -14,7 +14,7 @@
 - 兼容官方 Tailscale 客户端或协议（[ADR-0001](adr/0001-full-stack-own-protocol.md)）
 - 多租户、一次部署多个 HzNet
 - 子网路由、出口节点、管理 Web 界面、密钥轮换 UI（第二阶段）
-- Windows、iOS、Android、macOS Network Extension（注：iOS 同一时间只允许一个隧道类网络配置处于激活状态，届时 HzNet 无法与其他第三方 TUN 类网络工具同时开启）
+- Windows（计划于 v0.5，见 [macos-client-spec §11](macos-client-spec.md)）、iOS、Android、macOS Network Extension（注：iOS 同一时间只允许一个隧道类网络配置处于激活状态，届时 HzNet 无法与其他第三方 TUN 类网络工具同时开启）
 - Coordination Server 高可用、多地域 Relay
 - 与 Kanidm 的实时联动（User 被禁用后靠有效期兜底）、从 IdP 同步 Group
 - Node 自动升级

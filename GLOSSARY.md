@@ -58,6 +58,18 @@ _Avoid_: Control Server, Controller, Master, 服务端
 给 Admin 使用的浏览器界面，用来管理 HzNet（Node 列表、Auth Key、健康状态、有限的运维操作）。
 _Avoid_: Dashboard, Portal, Web UI
 
+**Client App**:
+装在 Node 上、给该 Node 的 User 使用的图形界面（v0.4 起为 macOS 菜单栏 App），只是 hzd 的外壳：开关连接、登录、查看状态与对端、导出诊断包。不含管理功能；它本身不是 Node，Node 是它所在的那台设备。
+_Avoid_: 客户端（未加限定时）, GUI, Tray App
+
+**Desired State**:
+User 希望本 Node 处于连接（`up`）还是断开（`down`）的状态，由 hzd 持久化；hzd 启动时据此决定是否启动数据面。与注册状态正交：断开不注销身份。
+_Avoid_: 自动连接开关, Enabled
+
+**IPC 权限档（只读档 / 成员档 / 管理档）**:
+hzd 本地 IPC 方法按调用方划分的三档：只读档任何本机用户可调；成员档只给当前交互式会话用户与 root，用于接入、开关、订阅与诊断；管理档只给 root，用于以本 Node 身份签发凭证与管理 HzNet。
+_Avoid_: 权限级别, sudo 命令
+
 **Relay**:
 带公网入口的中转服务，在两个 Node 无法直连时代为转发已加密的流量。
 _Avoid_: DERP, TURN, Proxy, 中继服务器（作为别名可接受，但代码与文档用 Relay）
