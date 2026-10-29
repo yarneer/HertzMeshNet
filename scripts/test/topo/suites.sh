@@ -124,14 +124,16 @@ peer_addresses() { # peer_addresses <a> <b>：打印对端视角的 v4/v6 Node A
 }
 
 assert_single_udp_socket() { # assert_single_udp_socket <node...>
+  # 只数数据面端口。端口映射（#77）另有发往网关的短命 UDP，换网后会立刻重申请，
+  # 探测窗口里多一个 fd 不代表数据面 socket 被重绑复制。
   local node ns count
   for node in "$@"; do
     ns=$(node_ns "$node")
-    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
+    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep hzd | grep -cE ':${HZ_WG_PORT}[[:space:]]' || true")
     if [[ $count == 1 ]]; then
       pass "${node}：hzd 恰好 1 个 UDP socket（WireGuard/打洞/STUN 共用，ADR-0002）"
     else
-      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
+      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，端口 ${HZ_WG_PORT}）"
     fi
   done
 }
@@ -229,15 +231,7 @@ assert_suite_lan() {
   done
 
   note "断言 4：hzd 仅持有唯一 UDP socket（WireGuard 与打洞共用，ADR-0002）"
-  for node in "$a" "$b"; do
-    ns=$(node_ns "$node")
-    count=$(ip netns exec "$ns" sh -c "ss -u -a -n -p 2>/dev/null | grep 'hzd' | grep -v '100\\.96\\.0\\.53:53' | grep -c . || true")
-    if [[ $count == 1 ]]; then
-      pass "${node}：hzd 恰好 1 个 UDP socket"
-    else
-      fail "${node}：hzd 数据面 UDP socket 数量为 ${count}（应为 1，已排除 100.96.0.53:53 本地 DNS 应答）"
-    fi
-  done
+  assert_single_udp_socket "$a" "$b"
 
   (( FAILURES == 0 ))
 }
