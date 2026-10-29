@@ -231,7 +231,7 @@ fn loginctl_sessions() -> Option<String> {
 /// 会话清单 → 交互式会话用户：取第一个带 seat（图形 / 控制台）会话的 uid。
 /// SSH 与后台会话没有 seat，天然排除。
 #[cfg(target_os = "linux")]
-pub(crate) fn console_uid_from_loginctl(sessions: &str) -> Option<u32> {
+pub fn console_uid_from_loginctl(sessions: &str) -> Option<u32> {
     sessions
         .lines()
         .filter_map(|line| {
