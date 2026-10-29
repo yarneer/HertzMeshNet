@@ -303,7 +303,7 @@ async fn stream_connection(
     let (mut read_half, mut write_half) = stream.into_split();
     // EOF 哨兵：客户端断开时读半边立刻可感知（写侧要等缓冲排干才 EPIPE，
     // 流式心跳间隔下可能拖很久）。流式期间客户端发来的多余字节直接丢弃。
-    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+    let (eof_tx, mut eof_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let mut scratch = [0u8; 256];
         loop {
@@ -317,7 +317,6 @@ async fn stream_connection(
 
     let (tx, mut rx) = mpsc::channel::<Response>(16);
     tokio::spawn(stream_handler(request, tx));
-    let mut eof_rx = eof_rx;
     loop {
         tokio::select! {
             response = rx.recv() => {
@@ -328,7 +327,7 @@ async fn stream_connection(
                 write_response_capped(&mut write_half, response).await?;
             }
             _ = &mut eof_rx => {
-                // 客户端断开：drop receiver 使 handler 的下一次 send 失败。
+                // 客户端断开：close 掉接收端使 handler 的下一次 send 失败。
                 rx.close();
                 break;
             }

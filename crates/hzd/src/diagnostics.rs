@@ -16,6 +16,11 @@ pub const LOG_TAIL_LINES: usize = 2000;
 /// 单行截断上限：tracing 正常行远短于此，防个别爆行撑爆 IPC 1 MiB 上限。
 const MAX_LINE_CHARS: usize = 8 * 1024;
 
+/// log_tail 总量预算（#84 评审）：2000 行 × 8 KiB 最坏可超 IPC 单行 1 MiB
+/// 上限——超预算时从最老的行开始丢弃，而不是让整份诊断以传输错误失败。
+/// 预算给 status/netcheck 部分留了充足余量。
+const MAX_TAIL_BYTES: usize = 512 * 1024;
+
 /// hzd 日志文件路径：`HZD_LOG_FILE` 显式指定（测试与手工部署），否则按
 /// 平台默认（macOS 是 launchd plist 的 StandardErrorPath）。Linux 的默认
 /// 落在 systemd journal，见 [`journal_tail`]。
@@ -45,10 +50,10 @@ pub fn collect_log_tail_from(path: Option<&std::path::Path>) -> (Vec<String>, Op
     if let Some(path) = path {
         return match std::fs::read_to_string(path) {
             Ok(text) => {
-                let lines = tail_lines(&text, LOG_TAIL_LINES);
+                let lines = fit_tail_budget(redact_lines(tail_lines(&text, LOG_TAIL_LINES)));
                 let count = lines.len();
                 (
-                    lines.into_iter().map(|line| redact_line(&line)).collect(),
+                    lines,
                     Some(format!("最近 {count} 行（{}，已脱敏）", path.display())),
                 )
             }
@@ -150,6 +155,38 @@ pub fn redact_line(line: &str) -> String {
     line = redact_invite_codes(&line);
     line = redact_login_tokens(&line);
     redact_long_hex(&line)
+}
+
+/// 多行 PEM 私钥块的状态机脱敏（#84 评审）：BEGIN 行进入块内状态，直到
+/// END 行——块内每行（64 字符 base64 体，无前缀，单行规则命中不了）整行
+/// 替换。单行含 BEGIN 与 END 时不进入块内状态。
+pub fn redact_lines(lines: Vec<String>) -> Vec<String> {
+    let mut in_pem = false;
+    lines
+        .into_iter()
+        .map(|line| {
+            if in_pem {
+                if line.contains("END") && line.contains("KEY") {
+                    in_pem = false;
+                }
+                return REDACTED.to_string();
+            }
+            if line.contains("PRIVATE KEY") {
+                in_pem = !line.contains("END");
+                return format!("…{REDACTED}（PEM 私钥块）");
+            }
+            redact_line(&line)
+        })
+        .collect()
+}
+
+/// 总量超预算时从最老的行开始丢弃（保最近的日志，排障价值最高）。
+fn fit_tail_budget(mut lines: Vec<String>) -> Vec<String> {
+    let size = |lines: &Vec<String>| lines.iter().map(|l| l.len() + 2).sum::<usize>();
+    while size(&lines) > MAX_TAIL_BYTES && lines.len() > 1 {
+        lines.remove(0);
+    }
+    lines
 }
 
 /// `hznet.` / `hzrelay.` 后 ≥20 个 base64url 字符的实体替换为 [REDACTED]。
@@ -320,6 +357,42 @@ mod tests {
         let truncated = truncate_line(&long);
         assert!(truncated.chars().count() <= MAX_LINE_CHARS + 10);
         assert!(truncated.ends_with("…(截断)"));
+    }
+
+    #[test]
+    fn multiline_pem_body_lines_are_redacted_as_a_block() {
+        let lines = vec![
+            "before".to_string(),
+            "-----BEGIN PRIVATE KEY-----".to_string(),
+            "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEA".to_string(),
+            "morebase64bodyline==".to_string(),
+            "-----END PRIVATE KEY-----".to_string(),
+            "after".to_string(),
+        ];
+        let redacted = redact_lines(lines);
+        assert!(
+            !redacted.iter().any(|l| l.contains("MIIBVAIB")),
+            "{redacted:?}"
+        );
+        assert!(
+            !redacted.iter().any(|l| l.contains("morebase64")),
+            "{redacted:?}"
+        );
+        assert_eq!(redacted[0], "before");
+        assert_eq!(redacted[5], "after");
+    }
+
+    #[test]
+    fn tail_budget_drops_oldest_lines_first() {
+        let lines: Vec<String> = (0..100)
+            .map(|i| format!("log-{i:03} {}", "x".repeat(6000)))
+            .collect();
+        let fitted = fit_tail_budget(lines);
+        // 100 × ~6KB = 600KB > 512KB 预算 → 丢弃最老行。
+        assert!(fitted.len() < 100);
+        assert!(fitted.last().unwrap().starts_with("log-099"), "最新行保留");
+        let total: usize = fitted.iter().map(|l| l.len() + 2).sum();
+        assert!(total <= MAX_TAIL_BYTES || fitted.len() == 1);
     }
 
     #[test]

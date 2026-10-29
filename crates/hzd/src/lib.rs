@@ -132,8 +132,14 @@ fn load_desired_state(state_dir: &Path) -> DesiredState {
 }
 
 fn save_desired_state(state_dir: &Path, state: DesiredState) -> anyhow::Result<()> {
+    let body = serde_json::to_string_pretty(&DesiredStateWrapper { state })?;
+    write_private_atomic(state_dir, DESIRED_STATE_FILE, body.as_bytes())
+}
+
+/// 状态目录里的 0600 原子写：tmp → rename（registration.json 同一形态）。
+fn write_private_atomic(state_dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    let path = state_dir.join(DESIRED_STATE_FILE);
+    let path = state_dir.join(name);
     let tmp = path.with_extension("tmp");
     {
         use std::io::Write;
@@ -144,7 +150,7 @@ fn save_desired_state(state_dir: &Path, state: DesiredState) -> anyhow::Result<(
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(serde_json::to_string_pretty(&DesiredStateWrapper { state })?.as_bytes())?;
+        file.write_all(bytes)?;
     }
     std::fs::rename(&tmp, &path)?;
     Ok(())
@@ -291,6 +297,9 @@ struct Daemon {
     desired_state: StdMutex<DesiredState>,
     /// 数据面监督句柄（#81）：down 时取消并等待全部数据面任务退出。
     dataplane: StdMutex<Option<DataplaneHandle>>,
+    /// start/shutdown 数据面的串行锁（#81 评审）：并发 up/down 下保证
+    /// check-then-act 不交错（双拉数据面 / 停机窗口内误判已启动）。
+    dataplane_gate: tokio::sync::Mutex<()>,
 }
 
 /// start_dataplane 的可停机句柄：cancel 后监督任务 abort 全部数据面子任务。
@@ -387,6 +396,7 @@ pub async fn run(state_dir: PathBuf, socket_path: PathBuf) -> anyhow::Result<()>
         egress_epoch: EgressEpoch::new(),
         desired_state: StdMutex::new(desired_state),
         dataplane: StdMutex::new(None),
+        dataplane_gate: tokio::sync::Mutex::new(()),
     });
 
     // 开机即已注册且 Desired State 为 up：直接拉起数据面（#81：down 时保持
@@ -1104,6 +1114,9 @@ async fn start_dataplane(
     info: &RegisteredInfo,
     coord_addr: &str,
 ) -> anyhow::Result<()> {
+    // 与 shutdown_dataplane 互斥：整个「检查 → 拉起 → 登记句柄」序列不被
+    // 并发的 down / up 交错（IPC 连接各自独立任务，无天然串行化）。
+    let _gate = daemon.dataplane_gate.lock().await;
     if daemon.engine.lock().expect("engine poisoned").is_some() {
         return Ok(());
     }
@@ -1176,7 +1189,9 @@ async fn start_dataplane(
         coord_addr,
         boot_endpoint,
     ));
-    tasks.push(spawn_portmap(daemon.clone(), engine.clone()));
+    if let Some(portmap) = spawn_portmap(daemon.clone(), engine.clone()) {
+        tasks.push(portmap);
+    }
     tasks.push(spawn_path_task(
         daemon.map_cache.clone(),
         daemon.map_signal.clone(),
@@ -1223,6 +1238,7 @@ async fn start_dataplane(
 /// 流随之断开、上报停止、Relay/STUN/TUN 尽拆）→ 还原系统 DNS 接入 →
 /// 移除引擎引用。幂等：未运行时是空操作。
 async fn shutdown_dataplane(daemon: &Arc<Daemon>) {
+    let _gate = daemon.dataplane_gate.lock().await;
     let handle = daemon.dataplane.lock().expect("dataplane poisoned").take();
     if let Some(handle) = handle {
         let _ = handle.cancel.send(true);
@@ -1741,13 +1757,16 @@ fn portmap_gateway_endpoint() -> Option<std::net::SocketAddr> {
 
 /// 端口映射监督任务（#77）：申请 → 发布 PortMap 候选 → 租期过半续租；
 /// 物理出口变化时立即重新申请；任务结束（hzd 退出）时尽力删除映射。
-fn spawn_portmap(daemon: Arc<Daemon>, engine: Arc<SocketEngine>) -> tokio::task::JoinHandle<()> {
+fn spawn_portmap(
+    daemon: Arc<Daemon>,
+    engine: Arc<SocketEngine>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !portmap_enabled() {
         tracing::debug!("portmap disabled by HZD_PORTMAP=0");
-        return tokio::spawn(async {});
+        return None;
     }
     let egress = daemon.egress_epoch.receiver();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut egress = egress;
         let mut egress_open = true;
         // Drop 时同步发出 lifetime=0 的删除报文（PCP/NAT-PMP）。
@@ -1888,7 +1907,7 @@ fn spawn_portmap(daemon: Arc<Daemon>, engine: Arc<SocketEngine>) -> tokio::task:
                 }
             }
         }
-    })
+    }))
 }
 
 /// 把端口映射候选并入 own_endpoints（替换既有 PortMap 项；无映射时移除）。
@@ -2940,28 +2959,11 @@ fn save_registration(
     info: &RegisteredInfo,
     coord_addr: &str,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    let path = state_dir.join(REGISTRATION_FILE);
-    let tmp = path.with_extension("tmp");
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(
-            serde_json::to_string_pretty(&RegistrationFile {
-                info: info.clone(),
-                coord_addr: Some(coord_addr.to_string()),
-            })?
-            .as_bytes(),
-        )?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    let body = serde_json::to_string_pretty(&RegistrationFile {
+        info: info.clone(),
+        coord_addr: Some(coord_addr.to_string()),
+    })?;
+    write_private_atomic(state_dir, REGISTRATION_FILE, body.as_bytes())
 }
 
 fn hex(bytes: &[u8]) -> String {
