@@ -1703,7 +1703,14 @@ except Exception:
   fi
 
   note "断言 2：coord 指标按原因计数（hz_coord_relayed_paths{reason=\"handshake_timeout\"} ≥ 1，黄点由该原因驱动）"
-  metrics=$(ip netns exec "$WAN_NS" curl -s http://127.0.0.1:9100/metrics || true)
+  # Health Report 每 30 秒一帧。断言 1 的 netcheck 往往在下一帧之前就命中，
+  # 此时 coord 里还是上一帧的 punch_pending；阻断必须保持到这一帧发出。
+  metrics=""
+  for i in $(seq 1 80); do # 最多 40 秒
+    metrics=$(ip netns exec "$WAN_NS" curl -s http://127.0.0.1:9100/metrics || true)
+    grep -q 'hz_coord_relayed_paths{reason="handshake_timeout"} [1-9]' <<<"$metrics" && break
+    sleep 0.5
+  done
   if grep -q 'hz_coord_relayed_paths{reason="handshake_timeout"} [1-9]' <<<"$metrics"; then
     pass "coord 指标已按原因计数 handshake_timeout"
   else
