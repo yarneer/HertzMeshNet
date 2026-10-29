@@ -67,6 +67,12 @@ enum Command {
     },
     /// 断开 HzNet（#81）：停数据面但保留注册与密钥；hz up 恢复
     Down,
+    /// 导出脱敏诊断包（#84）：status、netcheck、版本与 hzd 日志尾部
+    Diagnostics {
+        /// 写到文件（缺省输出到 stdout）
+        #[arg(short = 'o', long = "out")]
+        out: Option<PathBuf>,
+    },
     /// 探测一个对端：显示往返时延与当前路径（FR-12）
     Ping {
         /// 对端 Node Name 或 node id
@@ -190,6 +196,7 @@ async fn main() -> std::process::ExitCode {
         Command::Invite { command } => invite(command).await,
         Command::Node { command } => node(command).await,
         Command::Down => down().await,
+        Command::Diagnostics { out } => diagnostics(out).await,
         Command::Ping { node } => ping(node).await,
         Command::Netcheck { json } => netcheck(json).await,
     }
@@ -860,6 +867,59 @@ async fn down() -> std::process::ExitCode {
         Response::Error { error, .. } => {
             eprintln!("{error}");
             std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `hz diagnostics`（#84）：向 hzd 要一份脱敏诊断（status、netcheck、版本、
+/// hzd 日志最近 2000 行），pretty JSON 写到 -o 文件（0600）或 stdout。
+async fn diagnostics(out: Option<PathBuf>) -> std::process::ExitCode {
+    let socket = paths::socket_path();
+    let request = Request::new(5, "diagnostics", serde_json::json!({}));
+    let response = match ipc::request(&socket, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("无法连接 hzd：hzd 是否在运行？");
+            eprintln!("详细信息：{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = match response {
+        Response::Ok { result, .. } => result,
+        Response::Error { error, .. } => {
+            eprintln!("{error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let body = serde_json::to_string_pretty(&result).unwrap();
+    match out {
+        Some(path) => {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let write = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut file| file.write_all(body.as_bytes()));
+            match write {
+                Ok(()) => {
+                    println!(
+                        "诊断包已写入 {}（0600，已脱敏，可发给 Admin）",
+                        path.display()
+                    );
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("写入 {} 失败：{error}", path.display());
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        None => {
+            println!("{body}");
+            std::process::ExitCode::SUCCESS
         }
     }
 }

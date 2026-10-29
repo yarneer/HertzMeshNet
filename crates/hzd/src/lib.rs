@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+pub mod diagnostics;
 pub mod dns;
 pub mod launchd;
 pub mod ping;
@@ -429,47 +430,7 @@ async fn handle_request(
     keys: Arc<KeyStore>,
 ) -> Result<Value, String> {
     match request.method.as_str() {
-        "status" => {
-            let registration = daemon
-                .registration
-                .lock()
-                .expect("registration poisoned")
-                .clone();
-            let status = match registration {
-                Session::Registered(info) => NodeStatus::Registered(info),
-                Session::Expired(info) => NodeStatus::Expired(info),
-                Session::None => {
-                    return serde_json::to_value(NodeStatus::Unregistered)
-                        .map_err(|e| e.to_string());
-                }
-            };
-            let mut value = serde_json::to_value(status).map_err(|e| e.to_string())?;
-            value["peers"] =
-                serde_json::to_value(peers_view(&daemon)).map_err(|e| e.to_string())?;
-            value["desired_state"] = serde_json::json!(
-                daemon
-                    .desired_state
-                    .lock()
-                    .expect("desired state poisoned")
-                    .as_str()
-            );
-            value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
-            value["revoked"] = serde_json::json!(*daemon.revoked.lock().expect("revoked poisoned"));
-            // #25：最近一次运行中路由修复与引导 DNS 回退，供 hz status 汇报。
-            let route_repair = LAST_ROUTE_REPAIR
-                .lock()
-                .expect("route repair poisoned")
-                .clone();
-            value["diagnostics"] = serde_json::json!({
-                "route_repair": route_repair,
-                "dns_fallback": hz_core::outer_dns::global().last_fallback(),
-            });
-            value["policy"] = serde_json::json!({
-                "version": daemon.policy_gate.version(),
-                "dropped": daemon.policy_gate.dropped(),
-            });
-            Ok(value)
-        }
+        "status" => status_value(&daemon).await,
         "ping" => {
             let target = request
                 .params
@@ -481,6 +442,23 @@ async fn handle_request(
         "netcheck" => {
             let report = collect_netcheck(&daemon).await;
             serde_json::to_value(&report).map_err(|error| error.to_string())
+        }
+        "diagnostics" => {
+            // #84：普通 User 出问题时导出一份脱敏诊断文件发给 Admin。
+            let mut value = serde_json::json!({
+                "status": status_value(&daemon).await?,
+                "version": hz_core::version::node_version(),
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            });
+            value["netcheck"] =
+                serde_json::to_value(collect_netcheck(&daemon).await).map_err(|e| e.to_string())?;
+            let (tail, note) = diagnostics::collect_log_tail();
+            value["log_tail"] = serde_json::json!(tail);
+            if let Some(note) = note {
+                value["log_note"] = serde_json::json!(note);
+            }
+            Ok(value)
         }
         "down" => {
             // #81：停数据面（断 Network Map 流、停止上报、尽拆 TUN/DNS 接入），
@@ -829,6 +807,48 @@ async fn handle_request(
         }
         _ => Err(format!("unknown method: {}", request.method)),
     }
+}
+
+/// `status` IPC 方法的完整响应（diagnostics 复用同一形状，#84）。
+async fn status_value(daemon: &Daemon) -> Result<Value, String> {
+    let registration = daemon
+        .registration
+        .lock()
+        .expect("registration poisoned")
+        .clone();
+    // 未注册：保持只返回 {"registered": false}（既有 IPC 契约，daemon 测试锁定）。
+    let status = match registration {
+        Session::Registered(info) => NodeStatus::Registered(info),
+        Session::Expired(info) => NodeStatus::Expired(info),
+        Session::None => {
+            return serde_json::to_value(NodeStatus::Unregistered).map_err(|e| e.to_string());
+        }
+    };
+    let mut value = serde_json::to_value(status).map_err(|e| e.to_string())?;
+    value["peers"] = serde_json::to_value(peers_view(daemon)).map_err(|e| e.to_string())?;
+    value["desired_state"] = serde_json::json!(
+        daemon
+            .desired_state
+            .lock()
+            .expect("desired state poisoned")
+            .as_str()
+    );
+    value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
+    value["revoked"] = serde_json::json!(*daemon.revoked.lock().expect("revoked poisoned"));
+    // #25：最近一次运行中路由修复与引导 DNS 回退，供 hz status 汇报。
+    let route_repair = LAST_ROUTE_REPAIR
+        .lock()
+        .expect("route repair poisoned")
+        .clone();
+    value["diagnostics"] = serde_json::json!({
+        "route_repair": route_repair,
+        "dns_fallback": hz_core::outer_dns::global().last_fallback(),
+    });
+    value["policy"] = serde_json::json!({
+        "version": daemon.policy_gate.version(),
+        "dropped": daemon.policy_gate.dropped(),
+    });
+    Ok(value)
 }
 
 /// `hz up` / `hz login` 连接的 Coordination Server：显式 --coord → 注册时记下的
