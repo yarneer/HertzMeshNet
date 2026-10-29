@@ -116,44 +116,124 @@ async fn socket_is_connectable_by_any_local_user() {
     assert_eq!(mode, 0o666, "socket 权限应为 0666，实际 {mode:o}");
 }
 
-// #26：socket 对所有本机用户开放后，越权由按调用方 uid 的授权兜住：
-// 只读查询任何人可做；注册、Policy、Auth Key、Node 管理等只允许 root 或 hzd 同一用户。
-#[test]
-fn read_only_methods_are_open_to_any_local_user() {
-    let (hzd_uid, someone) = (0, 501);
-    assert!(ipc::authorize("status", someone, hzd_uid).is_ok());
-    assert!(ipc::authorize("ping", someone, hzd_uid).is_ok());
-    assert!(ipc::authorize("netcheck", someone, hzd_uid).is_ok());
+// ---------------------------------------------------------------------------
+// #82 / ADR-0011：IPC 权限三档。只读档任何人；成员档（交互式登录、邀请码、
+// down、subscribe、diagnostics、login_poll）给当前交互式会话用户；
+// 管理档（带 Auth Key 的 up、policy/authkey/invite/node）只给 root / 同 uid。
+// ---------------------------------------------------------------------------
+
+fn auth(method: &str, params: serde_json::Value, peer: u32, daemon: u32, console: Option<u32>) -> Result<(), String> {
+    ipc::authorize_request(&Request::new(1, method, params), peer, daemon, console)
 }
 
+/// 档 × 调用方全表：(方法, params, peer, console, 应放行)。
+/// daemon uid 固定 0（hzd 以 root 运行的生产形态），hzd 同 uid 场景单测。
 #[test]
-fn state_changing_methods_need_root_or_the_daemon_user() {
-    let (hzd_uid, someone) = (0, 501);
-    for method in [
-        "up",
-        "login_poll",
-        "policy_push",
-        "policy_get",
-        "policy_rollback",
-        "authkey_create",
-        "authkey_revoke",
-        "node_list",
-        "node_rename",
-        "node_delete",
-        "node_revoke",
-    ] {
-        let error = ipc::authorize(method, someone, hzd_uid).expect_err(method);
-        assert!(
-            error.contains("sudo"),
-            "{method} 的拒绝提示应引导用 sudo：{error}"
-        );
-        assert!(
-            ipc::authorize(method, 0, hzd_uid).is_ok(),
-            "root 可执行 {method}"
+fn permission_tiers_table() {
+    let daemon = 0u32;
+    let console_user = 501u32;
+    let other_user = 502u32;
+    let console = Some(console_user);
+    let no_console = None;
+    let no_params = json!({});
+    let auth_key = json!({"auth_key": "HZ-..."});
+    let invite = json!({"invite_code": "HZ-XXXX-XXXX"});
+
+    let cases: &[(&str, serde_json::Value, u32, Option<u32>, bool)] = &[
+        // 只读档：任何本机用户，与 console 无关。
+        ("status", no_params.clone(), other_user, no_console, true),
+        ("status", no_params.clone(), other_user, console, true),
+        ("ping", no_params.clone(), other_user, no_console, true),
+        ("netcheck", no_params.clone(), other_user, no_console, true),
+        // 成员档：console 用户放行；其他用户拒绝；console 取不到时退化拒绝。
+        ("up", no_params.clone(), console_user, console, true),
+        ("up", invite.clone(), console_user, console, true),
+        ("up", no_params.clone(), other_user, console, false),
+        ("up", no_params.clone(), console_user, no_console, false),
+        ("login_poll", no_params.clone(), console_user, console, true),
+        ("login_poll", no_params.clone(), other_user, console, false),
+        ("down", no_params.clone(), console_user, console, true),
+        ("down", no_params.clone(), other_user, console, false),
+        ("subscribe", no_params.clone(), console_user, console, true),
+        ("diagnostics", no_params.clone(), console_user, console, true),
+        // 管理档：up 带 Auth Key 即使 console 用户也拒绝（提示 sudo）。
+        ("up", auth_key.clone(), console_user, console, false),
+        ("up", auth_key.clone(), console_user, no_console, false),
+        ("policy_push", no_params.clone(), console_user, console, false),
+        ("policy_get", no_params.clone(), console_user, console, false),
+        ("authkey_create", no_params.clone(), console_user, console, false),
+        ("invite_create", no_params.clone(), console_user, console, false),
+        ("node_list", no_params.clone(), console_user, console, false),
+        // 未知方法归管理档：不因三档放开。
+        ("future_admin_thing", no_params.clone(), console_user, console, false),
+        // root 与 hzd 同 uid 对所有档放行。
+        ("up", auth_key.clone(), 0, no_console, true),
+        ("policy_push", no_params.clone(), 0, no_console, true),
+        ("up", no_params.clone(), daemon, no_console, true),
+    ];
+    for (method, params, peer, console, allowed) in cases {
+        let outcome = auth(method, params.clone(), *peer, daemon, *console);
+        assert_eq!(
+            outcome.is_ok(),
+            *allowed,
+            "{method}({params}) peer={peer} console={console:?} 期望放行={allowed}，实际 {outcome:?}"
         );
     }
-    // 开发/测试场景 hzd 以普通用户运行：同一用户可执行全部操作。
-    assert!(ipc::authorize("authkey_create", 501, 501).is_ok());
+}
+
+/// root 与 hzd 同 uid（开发/测试形态：hzd 以普通用户运行）始终放行，
+/// 即便完全取不到 console 用户。
+#[test]
+fn root_and_daemon_user_pass_every_tier_without_console() {
+    let daemon = 501u32;
+    for method in ["up", "down", "subscribe", "diagnostics", "login_poll", "policy_push"] {
+        let params = if method == "up" { json!({"auth_key": "HZ-..."}) } else { json!({}) };
+        assert!(
+            auth(method, params, 0, daemon, None).is_ok(),
+            "root 可执行 {method}"
+        );
+        assert!(
+            auth(method, json!({}), daemon, daemon, None).is_ok(),
+            "hzd 同 uid 可执行 {method}"
+        );
+    }
+}
+
+/// 拒绝文案区分「本机登录会话」与「sudo」：成员档引导登录会话，
+/// 管理档（含带 Auth Key 的 up）引导 sudo。
+#[test]
+fn rejection_messages_distinguish_console_session_from_sudo() {
+    let (daemon, console_user, other) = (0u32, 501u32, 502u32);
+    let console = Some(console_user);
+
+    let member = auth("down", json!({}), other, daemon, console).unwrap_err();
+    assert!(
+        member.contains("登录会话") && member.contains("sudo"),
+        "成员档拒绝应同时说明登录会话与 sudo 两条路：{member}"
+    );
+    let member_no_console = auth("up", json!({}), console_user, daemon, None).unwrap_err();
+    assert!(member_no_console.contains("登录会话"), "{member_no_console}");
+
+    let admin = auth("up", json!({"auth_key": "HZ-..."}), console_user, daemon, console).unwrap_err();
+    assert!(
+        admin.contains("sudo") && !admin.contains("登录会话"),
+        "管理档拒绝应只引导 sudo：{admin}"
+    );
+    let admin_unknown = auth("policy_push", json!({}), other, daemon, console).unwrap_err();
+    assert!(admin_unknown.contains("sudo") && !admin_unknown.contains("登录会话"), "{admin_unknown}");
+}
+
+/// loginctl 会话清单 → 交互式用户：带 seat 的会话命中，SSH/后台会话排除。
+#[cfg(target_os = "linux")]
+#[test]
+fn console_uid_picks_the_first_seated_session() {
+    use hz_core::ipc::console_uid_from_loginctl;
+    // 每行：SESSION UID USER SEAT TTY。
+    let sessions = " 2 1000 alice seat0 tty2\n 3 1001 bob - ssh\n 4 1002 carol - \n";
+    assert_eq!(console_uid_from_loginctl(sessions), Some(1000));
+    // 只有远程 / 无 seat 会话：取不到（成员档退化）。
+    assert_eq!(console_uid_from_loginctl(" 3 1001 bob - ssh\n"), None);
+    assert_eq!(console_uid_from_loginctl(""), None);
 }
 
 // ---------------------------------------------------------------------------

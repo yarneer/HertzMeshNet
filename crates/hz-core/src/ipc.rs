@@ -139,18 +139,108 @@ impl Drop for SocketGuard {
     }
 }
 
-/// 任何本机用户都可发起的只读请求（#26）。其余请求以本 Node 的身份改动
-/// 状态或读取 Policy、Node 列表等管理信息，只允许 root 或与 hzd 同一用户。
+/// 任何本机用户都可发起的只读请求（#26）。
 const READ_ONLY_METHODS: &[&str] = &["status", "ping", "netcheck"];
 
-/// 按调用方 uid 判定能否执行 `method`：只读请求放行；其余要求调用方是
-/// root 或与 hzd 同一用户（hzd 以普通用户运行的开发与测试场景）。
-pub fn authorize(method: &str, peer_uid: u32, daemon_uid: u32) -> Result<(), String> {
+/// 成员档方法（#82 / ADR-0011）：坐在机器前的交互式会话用户可执行，
+/// 无需 sudo。`up` 特殊：不带 Auth Key（交互式登录与邀请码）才进这一档，
+/// 方法本身不列在这里。列表允许包含尚未实现的方法名（实现前它们只会在
+/// handler 处返回未知方法，不影响权限语义）。
+const MEMBER_METHODS: &[&str] = &["login_poll", "down", "subscribe", "diagnostics"];
+
+/// 判定 `up` 请求是否携带 Auth Key（携带则升管理档）。邀请码不算：
+/// 短码本来就是发给成员的。
+fn request_carries_auth_key(request: &Request) -> bool {
+    request
+        .params
+        .get("auth_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty())
+}
+
+/// IPC 权限三档判定（#82 / 规格 §3.2，纯函数）：
+///
+/// - 只读档（`status` / `ping` / `netcheck`）：任何本机用户。
+/// - 成员档（不带 Auth Key 的 `up`、`login_poll` / `down` / `subscribe` /
+///   `diagnostics`）：当前交互式会话用户（`console_uid` 命中 `peer_uid`），
+///   或 root / 与 hzd 同 uid。
+/// - 管理档（带 Auth Key 的 `up`、`policy_*` / `authkey_*` / `invite_*` /
+///   `node_*` 及未知方法）：仅 root / 与 hzd 同 uid。
+///
+/// `console_uid` 为 None（取不到交互式会话，如无 seat 的服务器）时成员档
+/// 退化为仅 root / 同 uid。拒绝文案区分「在本机登录会话中执行」与「sudo」。
+pub fn authorize_request(
+    request: &Request,
+    peer_uid: u32,
+    daemon_uid: u32,
+    console_uid: Option<u32>,
+) -> Result<(), String> {
+    let method = request.method.as_str();
     if READ_ONLY_METHODS.contains(&method) || peer_uid == 0 || peer_uid == daemon_uid {
-        Ok(())
+        return Ok(());
+    }
+    let member_method = method == "up" && !request_carries_auth_key(request)
+        || MEMBER_METHODS.contains(&method);
+    if member_method {
+        if console_uid == Some(peer_uid) {
+            Ok(())
+        } else {
+            Err(format!(
+                "`{method}` 需要在本机的登录会话中执行（坐在机器前登录的账号），或用 sudo 运行"
+            ))
+        }
     } else {
         Err(format!("`{method}` 需要管理员权限，请用 sudo 执行"))
     }
+}
+
+/// 当前交互式会话用户（#82）：macOS 取 `/dev/console` 属主 uid（与
+/// SCDynamicStore 的 ConsoleUser 一致）；Linux 取 loginctl 里带 seat 的
+/// 会话 uid；取不到返回 None，成员档随之退化为仅 root / 同 uid。
+pub fn current_console_uid() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/dev/console").ok().map(|meta| meta.uid())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        console_uid_from_loginctl(&loginctl_sessions().unwrap_or_default())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// `loginctl list-sessions --no-legend` 的输出（无 loginctl / 非 systemd
+/// 环境返回 None）。每行：SESSION UID USER SEAT TTY。
+#[cfg(target_os = "linux")]
+fn loginctl_sessions() -> Option<String> {
+    let output = std::process::Command::new("loginctl")
+        .args(["list-sessions", "--no-legend"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 会话清单 → 交互式会话用户：取第一个带 seat（图形 / 控制台）会话的 uid。
+/// SSH 与后台会话没有 seat，天然排除。
+#[cfg(target_os = "linux")]
+pub(crate) fn console_uid_from_loginctl(sessions: &str) -> Option<u32> {
+    sessions
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // SESSION UID USER SEAT [TTY]，seat 为第 4 列（索引 3），非 "-"。
+            let uid: u32 = fields.get(1)?.parse().ok()?;
+            let seat = *fields.get(3)?;
+            (!seat.is_empty() && seat != "-").then_some(uid)
+        })
+        .next()
 }
 
 async fn handle_connection(
@@ -161,6 +251,9 @@ async fn handle_connection(
     let peer_uid = stream.peer_cred()?.uid();
     // SAFETY: geteuid 无副作用、不会失败。
     let daemon_uid = unsafe { libc::geteuid() };
+    // 交互式会话用户每连接探测一次（macOS 是一次 stat；Linux 走 loginctl，
+    // IPC 连接不频繁，无需缓存）。
+    let console_uid = current_console_uid();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -177,14 +270,14 @@ async fn handle_connection(
         if let Some(stream_handler) = streams.get(&request.method).cloned() {
             // 流式方法不受一问一答的生命周期约束：连接转给推送循环，本循环
             // 不再读取后续请求（一条流式连接只服务一个请求）。
-            if let Err(error) = authorize(&request.method, peer_uid, daemon_uid) {
+            if let Err(error) = authorize_request(&request, peer_uid, daemon_uid, console_uid) {
                 let response = Response::Error { id, error };
                 write_response_capped(reader.get_mut(), response).await?;
                 return Ok(());
             }
             return stream_connection(reader, request, stream_handler).await;
         }
-        let outcome = match authorize(&request.method, peer_uid, daemon_uid) {
+        let outcome = match authorize_request(&request, peer_uid, daemon_uid, console_uid) {
             Ok(()) => handler(request).await,
             Err(error) => Err(error),
         };
