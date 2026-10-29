@@ -155,3 +155,236 @@ fn state_changing_methods_need_root_or_the_daemon_user() {
     // 开发/测试场景 hzd 以普通用户运行：同一用户可执行全部操作。
     assert!(ipc::authorize("authkey_create", 501, 501).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// #95：一请求多响应。以下用测试专用的流式方法覆盖验收项。
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc as StdArc;
+
+use hz_core::ipc::{serve_with, stream_handler};
+
+/// 启动带流式方法的服务：普通方法恒回 `{"single":true}`；
+/// `test.stream` 按传入闭包的行为推送。
+async fn serve_streaming<F, Fut>(socket: &Path, stream: F) -> StreamsProbe
+where
+    F: Fn(ipc::Request, tokio::sync::mpsc::Sender<Response>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut streams = HashMap::new();
+    streams.insert("test.stream".to_string(), stream_handler(stream));
+    let socket = socket.to_path_buf();
+    let server = tokio::spawn(async move {
+        let _ = serve_with(
+            &socket,
+            handler(|_request: ipc::Request| async { Ok(json!({"single": true})) }),
+            Arc::new(streams),
+        )
+        .await;
+    });
+    StreamsProbe { server }
+}
+
+struct StreamsProbe {
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl StreamsProbe {
+    async fn stop(self) {
+        self.server.abort();
+        let _ = self.server.await;
+    }
+}
+
+/// 流式方法对同一请求 id 逐行推送多条响应，流结束后连接收尾（通道关闭）。
+#[tokio::test]
+async fn streaming_method_pushes_multiple_lines_until_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let probe = serve_streaming(&socket, |request, sender| async move {
+        for step in 1..=3 {
+            let _ = sender
+                .send(Response::Ok {
+                    id: request.id,
+                    result: json!({ "step": step }),
+                })
+                .await;
+        }
+    })
+    .await;
+    wait_for_socket(&socket).await;
+
+    let mut rx = ipc::request_stream(&socket, Request::new(7, "test.stream", json!({})))
+        .await
+        .unwrap();
+    let mut steps = Vec::new();
+    while let Some(response) = rx.recv().await {
+        match response {
+            Response::Ok { id, result } => {
+                assert_eq!(id, 7, "每行都携带同一请求 id");
+                steps.push(result["step"].as_u64().unwrap());
+            }
+            Response::Error { error, .. } => panic!("unexpected error: {error}"),
+        }
+    }
+    probe.stop().await;
+    assert_eq!(steps, vec![1, 2, 3]);
+    // 流结束后通道关闭（recv 已返回 None 才能走到这里）。
+}
+
+/// 客户端断开时服务端停止推送并释放资源，同一 hzd 的其他连接不受影响。
+#[tokio::test]
+async fn client_disconnect_stops_the_stream_and_frees_the_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let finished = StdArc::new(AtomicBool::new(false));
+    let probe_finished = finished.clone();
+    let probe = serve_streaming(&socket, move |_request, sender| {
+        let finished = probe_finished.clone();
+        async move {
+            // 先推一条，然后持续推送；客户端在第一条后断开，
+            // 后续 send 失败必须让 handler 退出（finished 置位）。
+            let _ = sender.send(Response::Ok { id: 1, result: json!({"step": 1}) }).await;
+            for step in 2..1000u64 {
+                if sender
+                    .send(Response::Ok {
+                        id: 1,
+                        result: json!({ "step": step }),
+                    })
+                    .await
+                    .is_err()
+                {
+                    finished.store(true, Ordering::SeqCst);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    })
+    .await;
+    wait_for_socket(&socket).await;
+
+    let mut rx = ipc::request_stream(&socket, Request::new(1, "test.stream", json!({})))
+        .await
+        .unwrap();
+    let first = rx.recv().await.expect("应收到第一条");
+    assert!(matches!(first, Response::Ok { .. }));
+    drop(rx); // 客户端断开
+
+    for _ in 0..100 {
+        if finished.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "客户端断开后 handler 应停止推送并退出"
+    );
+
+    // 同一 hzd 的其他连接不受影响：普通一问一答照常。
+    let response = ipc::request(&socket, Request::new(2, "status", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response,
+        Response::Ok {
+            id: 2,
+            result: json!({"single": true})
+        }
+    );
+    probe.stop().await;
+}
+
+/// 1 MiB 单行上限对流中每一行同样生效：超限行断开连接，其后的行到不了对端。
+#[tokio::test]
+async fn oversized_stream_line_is_rejected_per_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let probe = serve_streaming(&socket, |_request, sender| async move {
+        let _ = sender
+            .send(Response::Ok {
+                id: 1,
+                result: json!({"step": 1}),
+            })
+            .await;
+        // 超过 1 MiB 的单行：写侧必须拒绝（客户端侧 read_line_capped 也会拦）。
+        let _ = sender
+            .send(Response::Ok {
+                id: 1,
+                result: json!({ "blob": "x".repeat(2 * 1024 * 1024) }),
+            })
+            .await;
+        let _ = sender
+            .send(Response::Ok {
+                id: 1,
+                result: json!({"step": 3}),
+            })
+            .await;
+    })
+    .await;
+    wait_for_socket(&socket).await;
+
+    let mut rx = ipc::request_stream(&socket, Request::new(1, "test.stream", json!({})))
+        .await
+        .unwrap();
+    let mut steps = Vec::new();
+    while let Some(response) = rx.recv().await {
+        if let Response::Ok { result, .. } = response {
+            steps.push(result["step"].as_u64().unwrap_or(0));
+        }
+    }
+    probe.stop().await;
+    assert_eq!(
+        steps,
+        vec![1],
+        "超限行之后的响应不应到达客户端，实际收到 {steps:?}"
+    );
+}
+
+/// 流式方法不受单次请求 30 秒超时约束：推送前先等待也能收到
+///（对照 `request` 的 REQUEST_TIMEOUT 包装，这里没有整体限时）；
+/// 同一服务上的一问一答方法行为不变。
+#[tokio::test]
+async fn streaming_waits_are_not_bounded_by_the_single_shot_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hzd.sock");
+    let probe = serve_streaming(&socket, |request, sender| async move {
+        // 比 IPC 测试通常的节奏长、足以证明没有短超时截断；不真等 30s。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = sender
+            .send(Response::Ok {
+                id: request.id,
+                result: json!({"after": "wait"}),
+            })
+            .await;
+    })
+    .await;
+    wait_for_socket(&socket).await;
+
+    let mut rx = ipc::request_stream(&socket, Request::new(9, "test.stream", json!({})))
+        .await
+        .unwrap();
+    let response = rx.recv().await.expect("等待后的推送应到达");
+    assert!(
+        matches!(response, Response::Ok { id: 9, .. }),
+        "{response:?}"
+    );
+    drop(rx);
+
+    let single = ipc::request(&socket, Request::new(10, "status", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        single,
+        Response::Ok {
+            id: 10,
+            result: json!({"single": true})
+        },
+        "一问一答方法与流式方法并存时行为不变"
+    );
+    probe.stop().await;
+}
