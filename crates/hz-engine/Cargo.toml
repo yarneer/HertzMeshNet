@@ -9,11 +9,16 @@ license.workspace = true
 hz-core.workspace = true
 hz-proto.workspace = true
 anyhow.workspace = true
+socket2.workspace = true
 rand_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies])
 chrono.workspace = true
 hz-coord.workspace = true
 tempfile.workspace = true

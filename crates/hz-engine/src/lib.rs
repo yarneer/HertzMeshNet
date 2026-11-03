@@ -77,6 +77,16 @@ pub struct EngineConfig {
     pub portmap_gateway: Option<String>,
     /// HZD_DNS_RESOLVCONF_FALLBACK：桌面系统 DNS 接入的 resolv.conf 退路。
     pub dns_resolvconf_fallback: bool,
+    /// DNS 应答器转发模式（#98 规格 §5.2，仅 Android 用）：后缀外查询经
+    /// protect 的 socket 转发给 `Platform::system_dns()`；桌面保持分域接管
+    /// （false，后缀外 REFUSED）。
+    pub dns_forward: bool,
+    /// WireGuard persistent keepalive 间隔（秒；0 = 桌面缺省 8 秒）。
+    /// Android 档位 25 秒（#98 规格 §5.3）。
+    pub wg_keepalive_secs: u16,
+    /// coord / Relay 长连接 HTTP/2 keepalive 间隔（秒；0 = 桌面缺省 20 秒）。
+    /// Android 档位 60 秒（#98 规格 §5.3）。
+    pub coord_keepalive_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -95,6 +105,9 @@ impl Default for EngineConfig {
             portmap_enabled: true,
             portmap_gateway: None,
             dns_resolvconf_fallback: false,
+            dns_forward: false,
+            wg_keepalive_secs: 0,
+            coord_keepalive_secs: 0,
         }
     }
 }
@@ -525,6 +538,9 @@ impl Engine {
         }
         hz_core::dns::set_dns_suffix(config.dns_suffix.clone());
         hz_core::outer_dns::set_bootstrap_dns(config.bootstrap_dns.clone());
+        // keepalive 档位（#98）：桌面缺省 8s / 20s，Android 25s / 60s。
+        hz_core::wire::set_persistent_keepalive_secs(config.wg_keepalive_secs);
+        hz_core::coord_client::set_http2_keepalive_secs(config.coord_keepalive_secs);
 
         let keys = Arc::new(KeyStore::load_or_create(&state_dir)?);
         tracing::info!(
@@ -1496,7 +1512,11 @@ async fn start_dataplane(
     // 测试环境绑定失败只告警，控制面照常。系统 DNS 接入（systemd-resolved
     // 分域、/etc/resolver、resolv.conf 退路）是桌面 Platform.establish 的
     // 职责（hzd），Android 声明 dns_v4 即可。
-    if let Err(error) = dns::ensure_responder(daemon.map_cache.clone(), dns_v4).await {
+    let forward = daemon
+        .config
+        .dns_forward
+        .then(|| dns::Forwarding::new(daemon.platform.clone()));
+    if let Err(error) = dns::ensure_responder(daemon.map_cache.clone(), dns_v4, forward).await {
         tracing::warn!(%error, "dns responder unavailable");
     }
     tasks.push(spawn_endpoint_collector(

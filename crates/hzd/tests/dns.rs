@@ -89,6 +89,7 @@ async fn udp_answers_a_and_aaaa_with_map_literals() {
         "127.0.0.1:0".parse().unwrap(),
         cache,
         "hznet.internal".to_string(),
+        None,
     )
     .await
     .unwrap();
@@ -134,6 +135,7 @@ async fn udp_answers_follow_live_map_updates() {
         "127.0.0.1:0".parse().unwrap(),
         cache.clone(),
         "hznet.internal".to_string(),
+        None,
     )
     .await
     .unwrap();
@@ -173,6 +175,7 @@ async fn configured_suffix_switches_authority() {
         "127.0.0.1:0".parse().unwrap(),
         cache,
         "corp.mesh".to_string(),
+        None,
     )
     .await
     .unwrap();
@@ -200,6 +203,7 @@ async fn tcp_answers_framed_queries() {
         "127.0.0.1:0".parse().unwrap(),
         cache,
         "hznet.internal".to_string(),
+        None,
     )
     .await
     .unwrap();

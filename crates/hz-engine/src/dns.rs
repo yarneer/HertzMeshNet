@@ -3,16 +3,25 @@
 //! 实时快照。线格式按 RFC 1035 手写编码（只做应答 A/AAAA +
 //! REFUSED/NXDOMAIN，不递归），垃圾报文回 FORMERR。
 //! 桌面的系统接入（systemd-resolved 分域、/etc/resolver、resolv.conf 退路）
-//! 留在 hzd 的 Platform 实现；Android 由 VpnService 声明 DNS 服务器，#98
-//! 在此之上加"后缀外转发"模式。
+//! 留在 hzd 的 Platform 实现；Android 由 VpnService 声明 DNS 服务器。
+//!
+//! #98 转发模式（规格 §5.2，仅 Android）：VpnService 一旦声明 DNS 服务器，
+//! 走 VPN 网络的 App 的全部查询都发到本应答器——后缀外查询经
+//! `Platform::protect` 的 socket 原样转发给 `Platform::system_dns()` 的上游
+//! （UDP 优先、TC 截断改 TCP、依次尝试、全失败 SERVFAIL）；桌面不开转发
+//! 模式，后缀外照旧 REFUSED（分域接管）。
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 use hz_core::dns::DNS_PORT;
 use hz_core::map::{MapNode, NetworkMapCache};
+
+use crate::platform::Platform;
 
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
@@ -209,11 +218,182 @@ async fn write_tcp_message(
     stream.write_all(&framed).await
 }
 
+const RCODE_SERVFAIL: u16 = 2;
+
+/// 单个上游转发的超时（#98：依次尝试各服务器，总预算受此约束）。
+pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 转发模式的上游配置：经 Platform 拿服务器列表（网络切换后自动跟上）
+/// 并 protect 转发 socket（不进本 HzNet 的 TUN）。
+#[derive(Clone)]
+pub struct Forwarding {
+    pub platform: Arc<dyn Platform>,
+    pub timeout: Duration,
+    /// 上游端口（生产恒为 53；测试用假上游的随机端口注入）。
+    pub upstream_port: u16,
+}
+
+impl Forwarding {
+    /// 生产构造：标准 DNS 端口。
+    pub fn new(platform: Arc<dyn Platform>) -> Self {
+        Self {
+            platform,
+            timeout: FORWARD_TIMEOUT,
+            upstream_port: DNS_PORT,
+        }
+    }
+
+    fn upstream(&self, server: IpAddr) -> SocketAddr {
+        SocketAddr::new(server, self.upstream_port)
+    }
+}
+
+/// 查询 id（报文头前两字节）；短报文取 0。
+fn query_id_of(message: &[u8]) -> u16 {
+    message
+        .get(..2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .unwrap_or(0)
+}
+
+/// 应答的 TC（截断）位。
+fn is_truncated(message: &[u8]) -> bool {
+    message.get(2).is_some_and(|flags| flags & 0x02 != 0)
+}
+
+/// 仅含 id 的 SERVFAIL 头（#98：上游全部不可达时）。
+fn servfail(id: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&(FLAG_QR | RCODE_SERVFAIL).to_be_bytes());
+    out.extend_from_slice(&[0; 8]);
+    out
+}
+
+/// 经 protect 的 UDP socket 向上游转发一次查询，等待 id 匹配的应答。
+async fn forward_udp(
+    server: IpAddr,
+    query: &[u8],
+    forward: &Forwarding,
+) -> std::io::Result<Vec<u8>> {
+    let bind_addr: SocketAddr = if server.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+    let _ = forward.platform.protect(socket.as_raw_fd());
+    let upstream = forward.upstream(server);
+    socket.send_to(query, upstream).await?;
+    let qid = query_id_of(query);
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let (len, from) = tokio::time::timeout(forward.timeout, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "上游转发超时"))??;
+        if from == upstream && query_id_of(&buf[..len]) == qid {
+            return Ok(buf[..len].to_vec());
+        }
+    }
+}
+
+/// 经 protect 的 TCP 连接向上游转发（UDP 应答 TC 截断时改走，RFC 1035 §4.2.2）。
+async fn forward_tcp(
+    server: IpAddr,
+    query: &[u8],
+    forward: &Forwarding,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let upstream = forward.upstream(server);
+    let socket = socket2::Socket::new(
+        if upstream.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    // protect 必须在 connect(2) 之前（Android VpnService.protect 的要求）。
+    let _ = forward.platform.protect(socket.as_raw_fd());
+    socket.set_nonblocking(true)?;
+    match socket.connect(&socket2::SockAddr::from(upstream)) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {}
+        Err(error) => return Err(error),
+    }
+    let mut stream = tokio::net::TcpStream::from_std(socket.into())?;
+    stream.writable().await?;
+    if let Some(error) = stream.take_error()? {
+        return Err(error);
+    }
+    stream
+        .write_all(&(query.len() as u16).to_be_bytes())
+        .await?;
+    stream.write_all(query).await?;
+    let mut prefix = [0u8; 2];
+    tokio::time::timeout(forward.timeout, stream.read_exact(&mut prefix)).await??;
+    let len = u16::from_be_bytes(prefix) as usize;
+    let mut message = vec![0u8; len];
+    tokio::time::timeout(forward.timeout, stream.read_exact(&mut message)).await??;
+    Ok(message)
+}
+
+/// 依次尝试上游：UDP 优先，TC 截断改 TCP（TCP 也失败退回截断应答）；
+/// 全部失败返回 None（调用方回 SERVFAIL）。服务器列表由调用方每轮现取
+/// （`Platform::system_dns`，网络切换后自动用新列表）。
+async fn resolve_via_upstream(
+    servers: &[IpAddr],
+    query: &[u8],
+    forward: &Forwarding,
+) -> Option<Vec<u8>> {
+    for server in servers {
+        if let Ok(answer) = forward_udp(*server, query, forward).await {
+            if is_truncated(&answer) {
+                if let Ok(full) = forward_tcp(*server, query, forward).await {
+                    return Some(full);
+                }
+                return Some(answer);
+            }
+            return Some(answer);
+        }
+    }
+    None
+}
+
+/// 一条查询的完整应答决策：后缀内本地应答；后缀外按转发模式转发
+/// （未启用则 REFUSED，与桌面行为一致）。
+async fn respond(
+    query: &[u8],
+    nodes: &[MapNode],
+    suffix: &str,
+    forward: Option<&Forwarding>,
+) -> Vec<u8> {
+    let question = match parse_query(query) {
+        Ok(question) => question,
+        Err(error_id) => return formerr(error_id),
+    };
+    if matches!(decide(&question, nodes, suffix), Decision::Refused) {
+        if let Some(forward) = forward {
+            let servers = forward.platform.system_dns();
+            if servers.is_empty() {
+                return servfail(question.id);
+            }
+            if let Some(answer) = resolve_via_upstream(&servers, query, forward).await {
+                return answer;
+            }
+            return servfail(question.id);
+        }
+    }
+    build_response(query, nodes, suffix)
+}
+
 /// 在指定地址起 UDP + TCP 应答循环（测试可用 127.0.0.1:0），返回实际绑定地址。
 pub async fn spawn_responder(
     addr: SocketAddr,
     cache: Arc<NetworkMapCache>,
     suffix: String,
+    forward: Option<Forwarding>,
 ) -> anyhow::Result<SocketAddr> {
     let udp = tokio::net::UdpSocket::bind(addr)
         .await
@@ -227,13 +407,15 @@ pub async fn spawn_responder(
     tokio::spawn({
         let cache = cache.clone();
         let suffix = suffix.clone();
+        let forward = forward.clone();
         async move {
             let mut buf = vec![0u8; 4096];
             loop {
                 let Ok((len, peer)) = udp.recv_from(&mut buf).await else {
                     continue;
                 };
-                let response = build_response(&buf[..len], &cache.snapshot(), &suffix);
+                let response =
+                    respond(&buf[..len], &cache.snapshot(), &suffix, forward.as_ref()).await;
                 let _ = udp.send_to(&response, peer).await;
             }
         }
@@ -249,9 +431,11 @@ pub async fn spawn_responder(
                 };
                 let cache = cache.clone();
                 let suffix = suffix.clone();
+                let forward = forward.clone();
                 tokio::spawn(async move {
                     while let Some(query) = read_tcp_message(&mut stream).await {
-                        let response = build_response(&query, &cache.snapshot(), &suffix);
+                        let response =
+                            respond(&query, &cache.snapshot(), &suffix, forward.as_ref()).await;
                         if write_tcp_message(&mut stream, &response).await.is_err() {
                             return;
                         }
@@ -269,13 +453,17 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 引擎数据面拉起时的应答器入口（幂等）：在 `(dns_v4, 53)` 上起 UDP + TCP
 /// 应答循环。绑定失败（无 root / 辅助地址未挂）由调用方记告警，控制面照常。
-pub async fn ensure_responder(cache: Arc<NetworkMapCache>, dns_v4: Ipv4Addr) -> anyhow::Result<()> {
+pub async fn ensure_responder(
+    cache: Arc<NetworkMapCache>,
+    dns_v4: Ipv4Addr,
+    forward: Option<Forwarding>,
+) -> anyhow::Result<()> {
     if STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
     let suffix = hz_core::dns::dns_suffix();
     let addr = SocketAddr::from((dns_v4, DNS_PORT));
-    match spawn_responder(addr, cache, suffix.clone()).await {
+    match spawn_responder(addr, cache, suffix.clone(), forward).await {
         Ok(bound) => {
             tracing::info!(%bound, suffix = %suffix, "local dns responder started");
             Ok(())

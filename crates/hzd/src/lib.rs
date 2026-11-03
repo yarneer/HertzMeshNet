@@ -72,6 +72,10 @@ pub fn config_from_env() -> EngineConfig {
             std::env::var("HZD_DNS_RESOLVCONF_FALLBACK").as_deref(),
             Ok("1") | Ok("true")
         ),
+        // 桌面不开 DNS 转发（分域接管）也不改 keepalive 档位（#98）。
+        dns_forward: false,
+        wg_keepalive_secs: 0,
+        coord_keepalive_secs: 0,
     }
 }
 

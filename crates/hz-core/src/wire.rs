@@ -21,9 +21,31 @@ use crate::stun::StunRouter;
 /// WireGuard 数据报与 IP 包的统一缓冲上限（UDP 数据报上限 64 KiB）。
 const MAX_DATAGRAM: usize = 65536;
 
-/// boringtun 定期保活间隔（秒）。必须小于直连失效判据
+/// boringtun 定期保活间隔的桌面缺省（秒）。必须小于直连失效判据
 /// （[`crate::path::DIRECT_RX_FRESH`]），空闲直连靠保活维持新鲜度。
-const KEEPALIVE_SECS: u16 = 8;
+/// 引擎经 [`set_persistent_keepalive_secs`] 注入移动端档位（#98：
+/// Android 25 秒，运营商 UDP NAT 映射超时通常大于 30 秒）。
+const DEFAULT_KEEPALIVE_SECS: u16 = 8;
+
+static PERSISTENT_KEEPALIVE_SECS: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(DEFAULT_KEEPALIVE_SECS);
+
+/// 注入 WireGuard persistent keepalive 间隔（引擎启动时调用；0 恢复缺省）。
+pub fn set_persistent_keepalive_secs(secs: u16) {
+    PERSISTENT_KEEPALIVE_SECS.store(
+        if secs == 0 {
+            DEFAULT_KEEPALIVE_SECS
+        } else {
+            secs
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// 当前生效的 persistent keepalive 间隔。
+pub fn persistent_keepalive_secs() -> u16 {
+    PERSISTENT_KEEPALIVE_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// WireGuard 消息类型字节。
 const MSG_HANDSHAKE_INIT: u8 = 1;
@@ -189,7 +211,7 @@ impl Engine {
                 self.own_secret.clone(),
                 PublicKey::from(spec.node_key_pub),
                 None,
-                Some(KEEPALIVE_SECS),
+                Some(persistent_keepalive_secs()),
                 self.next_local_index,
                 None,
             );

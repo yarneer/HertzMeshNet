@@ -193,6 +193,48 @@ where
     panic!("条件在 {secs} 秒内未满足");
 }
 
+/// keepalive 档位（#98 规格 §5.3）：EngineConfig 注入 WireGuard persistent
+/// keepalive 与 coord HTTP/2 keepalive——桌面缺省 8s / 20s，Android 25s / 60s。
+#[tokio::test]
+async fn keepalive_tiers_from_engine_config_apply() {
+    let _serial = SERIALIZE
+        .get_or_init(tokio::sync::Mutex::default)
+        .lock()
+        .await;
+    let platform = FakePlatform::new();
+    let dir = tempfile::tempdir().unwrap();
+    let android = EngineConfig {
+        wg_keepalive_secs: 25,
+        coord_keepalive_secs: 60,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::start(
+        android,
+        EngineHooks::default(),
+        platform,
+        dir.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hz_core::wire::persistent_keepalive_secs(), 25);
+    assert_eq!(hz_core::coord_client::http2_keepalive_secs(), 60);
+    drop(engine);
+
+    // 桌面缺省：0 = 8s / 20s。
+    let platform = FakePlatform::new();
+    let dir = tempfile::tempdir().unwrap();
+    Engine::start(
+        EngineConfig::default(),
+        EngineHooks::default(),
+        platform,
+        dir.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hz_core::wire::persistent_keepalive_secs(), 8);
+    assert_eq!(hz_core::coord_client::http2_keepalive_secs(), 20);
+}
+
 /// establish 收到的 TunSpec：地址来自注册授予、段与 DNS 应答地址与 coord
 /// 下发一致（引擎不得把别的网段交给平台，规格 §5.1）。
 #[tokio::test]
