@@ -1,6 +1,6 @@
 # HertzMeshNet
 
-**私有部署的点对点组网系统**：让一个组织内分散在各种 NAT 后面的 Linux / macOS 机器，组成一张彼此可直接寻址的加密虚拟网络（HzNet）。能直连时直连，不能直连时经 Relay 中转，访问范围受 Policy 约束。
+**私有部署的点对点组网系统**：让一个组织内分散在各种 NAT 后面的 Linux / macOS 机器与 Android 手机，组成一张彼此可直接寻址的加密虚拟网络（HzNet）。能直连时直连，不能直连时经 Relay 中转，访问范围受 Policy 约束。v0.4 起 Android 有 Client App（APK 由 Coordination Server 分发，不上 Google Play）。
 
 **A self-hosted peer-to-peer mesh network**: connect your organization's Linux / macOS machines scattered behind various NATs into one encrypted, directly addressable virtual network (an HzNet). Direct when possible, relayed when not, with access governed by Policy.
 

@@ -307,3 +307,25 @@ hzd 会依次尝试 **PCP / NAT-PMP / UPnP IGD**，向出口路由器为 WireGua
 
 > macOS 与 Linux 均支持；申请报文经物理出口网卡发出，与第三方 TUN 类工具
 > 共存（见第 10 节）。
+
+## Android（v0.4）
+
+Android 9（API 28）及以上、arm64 设备从 Coordination Server 下载安装（不上
+Google Play）：
+
+1. 手机浏览器打开 `https://coord.<域名>/dl/android-arm64/hznet.apk` 下载；
+2. 安装时允许"未知来源／安装未知应用"（对该浏览器授予一次）；
+3. 打开 HzNet App：coord 地址预填可改，Node Name 预填机型名（可改）；
+4. 选"浏览器登录"（系统浏览器完成组织账号登录）或输入 Admin 发的邀请码
+   （也可直接点 Admin 发来的 `hznet://join` 链接，确认框核对 coord 域名）；
+5. 首次连接在系统对话框授权一次 VPN（"始终信任"后不再询问）。
+
+加入后与其他 Node 按 Node Address 与 `<name>.hznet.internal` 互通；App 是
+前台服务 + 常驻通知，重启后保持原开关状态。管理员把 release APK 放到 coord
+分发目录 `dist/android-arm64/hznet.apk` 后，App 每天检查一次版本并在确认后
+自升级（校验 sha256，身份不变）。
+
+Android 上只路由 HzNet 网段（默认 `100.96.0.0/16` 与本网 ULA 前缀），其他
+App 的上网与 DNS 不受影响；手机多在运营商 NAT 后，预期大量走 Relayed Path。
+开发构建见 [clients/android/README.md](../clients/android/README.md)；真机
+冒烟清单见 [android-smoke-test.md](android-smoke-test.md)。

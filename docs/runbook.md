@@ -312,6 +312,15 @@ sudo hz up --auth-key <Auth Key>
 安装前设置 `HZNET_RELAY_ADDR`（写法见 [install-guide.md](install-guide.md) §6）。
 hzd 没有对应的命令行 flag；私有 CA 仍要另写 `HZD_RELAY_CA_PATH`。
 
+**Android release keystore（#102）**：CI 打 tag 时用 GitHub Secrets 里的
+`HZNET_KEYSTORE_BASE64` / `HZNET_KEYSTORE_ALIAS` / `HZNET_KEYSTORE_PASSWORD` /
+`HZNET_KEYSTORE_KEY_PASSWORD` 签名 release APK。keystore 文件**离线备份两份
+以上**（密码管理器 + 加密移动介质，与仓库/CI 分开存放）；**丢失即无法覆盖
+升级**——所有已装 App 只能卸载重装（Node 身份随 App 私有目录一起清除，
+需重新注册），此时必须升 versionName 并公告用户。恢复 = 从离线备份取回
+keystore 重新入库 Secrets；只有 keystore 而丢密码同样视为丢失（换新 keystore
+同样走"新身份重装"路径）。
+
 **Relay / STUN 地址下发（#97）**：hz-coord 用 `--public-relay-addr` /
 `--public-stun-addr` 启动后（部署模板已带），公共地址随注册响应与 Network Map
 下发，Node 端按「显式配置 > coord 下发 > ADR-0004 由 coord 主机名推导」取值。
