@@ -6,6 +6,7 @@ members = [
     "crates/hz-coord",
     "crates/hz-relay",
     "crates/hz-engine",
+    "crates/hz-android",
     "crates/hzd",
     "crates/hz",
 ]

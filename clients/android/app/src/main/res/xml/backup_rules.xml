@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- allowBackup=false 的补充（旧版本 Android 走 fullBackupContent）。 -->
+<full-backup-content>
+    <exclude domain="file" path="hznet" />
+</full-backup-content>

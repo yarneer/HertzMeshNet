@@ -36,6 +36,42 @@ jobs:
       - name: Test
         run: cargo test --all
 
+  # #99：Android debug 构建 + Kotlin 单测（契约 fixture 解码）。Linux runner
+  # 上 cargo ndk 交叉编译 libhz_android.so，Gradle 打 debug APK。
+  android-debug:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装 cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Rust 侧 Android 目标检查（JNI 桥编译）
+        run: cargo check -p hz-android --target aarch64-linux-android
+      - name: Gradle（setup-gradle 安装发行版，不依赖 wrapper jar）
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Kotlin 单测（解码 clients/fixtures 全部 fixture）
+        working-directory: clients/android
+        run: gradle testDebugUnitTest --stacktrace -PhznetVersion=$(grep -m1 '^version' ../../Cargo.toml | cut -d'"' -f2)
+      - name: 构建 debug APK（arm64-v8a + x86_64）
+        working-directory: clients/android
+        run: gradle assembleDebug --stacktrace -PhznetVersion=$(grep -m1 '^version' ../../Cargo.toml | cut -d'"' -f2)
+      - name: 上传 debug APK（产物供真机冒烟）
+        uses: actions/upload-artifact@v4
+        with:
+          name: hznet-debug-apk
+          path: clients/android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
   check-macos:
     runs-on: macos-latest
     steps:

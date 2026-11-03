@@ -639,6 +639,14 @@ impl Engine {
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
+
+    /// 当前 Desired State（"up" / "down"；App 状态机与 onRevoke 流程用）。
+    pub fn desired_state_str(&self) -> &'static str {
+        self.desired_state
+            .lock()
+            .expect("desired state poisoned")
+            .as_str()
+    }
 }
 
 /// 订阅的节拍（#83，规格 §3.3）：每秒对比一次完整 status 快照，变化即推

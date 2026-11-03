@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 身份经云备份 / 设备迁移复制到另一台设备是被禁止的（规格 §6）：state_dir
+     （filesDir/hznet）整体排除，其余允许默认处理。 -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="hznet" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="hznet" />
+    </device-transfer>
+</data-extraction-rules>
