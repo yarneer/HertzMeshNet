@@ -1,6 +1,6 @@
 # v0.4 规格：macOS Client App
 
-状态：已定稿（grilling 2026-10-28），待实现。术语以 [GLOSSARY.md](../GLOSSARY.md) 为准，架构取舍见 [ADR-0010](adr/0010-client-app-as-gui-shell.md)，权限分档见 [ADR-0011](adr/0011-ipc-member-tier-console-user.md)。
+状态：已定稿（grilling 2026-10-28）；§3–§6 已实现，§7–§8（#91–#94）暂停：v0.4 内 Android 优先，Android 以 `0.4.0` 首发，本 App 收尾后在 `0.4.x` 发布（见 [android-client-spec](android-client-spec.md)）。术语以 [GLOSSARY.md](../GLOSSARY.md) 为准，架构取舍见 [ADR-0010](adr/0010-client-app-as-gui-shell.md)，权限分档见 [ADR-0011](adr/0011-ipc-member-tier-console-user.md)。
 
 ## 1. 动机
 

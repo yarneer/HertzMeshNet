@@ -59,8 +59,16 @@ _Avoid_: Control Server, Controller, Master, 服务端
 _Avoid_: Dashboard, Portal, Web UI
 
 **Client App**:
-装在 Node 上、给该 Node 的 User 使用的图形界面（v0.4 起为 macOS 菜单栏 App），只是 hzd 的外壳：开关连接、登录、查看状态与对端、导出诊断包。不含管理功能；它本身不是 Node，Node 是它所在的那台设备。
+装在 Node 上、给该 Node 的 User 使用的图形界面（v0.4 起为 macOS 菜单栏 App 与 Android App），开关连接、登录、查看状态与对端、导出诊断包。macOS 上它只是 hzd 的外壳；Android 上 Engine 运行在它的 VpnService 进程内。不含管理功能；它本身不是 Node，Node 是它所在的那台设备。
 _Avoid_: 客户端（未加限定时）, GUI, Tray App
+
+**Engine**:
+`hz-engine` crate 提供的、与平台无关的 Node 运行逻辑：注册与登录、Network Map、数据面监督、Endpoint 与 Relay、Health Report、诊断与请求分发。桌面上由 hzd 承载，Android 上运行在 Client App 的 VpnService 进程内。
+_Avoid_: Core（与 `hz-core` 库混淆）, SDK, 内核
+
+**Platform**:
+Engine 依赖的平台能力集合：建立 TUN（地址、路由、DNS 一次提交）、让外层 socket 绕开隧道、物理网络变化事件、系统 DNS 服务器。每个平台各有一个实现。
+_Avoid_: OS 层, HAL, Backend（Client App 里另有所指）
 
 **Desired State**:
 User 希望本 Node 处于连接（`up`）还是断开（`down`）的状态，由 hzd 持久化；hzd 启动时据此决定是否启动数据面。与注册状态正交：断开不注销身份。
