@@ -91,6 +91,54 @@ jobs:
             target/release/hzd
             target/release/hz
 
+  # #102：Android release APK——tag 时用 Secrets 中的 keystore 签名。
+  # keystore 丢失即无法覆盖升级（runbook 记保管与恢复）；手动触发时无
+  # secrets 则产出未签名包（仅调试用）。
+  build-android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装 cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Rust 侧 Android 目标检查
+        run: cargo check -p hz-android --target aarch64-linux-android
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: 解码 release keystore（Secrets）
+        run: |
+          if [ -n "${{ secrets.HZNET_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.HZNET_KEYSTORE_BASE64 }}" | base64 -d > clients/android/release.keystore
+            echo "HZNET_KEYSTORE_FILE=$(pwd)/clients/android/release.keystore" >> "$GITHUB_ENV"
+          else
+            echo "::warning::未配置 HZNET_KEYSTORE_BASE64，产出未签名 APK（仅调试）"
+          fi
+      - name: 构建 release APK（签名或未签名）
+        working-directory: clients/android
+        run: |
+          VERSION=$(grep -m1 '^version' ../../Cargo.toml | cut -d'"' -f2)
+          if [ -n "$HZNET_KEYSTORE_FILE" ]; then
+            gradle assembleRelease --stacktrace -PhznetVersion=$VERSION               -PhznetKeystoreFile=$HZNET_KEYSTORE_FILE               -PhznetKeystoreAlias="${{ secrets.HZNET_KEYSTORE_ALIAS }}"               -PhznetKeystorePassword="${{ secrets.HZNET_KEYSTORE_PASSWORD }}"               -PhznetKeystoreKeyPassword="${{ secrets.HZNET_KEYSTORE_KEY_PASSWORD }}"
+            cp app/build/outputs/apk/release/app-release.apk hznet.apk
+          else
+            gradle assembleRelease --stacktrace -PhznetVersion=$VERSION
+            cp app/build/outputs/apk/release/app-unaligned.apk hznet.apk 2>/dev/null               || cp app/build/outputs/apk/release/app-release-unsigned.apk hznet.apk
+          fi
+          sha256sum hznet.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android-arm64
+          path: clients/android/hznet.apk
+
   shellcheck:
     runs-on: ubuntu-24.04
     steps:
@@ -101,7 +149,7 @@ jobs:
         run: shellcheck packaging/install.sh scripts/test/install_docker.sh scripts/deploy/healthcheck.sh
 
   release:
-    needs: [build-linux-x86_64, build-linux-aarch64, build-macos-arm64, shellcheck]
+    needs: [build-linux-x86_64, build-linux-aarch64, build-macos-arm64, build-android, shellcheck]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     steps:
@@ -118,9 +166,14 @@ jobs:
         with:
           name: dist-darwin-arm64
           path: stage/darwin-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-android-arm64
+          path: stage/android-arm64
       - name: Stage assets and manifest
         run: |
           mkdir assets
+          cp stage/android-arm64/hznet.apk assets/hznet.apk-android-arm64
           for arch in x86_64 aarch64; do
             for bin in hzd hz hz-coord hz-relay; do
               mv "stage/linux-$arch/$bin" "assets/$bin-linux-$arch"

@@ -12,10 +12,12 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.app.NotificationCompat
 import dev.hznet.android.engine.EngineBridge
 import dev.hznet.android.engine.HzNetPlatform
 import dev.hznet.android.engine.SnapshotSink
+import dev.hznet.android.ui.LoginFlow
 import dev.hznet.android.ui.MainActivity
 import org.json.JSONObject
 
@@ -48,10 +50,14 @@ class HzNetVpnService : VpnService() {
 
         /**
          * 待消费的邀请码（Activity 收集输入 → 服务进程内 up 注册）。
-         * 浏览器登录 / `hznet://join` 深链（#100）走同一通道。
+         * `hznet://join` 深链走同一通道。
          */
         @Volatile
         var pendingInvite: String? = null
+
+        /** 待发起的浏览器登录（引导页选择"浏览器登录"时带上 coord 地址）。 */
+        @Volatile
+        var pendingBrowserLogin: String? = null
 
         /** 拉起服务（连接开关 on）。 */
         fun start(context: Context, configJson: String) {
@@ -123,8 +129,36 @@ class HzNetVpnService : VpnService() {
                 """{"method":"up","params":{"invite_code":"$invite"}}"""
             )
         }
+        // 浏览器登录：up 拿 login_url → Custom Tabs 打开 → 轮询 login_poll →
+        // 完成后把 App 切回前台（规格 §8）。
+        pendingBrowserLogin?.let { coord ->
+            pendingBrowserLogin = null
+            startBrowserLogin(coord)
+        }
         watchPhysicalNetwork()
         subscribeStatus()
+    }
+
+    private var loginFlow: LoginFlow? = null
+
+    private fun startBrowserLogin(coordAddr: String) {
+        loginFlow?.cancel()
+        loginFlow = LoginFlow(
+            backend = dev.hznet.android.backend.JniBackend(),
+            onStarted = { loginUrl ->
+                CustomTabsIntent.Builder().build().launchUrl(this, android.net.Uri.parse(loginUrl))
+            },
+            onFinished = { outcome ->
+                if (outcome == LoginFlow.Outcome.COMPLETED) {
+                    // 登录完成：切回前台（clearTop 复用单实例 Activity）。
+                    startActivity(
+                        Intent(this, MainActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                    )
+                }
+            },
+        )
+        loginFlow?.begin(coordAddr)
     }
 
     /** 物理网络变化（Wi-Fi ↔ 蜂窝等）→ onNetworkChanged 驱动重绑（30 秒内恢复）。 */
@@ -153,7 +187,7 @@ class HzNetVpnService : VpnService() {
         EngineBridge.onNetworkChanged(servers.toString())
     }
 
-    /** 订阅引擎快照：更新常驻通知文本 + AppModel（UI 的唯一数据源）。 */
+    /** 订阅引擎快照：更新常驻通知 + AppModel（UI 的唯一数据源）+ 到期重排。 */
     private fun subscribeStatus() {
         EngineBridge.subscribe(SnapshotSink { snapshotJson ->
             runCatching {
@@ -161,6 +195,14 @@ class HzNetVpnService : VpnService() {
                 val result = response.optJSONObject("result") ?: return@SnapshotSink
                 AppModel.publish(result)
                 updateNotification(statusLine(result))
+                // 到期提醒（#101）：expires_at 变化时 WorkManager REPLACE 重排；
+                // VPN 关闭时也能触发（不依赖引擎运行）。
+                val expiresAt = if (result.has("expires_at_unix")) {
+                    result.optLong("expires_at_unix", 0)
+                } else {
+                    0
+                }
+                dev.hznet.android.notify.ExpiryNotifier.reschedule(this, expiresAt.takeIf { it > 0 })
             }
         })
     }
@@ -240,6 +282,7 @@ class HzNetVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        loginFlow?.cancel()
         networkCallback?.let {
             runCatching {
                 (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)

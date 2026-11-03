@@ -34,7 +34,17 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            // release 签名由 CI 注入（#102：keystore 在 GitHub Secrets）。
+            // release 签名由 CI 注入（#102：keystore 在 GitHub Secrets，
+            // 经 -PhznetKeystore* 传入；未提供时不签名）。
+            val keystoreFile = project.findProperty("hznetKeystoreFile") as String?
+            if (keystoreFile != null) {
+                signingConfig = signingConfigs.create("release") {
+                    storeFile = file(keystoreFile)
+                    storePassword = project.findProperty("hznetKeystorePassword") as String
+                    keyAlias = project.findProperty("hznetKeystoreAlias") as String
+                    keyPassword = project.findProperty("hznetKeystoreKeyPassword") as String
+                }
+            }
         }
     }
 
@@ -104,6 +114,8 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.browser)
+    implementation(libs.androidx.work)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))

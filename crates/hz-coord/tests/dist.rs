@@ -109,6 +109,37 @@ async fn manifest_and_binaries_carry_matching_sha256() {
     assert_eq!(&bytes[..], HZ_X86, "下发的就是 dist 目录里的那份文件");
 }
 
+/// #102：APK 进分发目录——manifest 列出 sha256，/dl/android-arm64/hznet.apk 可下载。
+#[tokio::test]
+async fn android_apk_is_listed_and_downloadable() {
+    const APK: &[u8] = b"PK\x03\x04fake-apk-bytes-for-dist-test";
+    let (base, _handle) = start_http(Some(dist_with(&[
+        ("linux-x86_64", "hzd", HZD_X86),
+        ("android-arm64", "hznet.apk", APK),
+    ])))
+    .await;
+
+    let manifest: serde_json::Value = reqwest::get(format!("{base}/dl/manifest.json"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = &manifest["files"]["android-arm64/hznet.apk"];
+    assert_eq!(
+        entry["sha256"].as_str().unwrap(),
+        authkey::hex(&Sha256::digest(APK)),
+        "manifest 应列出 APK 的 sha256：{manifest}"
+    );
+
+    let response = reqwest::get(format!("{base}/dl/android-arm64/hznet.apk"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = response.bytes().await.unwrap();
+    assert_eq!(&bytes[..], APK, "下载的就是分发目录里的那份 APK");
+}
+
 #[tokio::test]
 async fn unknown_platform_or_binary_is_not_found() {
     let (base, _handle) = start_http(Some(dist_with(&[("linux-x86_64", "hzd", HZD_X86)]))).await;
