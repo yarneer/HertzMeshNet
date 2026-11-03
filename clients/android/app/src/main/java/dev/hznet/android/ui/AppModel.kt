@@ -21,11 +21,23 @@ object AppModel {
     /** 引擎是否在运行（start/stop 状态；UI 开关的即时反馈）。 */
     var engineRunning: Boolean by mutableStateOf(false)
 
+    /** 运行中到达的 hznet://join 深链（onNewIntent → UI 确认框）。 */
+    var pendingDeepLink: String? by mutableStateOf(null)
+        private set
+
     fun publish(snapshot: JSONObject) {
         this.snapshot = snapshot
     }
 
     fun noteRevoked() {
         revokedAtMillis = System.currentTimeMillis()
+    }
+
+    fun offerDeepLink(link: String) {
+        pendingDeepLink = link
+    }
+
+    fun consumeDeepLink() {
+        pendingDeepLink = null
     }
 }

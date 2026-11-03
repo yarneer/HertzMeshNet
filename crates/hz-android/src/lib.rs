@@ -81,6 +81,11 @@ pub fn android_config_from_json(config: &AndroidConfigJson) -> anyhow::Result<En
     }
     Ok(EngineConfig {
         coord_addr: config.coord_addr.clone(),
+        node_name: config
+            .node_name
+            .clone()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty()),
         relay_addr: config.relay_addr.clone(),
         relay_ca_pem: config.relay_ca_pem.clone(),
         stun_addrs: config.stun_addrs.clone(),

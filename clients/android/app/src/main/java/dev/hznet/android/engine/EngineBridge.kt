@@ -22,6 +22,7 @@ object EngineBridge {
         relayCaPem: String?,
         stunAddrs: List<String>?,
         dnsSuffix: String?,
+        nodeName: String? = null,
     ): String = JSONObject().apply {
         put("state_dir", stateDir)
         putOpt("coord_addr", coordAddr?.takeIf { it.isNotBlank() })
@@ -29,6 +30,7 @@ object EngineBridge {
         putOpt("relay_ca_pem", relayCaPem?.takeIf { it.isNotBlank() })
         stunAddrs?.takeIf { it.isNotEmpty() }?.let { put("stun_addrs", it) }
         putOpt("dns_suffix", dnsSuffix?.takeIf { it.isNotBlank() })
+        putOpt("node_name", nodeName?.takeIf { it.isNotBlank() })
     }.toString()
 
     /** 平台回调（establish / protect）与引擎启动；成功返回 true。 */

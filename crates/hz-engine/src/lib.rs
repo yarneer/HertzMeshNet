@@ -69,6 +69,9 @@ pub struct EngineConfig {
     pub force_relay: bool,
     /// HZNET_DNS_SUFFIX：Magic DNS 后缀。
     pub dns_suffix: String,
+    /// 注册时上报的 Node Name（Android 引导页预填 Build.MODEL 规范化结果；
+    /// None = 桌面取本机主机名）。
+    pub node_name: Option<String>,
     /// HZD_BOOTSTRAP_DNS：外层解析回退用的引导 DNS（逗号分隔）。
     pub bootstrap_dns: Option<String>,
     /// HZD_PORTMAP != "0"（桌面伴随任务的开关，引擎只透传给钩子）。
@@ -101,6 +104,7 @@ impl Default for EngineConfig {
             v4_cidr: None,
             force_relay: false,
             dns_suffix: hz_core::dns::DEFAULT_DNS_SUFFIX.to_string(),
+            node_name: None,
             bootstrap_dns: None,
             portmap_enabled: true,
             portmap_gateway: None,
@@ -831,11 +835,16 @@ async fn handle_request(request: ipc::Request, daemon: Arc<Engine>) -> Result<Va
                     // 邀请码与 Auth Key 共用同一通道：有 invite 时 auth_key 传空串，
                     // 服务端按 invite_code 字段优先走短码核销。
                     let auth_key = if invite_code.is_some() { "" } else { &auth_key };
+                    let hostname = daemon
+                        .config
+                        .node_name
+                        .clone()
+                        .unwrap_or_else(local_hostname);
                     let info = register_with_auth_key(
                         &daemon.state_dir,
                         auth_key,
                         invite_code.as_deref(),
-                        &local_hostname(),
+                        &hostname,
                         &coord_addr,
                     )
                     .await
@@ -855,9 +864,14 @@ async fn handle_request(request: ipc::Request, daemon: Arc<Engine>) -> Result<Va
                         .as_ref()
                         .map(|(_, public)| *public)
                         .unwrap_or_else(|| keys.node_public());
+                    let hostname = daemon
+                        .config
+                        .node_name
+                        .clone()
+                        .unwrap_or_else(local_hostname);
                     let started = begin_interactive_login(
                         &daemon.state_dir,
-                        &local_hostname(),
+                        &hostname,
                         &coord_addr,
                         node_key_pub,
                     )
@@ -1330,7 +1344,11 @@ fn spawn_login_poller(
     staged_secret: Option<NodeStaticSecret>,
 ) {
     tokio::spawn(async move {
-        let hostname = local_hostname();
+        let hostname = daemon
+            .config
+            .node_name
+            .clone()
+            .unwrap_or_else(local_hostname);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
             if tokio::time::Instant::now() >= deadline {
