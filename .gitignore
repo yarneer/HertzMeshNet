@@ -10,3 +10,4 @@ clients/macos/*.xcodeproj
 
 # 本机 swift build 误在仓库根产生的产物
 /.build/
+arm64-v8a/

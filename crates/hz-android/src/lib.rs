@@ -18,7 +18,7 @@ pub mod ring;
 
 use std::sync::Arc;
 
-use hz_engine::{Engine, EngineConfig, EngineHooks, LogTailFn};
+use hz_engine::{EngineConfig, EngineHooks, LogTailFn};
 use serde_json::Value;
 
 /// Kotlin 侧的日志环形缓冲（2000 行，规格 §6）。
@@ -118,15 +118,6 @@ pub fn android_hooks(log: Arc<RingLog>) -> EngineHooks {
         log_tail: Some(log_tail),
     }
 }
-
-/// 引擎句柄的全局槽（一个进程一个引擎；start 幂等，stop 后可重启）。
-pub(crate) struct Runtime {
-    pub engine: Arc<Engine>,
-    pub shutdown: tokio::sync::watch::Sender<bool>,
-}
-
-pub(crate) static RUNTIME: tokio::sync::Mutex<Option<Runtime>> =
-    tokio::sync::Mutex::const_new(None);
 
 pub(crate) static RING_LOG: std::sync::OnceLock<Arc<RingLog>> = std::sync::OnceLock::new();
 

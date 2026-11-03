@@ -6,7 +6,6 @@
 //! 出口变化后的重绑不在本模块（见 #9/#16）。
 
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, RawFd};
 #[cfg(target_os = "macos")]

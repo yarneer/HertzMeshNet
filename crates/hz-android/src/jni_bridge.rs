@@ -23,12 +23,15 @@ use hz_core::netwatch::NetEvent;
 use hz_core::tun::TunIo;
 use hz_engine::{Platform, TunSpec};
 
-use crate::{AndroidConfigJson, RUNTIME, Runtime, android_config_from_json, member_request_gate};
+use crate::{AndroidConfigJson, android_config_from_json, member_request_gate};
+
+/// 引擎句柄的全局槽（一个进程一个引擎；start 幂等，stop 后可重启）。
+pub(crate) static RUNTIME: tokio::sync::Mutex<Option<AndroidRuntime>> =
+    tokio::sync::Mutex::const_new(None);
 
 /// 运行中的引擎 + 它的 tokio 运行时（stop 时整体拆除）。
 pub(crate) struct AndroidRuntime {
     pub engine: Arc<hz_engine::Engine>,
-    pub rt: Arc<tokio::runtime::Runtime>,
 }
 
 /// 平台对象（establish / protect 回调 + Kotlin 网络推送的落点）。
@@ -62,8 +65,9 @@ impl AndroidPlatform {
     fn call_establish(&self, spec_json: String) -> anyhow::Result<RawFd> {
         let mut env = self.vm.attach_current_thread()?;
         let jconfig: JString = env.new_string(&spec_json)?;
+        let object: &JObject<'_> = self.platform.as_obj();
         let value = env.call_method(
-            self.platform.as_ref(),
+            object,
             "establish",
             "(Ljava/lang/String;)I",
             &[jni::objects::JValue::Object(&jconfig)],
@@ -77,8 +81,9 @@ impl AndroidPlatform {
         let Ok(mut env) = self.vm.attach_current_thread() else {
             return false;
         };
+        let object: &JObject<'_> = self.platform.as_obj();
         env.call_method(
-            self.platform.as_ref(),
+            object,
             "protect",
             "(I)Z",
             &[jni::objects::JValue::Int(fd as i32)],
@@ -145,7 +150,8 @@ impl FdTun {
         // drop（数据面拆除）时关闭 fd。
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         Self {
-            fd: tokio::io::unix::AsyncFd::new(owned).expect("TUN fd 可注册为异步"),
+            // SAFETY：owned 是刚 detach 的唯一 fd，独占所有权，此后只经本端读写。
+            fd: unsafe { tokio::io::unix::AsyncFd::register(owned) }.expect("TUN fd 可注册为异步"),
         }
     }
 }
@@ -247,14 +253,23 @@ fn init_tracing() {
     });
 }
 
-/// 写 logcat（liblog 的 __android_log_write，INFO 级，tag=hznet）。
+// liblog 的 logcat 入口（libc crate 不携带，自行声明；链接 liblog）。
+unsafe extern "C" {
+    fn __android_log_write(
+        prio: i32,
+        tag: *const std::os::raw::c_char,
+        text: *const std::os::raw::c_char,
+    ) -> i32;
+}
+
+/// 写 logcat（__android_log_write，INFO 级，tag=hznet）。
 fn android_log(line: &str) {
     const ANDROID_LOG_INFO: i32 = 4;
     unsafe {
         static NAME: &[u8] = b"hznet\0";
         let mut with_nul: Vec<u8> = line.as_bytes().to_vec();
         with_nul.push(0);
-        libc::__android_log_write(
+        __android_log_write(
             ANDROID_LOG_INFO,
             NAME.as_ptr().cast(),
             with_nul.as_ptr().cast(),
@@ -267,12 +282,6 @@ fn android_log(line: &str) {
 // 约定：除了 request 返回 JSON 字符串，其余以异常表达失败（Kotlin 侧
 // `check(env.exception_check())` 后转成自己的错误类型）。
 
-fn throw(env: &JNIEnv, message: &str) {
-    // 抛 java.lang.IllegalStateException；消息截断防超长。
-    let message: String = message.chars().take(500).collect();
-    let _ = env.throw_new("java/lang/IllegalStateException", message);
-}
-
 /// 当前运行时快照（锁内克隆，立刻放锁）。
 fn with_runtime<T>(f: impl FnOnce(&AndroidRuntime) -> T) -> Option<T> {
     let guard = RUNTIME.blocking_lock();
@@ -284,21 +293,21 @@ static PLATFORM: std::sync::OnceLock<Arc<AndroidPlatform>> = std::sync::OnceLock
 
 /// `start(configJson, platform) -> boolean`：建 tokio 运行时并启动引擎。
 /// 已在运行时直接返回 true（Kotlin 状态机保证 stop 之后再 start）。
-#[no_mangle]
-pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_start(
-    env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
-    platform: JObject,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_start<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_json: JString<'local>,
+    platform: JObject<'local>,
 ) -> jboolean {
-    if start_impl(&env, &config_json, &platform).is_ok() {
+    if start_impl(&mut env, &config_json, &platform).is_ok() {
         JNI_TRUE
     } else {
         false as jboolean
     }
 }
 
-fn start_impl(env: &JNIEnv, config_json: &JString, platform: &JObject) -> anyhow::Result<()> {
+fn start_impl(env: &mut JNIEnv, config_json: &JString, platform: &JObject) -> anyhow::Result<()> {
     let config_text: String = env.get_string(config_json)?.into();
     let json: serde_json::Value = serde_json::from_str(&config_text)?;
     let android_config: AndroidConfigJson = serde_json::from_value(json)?;
@@ -335,13 +344,8 @@ fn start_impl(env: &JNIEnv, config_json: &JString, platform: &JObject) -> anyhow
     if guard.is_some() {
         return Ok(()); // 已在运行。
     }
-    // 把引擎放进 lib.rs 的 RUNTIME（request/subscribe 共用）。
-    *guard = Some(Runtime {
+    *guard = Some(AndroidRuntime {
         engine: engine.clone(),
-        shutdown: {
-            let (tx, _rx) = tokio::sync::watch::channel(false);
-            tx
-        },
     });
     drop(guard);
     // 真正的运行时本体存这里，stop 时整体拆除。
@@ -354,7 +358,7 @@ static RUNTIME_HANDLE: std::sync::Mutex<Option<Arc<tokio::runtime::Runtime>>> =
     std::sync::Mutex::new(None);
 
 /// `stop()`：停数据面与运行时（引擎任务随运行时拆除结束）。幂等。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_stop(
     _env: JNIEnv,
     _class: JClass,
@@ -367,18 +371,20 @@ pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_stop(
     if let Some(rt) = rt {
         tracing::info!("hz-android engine stopping");
         // 给数据面拆除留 3 秒（TUN fd 随任务 drop 关闭），然后硬停。
-        rt.shutdown_timeout(std::time::Duration::from_secs(3));
+        Arc::into_inner(rt)
+            .expect("运行时引用已全部释放")
+            .shutdown_timeout(std::time::Duration::from_secs(3));
     }
 }
 
 /// `request(json) -> json`：成员档请求分发。封套 `{"method","params"}` →
 /// `{"ok":true,"result":…}` / `{"ok":false,"error":"…"}`。
-#[no_mangle]
-pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_request(
-    env: JNIEnv,
-    _class: JClass,
-    request_json: JString,
-) -> JString {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_request<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    request_json: JString<'local>,
+) -> JString<'local> {
     let Ok(text): Result<String, _> = env.get_string(&request_json).map(Into::into) else {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
@@ -436,11 +442,11 @@ fn route_request(request_text: &str) -> String {
 /// `subscribe(callback)`：推送与 IPC `subscribe` 同形状的快照（含
 /// desired_state），节流与心跳规则相同——直接复用引擎的订阅循环，
 /// 逐条 `Response` 序列化为 JSON 行回调给 Kotlin。
-#[no_mangle]
-pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_subscribe(
-    env: JNIEnv,
-    _class: JClass,
-    callback: JObject,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_subscribe<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    callback: JObject<'local>,
 ) {
     let Ok(vm) = env.get_java_vm() else { return };
     let Ok(callback) = env.new_global_ref(callback) else {
@@ -475,8 +481,9 @@ fn push_snapshot(vm: &JavaVM, callback: &jni::objects::GlobalRef, text: &str) ->
     let Ok(jtext) = env.new_string(text) else {
         return false;
     };
+    let object: &JObject<'_> = callback.as_obj();
     env.call_method(
-        callback.as_ref(),
+        object,
         "onSnapshot",
         "(Ljava/lang/String;)V",
         &[jni::objects::JValue::Object(&jtext)],
@@ -487,11 +494,11 @@ fn push_snapshot(vm: &JavaVM, callback: &jni::objects::GlobalRef, text: &str) ->
 /// `onNetworkChanged(dnsServersJson)`：Kotlin 推送物理网络变化与当前 DNS
 /// 服务器（ConnectivityManager.NetworkCallback 驱动，规格 §6），喂给
 /// net_events（恢复序列）与 system_dns（转发上游，#98）。
-#[no_mangle]
-pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_onNetworkChanged(
-    env: JNIEnv,
-    _class: JClass,
-    dns_servers_json: JString,
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_onNetworkChanged<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    dns_servers_json: JString<'local>,
 ) {
     let Ok(text): Result<String, _> = env.get_string(&dns_servers_json).map(Into::into) else {
         return;
@@ -506,22 +513,22 @@ pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_onNetworkCha
 
 /// `desiredState() -> String`：UI 七态判定读 Desired State（快照里也有，
 /// 这里给 onRevoke 等非订阅时点的即时读取）。
-#[no_mangle]
-pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_desiredState(
-    env: JNIEnv,
-    _class: JClass,
-) -> JString {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_desiredState<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
     let state = with_runtime(|runtime| runtime.engine.desired_state_str().to_string())
         .unwrap_or_else(|| "down".to_string());
     env.new_string(&state).expect("JVM 字符串分配")
 }
 
 /// `ringLogTail() -> json`：诊断预览（环形缓冲快照，脱敏后）。
-#[no_mangle]
-pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_ringLogTail(
-    env: JNIEnv,
-    _class: JClass,
-) -> JString {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_ringLogTail<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
     let lines = crate::ring_log().tail_lines();
     let text = serde_json::to_string(&lines).unwrap_or_else(|_| "[]".to_string());
     env.new_string(&text).expect("JVM 字符串分配")

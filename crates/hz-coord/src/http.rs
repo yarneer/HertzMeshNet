@@ -28,10 +28,17 @@ use crate::store::Store;
 const PLACEHOLDER_HTTP_URL: &str = "@@HZNET_COORD_URL@@";
 const PLACEHOLDER_GRPC_ADDR: &str = "@@HZNET_COORD_GRPC_ADDR@@";
 
-/// 支持的分发平台（FR-13）：同时也是 /dl 路径的白名单。
-pub const DIST_PLATFORMS: [&str; 3] = ["linux-x86_64", "linux-aarch64", "darwin-arm64"];
-/// 每个平台分发的二进制。
-pub const DIST_BINARIES: [&str; 2] = ["hzd", "hz"];
+/// 支持的分发平台（FR-13）：同时也是 /dl 路径的白名单。android-arm64
+/// 是 Client App 的 APK（#102）：放置 hznet.apk 后 manifest 自动列出
+/// sha256，下载地址 /dl/android-arm64/hznet.apk。
+pub const DIST_PLATFORMS: [&str; 4] = [
+    "linux-x86_64",
+    "linux-aarch64",
+    "darwin-arm64",
+    "android-arm64",
+];
+/// 每个平台分发的二进制；缺文件的平台/名字组合直接跳过。
+pub const DIST_BINARIES: [&str; 3] = ["hzd", "hz", "hznet.apk"];
 
 /// 回调与登录页共用的服务端状态。
 pub struct HttpState {

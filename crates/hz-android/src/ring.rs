@@ -3,7 +3,6 @@
 //! `hz_engine::diagnostics::redact_line` 脱敏后入环。
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 /// 环形缓冲容量（行）。
 pub const RING_CAPACITY: usize = 2000;
