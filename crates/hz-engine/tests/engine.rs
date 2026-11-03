@@ -132,7 +132,9 @@ fn captured_logs() -> Arc<StdMutex<String>> {
 /// 进程内 coord（回环 + 内存库）+ 一个可用的 Auth Key。
 async fn in_process_coord() -> (hz_coord::service::ServeHandle, String, String) {
     let dir = tempfile::tempdir().unwrap();
-    let store_path: PathBuf = dir.path().join("coord.db");
+    // keep()：coord 的 SQLite 在测试进程外存活到 shutdown，目录不能随
+    // TempDir 提前删除（unlink 后建 WAL/SHM 会偶发存储错误）。
+    let store_path: PathBuf = dir.keep().join("coord.db");
     let store = Store::open(&store_path, AddressConfig::default())
         .await
         .unwrap();

@@ -255,7 +255,7 @@ pub struct StartedLogin {
 /// LoginStatus 轮询一次的结果。
 pub enum LoginPoll {
     Pending,
-    Completed(RegisteredInfo),
+    Completed(Box<RegisteredInfo>),
     Failed(String),
 }
 
@@ -289,7 +289,7 @@ pub async fn poll_login_status(
         return Ok(LoginPoll::Failed(error));
     }
     match (response.completed, response.node) {
-        (true, Some(node)) => Ok(LoginPoll::Completed(RegisteredInfo {
+        (true, Some(node)) => Ok(LoginPoll::Completed(Box::new(RegisteredInfo {
             node_id: node.node_id,
             name: node.name,
             ipv4: node.ipv4,
@@ -301,7 +301,7 @@ pub async fn poll_login_status(
             dns_v4: response.dns_v4,
             relay_addr: response.relay_addr,
             stun_addrs: response.stun_addrs,
-        })),
+        }))),
         (true, None) => Ok(LoginPoll::Failed(
             "服务端返回了完成态但没有 Node 信息".to_string(),
         )),

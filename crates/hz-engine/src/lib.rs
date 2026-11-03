@@ -1343,7 +1343,7 @@ fn spawn_login_poller(
                             );
                         }
                     }
-                    if let Err(error) = finish_registration(&daemon, info, &coord_addr).await {
+                    if let Err(error) = finish_registration(&daemon, *info, &coord_addr).await {
                         *daemon.login.lock().expect("login poisoned") =
                             LoginProgress::Failed { error };
                         return;

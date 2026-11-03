@@ -1,8 +1,7 @@
-//! #97 Seam B：coord 配置 / 未配置 `--public-relay-addr` / `--public-stun-addr`
-//! 时，注册响应与 Network Map 全量快照是否携带地址（真实 tonic over loopback
-//! + 内存 SQLite）。未配置时不携带——旧 coord（N-2）对 Node 即此形态，
-//! Node 侧按三级优先级落到显式配置或 ADR-0004 推导
-//! （本测试只覆盖服务端契约，优先级取值见 hz-engine 单测）。
+//! #97 Seam B：coord 配置 / 未配置 `--public-relay-addr` /
+//! `--public-stun-addr` 时，注册响应与 Network Map 全量快照是否携带地址
+//! （真实 tonic over loopback + 内存 SQLite）。未配置时不携带——旧 coord
+//! （N-2）对 Node 即此形态；Node 侧的三级优先级取值见 hz-engine 单测。
 
 use std::net::SocketAddr;
 use std::time::Duration;

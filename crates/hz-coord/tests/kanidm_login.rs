@@ -318,7 +318,7 @@ async fn node_login(
                 }
                 persist_like_hzd(state_dir, &info);
                 return LoginOutcome {
-                    info,
+                    info: *info,
                     login_url: started.login_url,
                 };
             }
