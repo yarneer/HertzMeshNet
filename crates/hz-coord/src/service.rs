@@ -61,6 +61,11 @@ pub struct ServeConfig {
     /// 浏览器可访问的公共基地址（--public-url，如 https://coord.example.com）；
     /// 一次性登录链接按它拼接，缺省由 OIDC 回调地址推导。
     pub public_url: Option<String>,
+    /// 对 Node 下发的公共 Relay 地址（--public-relay-addr，#97）：注册响应、
+    /// 登录轮询与 Network Map 全量快照携带；缺省不下发（Node 侧走推导）。
+    pub public_relay_addr: Option<String>,
+    /// 对 Node 下发的公共 STUN 地址列表（--public-stun-addr，逗号分隔）。
+    pub public_stun_addrs: Vec<String>,
     /// 一次性登录链接的有效期（默认 5 分钟）。
     pub login_ttl: Duration,
     /// 交互式登录授予的 Node 有效期（默认 90 天）。
@@ -82,6 +87,8 @@ impl ServeConfig {
             dist: None,
             metrics_listen: None,
             public_url: None,
+            public_relay_addr: None,
+            public_stun_addrs: Vec::new(),
             login_ttl: LOGIN_TTL,
             login_node_ttl_secs: LOGIN_NODE_TTL_SECS,
             ops: OpsConfig::default(),
@@ -307,6 +314,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         login_base,
         metrics,
         health: health.clone(),
+        public_relay_addr: config.public_relay_addr.clone(),
+        public_stun_addrs: config.public_stun_addrs.clone(),
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -318,6 +327,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<ServeHandle> {
         MapPushConfig {
             keepalive_every: config.map_keepalive,
             sweep_every: config.map_sweep,
+            public_relay_addr: config.public_relay_addr.clone(),
+            public_stun_addrs: config.public_stun_addrs.clone(),
         },
     ));
     // last_seen 批量落库（#71）：离线条目 5 秒内落库，在线条目 5 分钟一批。
@@ -442,6 +453,9 @@ struct CoordServiceImpl {
     metrics: Arc<Metrics>,
     /// Health Report 内存表 + last_seen / 版本缓存（#69 v0.3）。
     health: Arc<HealthCenter>,
+    /// 对 Node 下发的公共 Relay / STUN 地址（#97）；None / 空 = 不下发。
+    public_relay_addr: Option<String>,
+    public_stun_addrs: Vec<String>,
 }
 
 impl CoordServiceImpl {
@@ -745,6 +759,8 @@ impl Coord for CoordServiceImpl {
             node: Some(node_info_from(record)),
             network_cidr: range.0,
             dns_v4: range.1,
+            relay_addr: self.public_relay_addr.clone(),
+            stun_addrs: self.public_stun_addrs.clone(),
         }))
     }
 
@@ -838,6 +854,8 @@ impl Coord for CoordServiceImpl {
                 error: None,
                 network_cidr: range.0,
                 dns_v4: range.1,
+                relay_addr: self.public_relay_addr.clone(),
+                stun_addrs: self.public_stun_addrs.clone(),
             })),
             PollResult::Completed(record) => {
                 tracing::info!(node_id = %record.id, "interactive login delivered to node");
@@ -847,6 +865,8 @@ impl Coord for CoordServiceImpl {
                     error: None,
                     network_cidr: Some(self.store.addr().cidr.to_string()),
                     dns_v4: Some(self.store.addr().reserved_dns().to_string()),
+                    relay_addr: self.public_relay_addr.clone(),
+                    stun_addrs: self.public_stun_addrs.clone(),
                 }))
             }
             PollResult::Failed(reason) => Ok(Response::new(LoginStatusResponse {
@@ -855,6 +875,8 @@ impl Coord for CoordServiceImpl {
                 error: Some(reason),
                 network_cidr: range.0,
                 dns_v4: range.1,
+                relay_addr: self.public_relay_addr.clone(),
+                stun_addrs: self.public_stun_addrs.clone(),
             })),
         }
     }

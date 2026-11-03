@@ -312,6 +312,13 @@ sudo hz up --auth-key <Auth Key>
 安装前设置 `HZNET_RELAY_ADDR`（写法见 [install-guide.md](install-guide.md) §6）。
 hzd 没有对应的命令行 flag；私有 CA 仍要另写 `HZD_RELAY_CA_PATH`。
 
+**Relay / STUN 地址下发（#97）**：hz-coord 用 `--public-relay-addr` /
+`--public-stun-addr` 启动后（部署模板已带），公共地址随注册响应与 Network Map
+下发，Node 端按「显式配置 > coord 下发 > ADR-0004 由 coord 主机名推导」取值。
+只填 coord 地址的节点（Android App，macOS Client App）不再需要本地配置即能找到
+Relay 与 STUN；缺省（旧 coord / 未配置）时 Node 按 `coord.<域名>` →
+`https://relay.<域名>` 推导，主机名不是 `coord.` 开头则不推导（行为与升级前一致）。
+
 ### 6.4 macOS Node
 
 ```sh

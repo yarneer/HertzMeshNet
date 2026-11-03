@@ -33,6 +33,8 @@ fn registered_info(name: &str, ipv4: &str, expires: Option<i64>) -> RegisteredIn
         expires_at_unix: expires,
         network_cidr: Some("100.96.0.0/16".to_string()),
         dns_v4: Some("100.96.0.53".to_string()),
+        relay_addr: None,
+        stun_addrs: vec![],
     }
 }
 

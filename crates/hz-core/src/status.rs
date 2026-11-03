@@ -22,6 +22,13 @@ pub struct RegisteredInfo {
     pub network_cidr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_v4: Option<String>,
+    /// coord 下发的公共 Relay 地址与 STUN 列表（#97）：随注册/登录响应获得
+    /// 并持久化；引擎取值优先级 显式配置 > coord 下发 > ADR-0004 推导。
+    /// 旧服务端不带（N-2），Network Map 全量快照可在线刷新运行时值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stun_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

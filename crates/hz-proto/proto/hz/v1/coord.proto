@@ -85,6 +85,10 @@ message RegisterResponse {
   // 与本地 DNS，替代易失配的 HZD_V4_CIDR 环境变量。
   optional string network_cidr = 2;
   optional string dns_v4 = 3;
+  // Relay / STUN 地址下发（#97 / 规格 §4，optional：旧 coord 不带，Node 侧
+  // 走三级优先级）。--public-relay-addr / --public-stun-addr 配置，缺省不下发。
+  optional string relay_addr = 4;
+  repeated string stun_addrs = 5;
 }
 
 message NodeInfo {
@@ -211,6 +215,9 @@ message LoginStatusResponse {
   // 与 RegisterResponse 同义；交互式登录路径同样需要生效段信息。
   optional string network_cidr = 4;
   optional string dns_v4 = 5;
+  // 与 RegisterResponse 同义的 Relay / STUN 下发（#97）。
+  optional string relay_addr = 6;
+  repeated string stun_addrs = 7;
 }
 
 message StreamMapRequest {
@@ -256,6 +263,10 @@ message InboundRule {
 
 message NetworkMap {
   repeated NodeInfo nodes = 1;
+  // Relay / STUN 地址下发（#97）：随全量快照携带，Node 端刷新运行时取值
+  // （显式配置 > coord 下发 > ADR-0004 推导）。差量不携带。
+  optional string relay_addr = 2;
+  repeated string stun_addrs = 3;
 }
 
 message MapDelta {

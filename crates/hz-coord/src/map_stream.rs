@@ -24,6 +24,10 @@ pub struct MapPushConfig {
     pub keepalive_every: Duration,
     /// 全量重建间隔：接住绕过 notify 的到期跨越等外部写入。
     pub sweep_every: Duration,
+    /// 对 Node 下发的公共 Relay / STUN 地址（#97）：随全量快照携带；
+    /// None / 空 = 不下发。
+    pub public_relay_addr: Option<String>,
+    pub public_stun_addrs: Vec<String>,
 }
 
 /// 一个订阅者已下发的最后视图：差量与 Policy 变更判定都基于它。
@@ -139,7 +143,7 @@ pub async fn run_fan_out(store: Store, hub: Arc<MapHub>, config: MapPushConfig) 
                 continue;
             }
         };
-        deliver(&hub, &snapshot, epoch, keepalive_due);
+        deliver(&hub, &snapshot, epoch, keepalive_due, &config);
     }
 }
 
@@ -260,7 +264,13 @@ fn inbound_rules_of(view: &PolicyView) -> Vec<InboundRule> {
         .collect()
 }
 
-fn deliver(hub: &MapHub, snapshot: &Snapshot, loaded_epoch: u64, keepalive_due: bool) {
+fn deliver(
+    hub: &MapHub,
+    snapshot: &Snapshot,
+    loaded_epoch: u64,
+    keepalive_due: bool,
+    config: &MapPushConfig,
+) {
     let by_id: HashMap<&str, &NodeRecord> = snapshot
         .nodes
         .iter()
@@ -294,6 +304,8 @@ fn deliver(hub: &MapHub, snapshot: &Snapshot, loaded_epoch: u64, keepalive_due: 
             NetworkMapMessage {
                 kind: Some(Kind::Full(NetworkMap {
                     nodes: visible.iter().cloned().map(node_info_from).collect(),
+                    relay_addr: config.public_relay_addr.clone(),
+                    stun_addrs: config.public_stun_addrs.clone(),
                 })),
                 policy: policy_view.clone(),
             }

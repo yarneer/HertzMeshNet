@@ -310,6 +310,10 @@ pub struct Engine {
     engine: StdMutex<Option<Arc<SocketEngine>>>,
     /// 最近一次成功使用的 Coordination Server 地址；重启后自动重连用它。
     coord_addr: StdMutex<Option<String>>,
+    /// coord 下发的公共 Relay / STUN 地址（#97）：注册响应落盘（registration.json）
+    /// 载入，Network Map 全量快照在线刷新。取值见 [`Engine::effective_relay_addr`]。
+    coord_relay: StdMutex<Option<String>>,
+    coord_stuns: StdMutex<Vec<String>>,
     login: StdMutex<LoginProgress>,
     /// Network Map 有变化时唤醒路径任务（打洞轮次紧跟对端 Endpoint 更新）。
     map_signal: Arc<tokio::sync::Notify>,
@@ -385,12 +389,45 @@ impl Engine {
         )
     }
 
-    /// STUN 服务器列表（原 HZD_STUN_ADDR / HZD_RELAY_ADDR 推导，#97 起
-    /// 三级优先级在此之上再加 coord 下发）。周期收集只用第一个。
+    /// STUN 服务器列表（#97 三级优先级）。周期收集只用第一个。
     fn stun_server_targets(&self) -> Vec<String> {
+        let relay = self.effective_relay_addr();
         stun_targets_from(
-            self.config.stun_addrs.clone(),
+            self.config
+                .stun_addrs
+                .clone()
+                .filter(|list| !list.is_empty())
+                .or_else(|| {
+                    let stuns = self
+                        .coord_stuns
+                        .lock()
+                        .expect("coord stuns poisoned")
+                        .clone();
+                    (!stuns.is_empty()).then_some(stuns)
+                }),
+            relay,
+        )
+    }
+
+    /// Relay 地址三级优先级（规格 §4）：EngineConfig 显式值 > coord 下发
+    /// （注册响应 / Network Map）> 按 ADR-0004 由 coord 主机名推导
+    /// （`coord.<域名>` → `https://relay.<域名>`；主机名不是 `coord.` 开头
+    /// 时不推导——无从断定 Relay 子域存在）。
+    fn effective_relay_addr(&self) -> Option<String> {
+        let coord_addr = self
+            .coord_addr
+            .lock()
+            .expect("coord addr poisoned")
+            .clone()
+            .filter(|addr| !addr.is_empty())
+            .or_else(|| self.config.coord_addr.clone());
+        effective_relay(
             self.config.relay_addr.clone(),
+            self.coord_relay
+                .lock()
+                .expect("coord relay poisoned")
+                .clone(),
+            coord_addr.as_deref(),
         )
     }
 
@@ -407,10 +444,7 @@ impl Engine {
     /// 的通道——全部被静默丢弃，数据面只剩按退避节奏的打洞包，握手在慢
     /// 机器上永远完不成；此时对端必须直连（有候选 Endpoint 就朝它们发）。
     fn relay_transport_configured(&self) -> bool {
-        self.config
-            .relay_addr
-            .as_deref()
-            .is_some_and(|addr| !addr.is_empty())
+        self.effective_relay_addr().is_some()
     }
 
     /// 桌面伴随任务（Port Map）回写结果：更新状态与候选槽并并入
@@ -530,8 +564,20 @@ impl Engine {
             engine: StdMutex::new(None),
             coord_addr: StdMutex::new(
                 registration
-                    .and_then(|file| file.coord_addr)
+                    .as_ref()
+                    .and_then(|file| file.coord_addr.clone())
                     .filter(|addr| !addr.is_empty()),
+            ),
+            coord_relay: StdMutex::new(
+                registration
+                    .as_ref()
+                    .and_then(|file| file.info.relay_addr.clone())
+                    .filter(|addr| !addr.is_empty()),
+            ),
+            coord_stuns: StdMutex::new(
+                registration
+                    .map(|file| file.info.stun_addrs)
+                    .unwrap_or_default(),
             ),
             login: StdMutex::new(LoginProgress::Idle),
             map_signal: Arc::new(tokio::sync::Notify::new()),
@@ -1219,12 +1265,33 @@ async fn finish_registration(
     }
     *daemon.registration.lock().expect("registration poisoned") = Session::Registered(info.clone());
     *daemon.coord_addr.lock().expect("coord addr poisoned") = Some(coord_addr.to_string());
+    note_coord_transport(daemon, info.relay_addr.clone(), info.stun_addrs.clone());
     tracing::info!(node_id = %info.node_id, name = %info.name, "node registered");
     if let Err(error) = start_dataplane(daemon, &info, coord_addr).await {
         // 数据面失败不回滚注册：控制面可用，问题在日志里可见。
         tracing::error!(%error, "dataplane startup failed after registration");
     }
     serde_json::to_value(info).map_err(|e| e.to_string())
+}
+
+/// 记录 coord 下发的 Relay / STUN（注册响应与 Network Map 全量共用）；
+/// 与生效值比较，变化时打一条日志（显式配置优先，不受影响）。
+fn note_coord_transport(daemon: &Arc<Engine>, relay: Option<String>, stuns: Vec<String>) {
+    let mut slot = daemon.coord_relay.lock().expect("coord relay poisoned");
+    if *slot != relay {
+        tracing::info!(
+            from = ?*slot,
+            to = ?relay,
+            "coord-provided relay address updated"
+        );
+        *slot = relay;
+    }
+    drop(slot);
+    let mut stun_slot = daemon.coord_stuns.lock().expect("coord stuns poisoned");
+    if *stun_slot != stuns {
+        tracing::info!(from = ?*stun_slot, to = ?stuns, "coord-provided stun list updated");
+        *stun_slot = stuns;
+    }
 }
 
 /// 每 2 秒轮询一次登录状态，直到终态；总预算 10 分钟。
@@ -1391,12 +1458,7 @@ async fn start_dataplane(
 
     // 全部数据面子任务的句柄（#81）：监督任务持有，down 时逐个 abort。
     let mut tasks = Vec::new();
-    if let Some(relay_addr) = daemon
-        .config
-        .relay_addr
-        .as_deref()
-        .filter(|addr| !addr.is_empty())
-    {
+    if let Some(relay_addr) = daemon.effective_relay_addr().as_deref() {
         tasks.push(spawn_relay_supervisor(
             &engine,
             &keys,
@@ -1551,6 +1613,8 @@ mod effective_v4_cidr_tests {
             expires_at_unix: None,
             network_cidr: cidr.map(str::to_string),
             dns_v4: None,
+            relay_addr: None,
+            stun_addrs: vec![],
         }
     }
 
@@ -1664,6 +1728,32 @@ fn stun_targets_from(explicit: Option<Vec<String>>, relay: Option<String>) -> Ve
         .and_then(|relay| relay_host_of(&relay))
         .map(|host| vec![format!("{host}:3478"), format!("{host}:3479")])
         .unwrap_or_default()
+}
+
+/// Relay 地址三级优先级（纯函数，#97）：显式配置 > coord 下发 > ADR-0004
+/// 推导。
+fn effective_relay(
+    explicit: Option<String>,
+    coord_provided: Option<String>,
+    coord_addr: Option<&str>,
+) -> Option<String> {
+    explicit
+        .filter(|addr| !addr.is_empty())
+        .or_else(|| coord_provided.filter(|addr| !addr.is_empty()))
+        .or_else(|| coord_addr.and_then(derive_relay_from_coord))
+}
+
+/// ADR-0004 推导（#97）：coord 地址的主机名以 `coord.` 开头时，Relay 在
+/// `relay.<域名>`（https）；否则不推导——无从断定该部署有 Relay 子域。
+fn derive_relay_from_coord(coord_addr: &str) -> Option<String> {
+    let host = coord_addr
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(coord_addr);
+    let host = host.split(['/', ':']).next().unwrap_or_default();
+    host.strip_prefix("coord.")
+        .filter(|rest| !rest.is_empty())
+        .map(|rest| format!("https://relay.{rest}"))
 }
 
 /// 地址串的主机部分（去 scheme、去端口）。
@@ -2794,8 +2884,18 @@ fn spawn_map_task(
                                 hz_proto::network_map_message::Kind::Full(_) => false,
                             };
                             let change = match kind {
-                                hz_proto::network_map_message::Kind::Full(map) => cache
-                                    .apply_full(map.nodes.into_iter().map(MapNode::from).collect()),
+                                hz_proto::network_map_message::Kind::Full(map) => {
+                                    // Relay / STUN 下发（#97）：随全量快照刷新运行时取值
+                                    // （生效于下一次数据面拉起；显式配置不受影响）。
+                                    note_coord_transport(
+                                        &daemon,
+                                        map.relay_addr.clone(),
+                                        map.stun_addrs.clone(),
+                                    );
+                                    cache.apply_full(
+                                        map.nodes.into_iter().map(MapNode::from).collect(),
+                                    )
+                                }
                                 hz_proto::network_map_message::Kind::Delta(delta) => cache
                                     .apply_delta(
                                         delta
@@ -3023,6 +3123,95 @@ mod desired_state_tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod relay_stun_priority_tests {
+    use super::*;
+
+    /// 显式配置 > coord 下发 > ADR-0004 推导；空串视同未提供。
+    #[test]
+    fn relay_priority_explicit_then_coord_then_derivation() {
+        let derived = Some("https://coord.example.com");
+        assert_eq!(
+            effective_relay(
+                Some("https://relay-explicit.example.com".into()),
+                Some("https://relay-coord.example.com".into()),
+                derived.map(str::to_string).as_deref(),
+            ),
+            Some("https://relay-explicit.example.com".into()),
+            "显式配置最优先"
+        );
+        assert_eq!(
+            effective_relay(
+                None,
+                Some("https://relay-coord.example.com".into()),
+                derived
+            ),
+            Some("https://relay-coord.example.com".into()),
+            "coord 下发胜过推导"
+        );
+        assert_eq!(
+            effective_relay(Some("".into()), None, derived),
+            Some("https://relay.example.com".into()),
+            "空串显式值视同未提供，落到推导"
+        );
+    }
+
+    /// 推导只在主机名以 `coord.` 开头时发生（ADR-0004 部署约定）。
+    #[test]
+    fn derivation_requires_coord_subdomain() {
+        assert_eq!(
+            derive_relay_from_coord("https://coord.example.com"),
+            Some("https://relay.example.com".to_string())
+        );
+        assert_eq!(
+            derive_relay_from_coord("https://coord.example.com:443"),
+            Some("https://relay.example.com".to_string()),
+            "端口不参与推导"
+        );
+        assert_eq!(
+            derive_relay_from_coord("coord.example.com"),
+            Some("https://relay.example.com".to_string()),
+            "无 scheme 也能取主机名"
+        );
+        assert_eq!(
+            derive_relay_from_coord("https://hz.example.com"),
+            None,
+            "非 coord. 前缀不推导"
+        );
+        assert_eq!(
+            derive_relay_from_coord("https://coord."),
+            None,
+            "空域名不推导"
+        );
+    }
+
+    /// STUN 优先级：显式列表 > coord 下发 > 从生效 Relay 主机推导双端口。
+    #[test]
+    fn stun_priority_explicit_then_coord_then_relay_host() {
+        assert_eq!(
+            stun_targets_from(Some(vec!["s1.example.com:3478".into()]), None),
+            vec!["s1.example.com:3478".to_string()]
+        );
+        assert_eq!(
+            stun_targets_from(
+                Some(vec!["a:3478".into(), " b:3479 ".into()]),
+                Some("https://r".into())
+            ),
+            vec!["a:3478".to_string(), "b:3479".to_string()],
+            "显式列表优先于 Relay 推导"
+        );
+        assert_eq!(
+            stun_targets_from(None, Some("https://relay.example.com".into())),
+            vec![
+                "relay.example.com:3478".to_string(),
+                "relay.example.com:3479".to_string()
+            ],
+            "无显式 STUN 时按 Relay 主机推导双端口（#76 nat 判定需要）"
+        );
+        assert!(stun_targets_from(None, None).is_empty());
     }
 }
 

@@ -22,6 +22,8 @@ fn registered_roundtrips_identity_fields() {
         owner_user: None,
         network_cidr: None,
         dns_v4: None,
+        relay_addr: None,
+        stun_addrs: vec![],
         expires_at_unix: Some(1_800_000_000),
     };
     let wire = serde_json::to_value(NodeStatus::Registered(info.clone())).unwrap();
@@ -53,6 +55,8 @@ fn expired_keeps_identity_and_roundtrips_with_expired_flag() {
         owner_user: Some("alice".to_string()),
         network_cidr: None,
         dns_v4: None,
+        relay_addr: None,
+        stun_addrs: vec![],
         expires_at_unix: Some(1),
     };
     let wire = serde_json::to_value(NodeStatus::Expired(info.clone())).unwrap();

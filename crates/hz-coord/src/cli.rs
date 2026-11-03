@@ -76,6 +76,13 @@ enum Command {
         /// install.sh 写入 HZD_COORD_ADDR 的 gRPC 公网地址（缺省取 public-url 的主机名配 https）
         #[arg(long)]
         public_grpc_addr: Option<String>,
+        /// 对 Node 下发的公共 Relay 地址（#97）：注册响应 / 登录轮询 / Network Map
+        /// 全量快照携带；缺省不下发（Node 侧按 ADR-0004 由 coord 主机名推导）
+        #[arg(long)]
+        public_relay_addr: Option<String>,
+        /// 对 Node 下发的公共 STUN 地址（逗号分隔，可多个）；缺省不下发
+        #[arg(long, value_delimiter = ',')]
+        public_stun_addr: Vec<String>,
     },
     /// 签发 Auth Key（本机管理操作）
     Bootstrap {
@@ -130,6 +137,8 @@ pub fn run() -> anyhow::Result<()> {
             dist_dir,
             public_url,
             public_grpc_addr,
+            public_relay_addr,
+            public_stun_addr,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -151,6 +160,8 @@ pub fn run() -> anyhow::Result<()> {
                 dist_dir,
                 public_url,
                 public_grpc_addr,
+                public_relay_addr,
+                public_stun_addr,
             })),
         Command::Bootstrap {
             db,
@@ -197,6 +208,8 @@ struct ServeArgs {
     dist_dir: Option<PathBuf>,
     public_url: Option<String>,
     public_grpc_addr: Option<String>,
+    public_relay_addr: Option<String>,
+    public_stun_addr: Vec<String>,
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -218,6 +231,8 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         dist_dir,
         public_url,
         public_grpc_addr,
+        public_relay_addr,
+        public_stun_addr,
     } = args;
     let listen: std::net::SocketAddr = listen
         .parse()
@@ -301,6 +316,24 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // 公共基地址同时用于 install.sh 与一次性登录链接（缺省时登录链接由回调地址推导）。
     let public_url = public_url.or_else(|| env_value("HZ_COORD_PUBLIC_URL"));
     config.public_url = public_url.clone();
+
+    // Relay / STUN 地址下发（#97）：也接受环境变量（容器/脚本部署）。
+    config.public_relay_addr = public_relay_addr
+        .or_else(|| env_value("HZ_COORD_PUBLIC_RELAY_ADDR"))
+        .filter(|addr| !addr.is_empty());
+    let public_stun = public_stun_addr;
+    if public_stun.is_empty() {
+        if let Some(raw) = env_value("HZ_COORD_PUBLIC_STUN_ADDR") {
+            config.public_stun_addrs = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|addr| !addr.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    } else {
+        config.public_stun_addrs = public_stun;
+    }
 
     let dist_dir = dist_dir.or_else(|| env_value("HZ_COORD_DIST_DIR").map(PathBuf::from));
     if let Some(dir) = dist_dir {
