@@ -1186,6 +1186,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hz-engine"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hz-coord",
+ "hz-core",
+ "hz-proto",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hz-proto"
 version = "0.3.0"
 dependencies = [
@@ -1227,6 +1245,7 @@ dependencies = [
  "chrono",
  "hz-coord",
  "hz-core",
+ "hz-engine",
  "hz-proto",
  "libc",
  "rand_core 0.6.4",
@@ -1237,6 +1256,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tun",
  "x25519-dalek",
 ]
 

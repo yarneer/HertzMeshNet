@@ -5,6 +5,7 @@ members = [
     "crates/hz-core",
     "crates/hz-coord",
     "crates/hz-relay",
+    "crates/hz-engine",
     "crates/hzd",
     "crates/hz",
 ]
@@ -19,6 +20,7 @@ license = "Apache-2.0"
 hz-core = { path = "crates/hz-core" }
 hz-coord = { path = "crates/hz-coord" }
 hz-proto = { path = "crates/hz-proto" }
+hz-engine = { path = "crates/hz-engine" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio", "form"] }
 base64 = "0.22"

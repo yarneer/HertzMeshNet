@@ -14,9 +14,20 @@ pub const DNS_PORT: u16 = 53;
 /// 网内域名后缀默认值；`<NodeName>.<suffix>` 解析到 Node Address。
 pub const DEFAULT_DNS_SUFFIX: &str = "hznet.internal";
 
-/// 读取环境变量 HZNET_DNS_SUFFIX 的后缀配置。
+/// 引擎注入的后缀覆盖（EngineConfig.dns_suffix；注入后不再看环境变量）。
+static SUFFIX_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 注入后缀覆盖（引擎启动时调用一次）。
+pub fn set_dns_suffix(suffix: String) {
+    let _ = SUFFIX_OVERRIDE.set(suffix);
+}
+
+/// 当前生效的域名后缀：引擎注入值 > 环境变量 HZNET_DNS_SUFFIX > 默认值。
 pub fn dns_suffix() -> String {
-    dns_suffix_from(std::env::var("HZNET_DNS_SUFFIX").ok().as_deref())
+    SUFFIX_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| dns_suffix_from(std::env::var("HZNET_DNS_SUFFIX").ok().as_deref()))
 }
 
 /// 纯函数形态的后缀解析：去空白、去首尾圆点、转小写；空值或未设置时用默认后缀。

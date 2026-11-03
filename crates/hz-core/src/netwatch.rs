@@ -26,6 +26,10 @@ pub enum NetEvent {
     /// 单调时钟落后墙钟超过阈值：休眠唤醒。NAT 映射大概率已失效，
     /// 即使快照没变也应重走恢复序列。
     ClockJump,
+    /// 平台自己的出口监视器直接判定物理出口变化（macOS 的轮询器、Android
+    /// 由 Kotlin ConnectivityManager 推送经此汇入）。与 Linux 的 netlink
+    /// 三变体不同：监视器已经判定过"确实变了"，消费者不再重算快照去抖。
+    EgressChanged,
 }
 
 /// 判为唤醒的单调/墙钟偏差。

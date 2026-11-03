@@ -8,9 +8,10 @@
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::net::Ipv4Addr;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, RawFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 
 /// 虚拟网卡的名称前缀排除表。第三方 TUN 类网络工具可能用表外名字创建
 /// tun 设备，Linux 上另用 `/sys/class/net/<if>/tun_flags` 的存在性兜底。
@@ -238,6 +239,39 @@ fn log_bound(iface: &str) {
     } else {
         tracing::info!(%iface, "outer traffic bound to physical egress");
         *last = Some(iface.to_string());
+    }
+}
+
+/// socket 保护钩子（ADR-0013 `Platform::protect` 的进程级安装点）：引擎
+/// 启动时注入，hz-core 的外层 socket 创建点（WireGuard UDP、coord / Relay
+/// TCP、引导 DNS 查询）统一经过它。返回值语义与
+/// [`bind_to_physical_egress`] 一致：成功时返回绑定目标名（Linux 重绑
+/// 记账用），失败返回 None。
+pub type SocketProtector = Arc<dyn Fn(RawFd) -> Option<String> + Send + Sync>;
+
+static SOCKET_PROTECTOR: std::sync::RwLock<Option<SocketProtector>> = std::sync::RwLock::new(None);
+
+/// 注入保护钩子（引擎启动时调用一次；后装覆盖先装）。
+pub fn set_socket_protector(protector: SocketProtector) {
+    *SOCKET_PROTECTOR.write().expect("socket protector poisoned") = Some(protector);
+}
+
+/// 当前安装的保护钩子（测试观察用）。
+pub fn socket_protector() -> Option<SocketProtector> {
+    SOCKET_PROTECTOR
+        .read()
+        .expect("socket protector poisoned")
+        .clone()
+}
+
+/// 外层 socket 的统一出口绑定入口：注入了 `Platform::protect` 钩子时走钩子
+/// （桌面即绑物理出口，Android 由 VpnService 保护），未注入时维持桌面默认
+/// （hz-core 单元测试路径）。
+pub fn protect_outer_socket<S: AsFd>(socket: &S) -> Option<String> {
+    use std::os::fd::AsRawFd;
+    match socket_protector() {
+        Some(protect) => protect(socket.as_fd().as_raw_fd()),
+        None => bind_to_physical_egress(socket),
     }
 }
 

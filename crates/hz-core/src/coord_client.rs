@@ -821,7 +821,7 @@ pub(crate) async fn connect_bound(addr: SocketAddr) -> io::Result<tokio::net::Tc
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     if !addr.ip().is_loopback() {
-        crate::netif::bind_to_physical_egress(&socket);
+        crate::netif::protect_outer_socket(&socket);
     }
     socket.set_nonblocking(true)?;
     match socket.connect(&SockAddr::from(addr)) {

@@ -158,15 +158,28 @@ impl OuterResolver {
     }
 }
 
+/// 引擎注入的引导 DNS 覆盖（EngineConfig.bootstrap_dns；Android 侧随
+/// 物理网络 DNS 刷新）。None = 未注入，走 `HZD_BOOTSTRAP_DNS` 旧语义。
+static BOOTSTRAP_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+
+/// 注入引导 DNS 覆盖（引擎启动时调用；逗号分隔的 IP 列表）。
+pub fn set_bootstrap_dns(servers: Option<String>) {
+    let _ = BOOTSTRAP_OVERRIDE.set(servers);
+}
+
 /// 进程级解析器：系统 DNS 用 getaddrinfo；引导 DNS 列表在每次需要回退时
-/// 现查（`HZD_BOOTSTRAP_DNS` 优先，其次系统经 DHCP 获得的 DNS，最后公共
-/// DNS），网络切换后 DHCP 下发的 DNS 变化也能跟上。
+/// 现查（引擎注入的覆盖 > `HZD_BOOTSTRAP_DNS` > 系统经 DHCP 获得的 DNS >
+/// 公共 DNS），网络切换后 DHCP 下发的 DNS 变化也能跟上。
 pub fn global() -> &'static OuterResolver {
     static RESOLVER: OnceLock<OuterResolver> = OnceLock::new();
     RESOLVER.get_or_init(|| {
         OuterResolver::build(
             Box::new(|| {
-                let configured = std::env::var("HZD_BOOTSTRAP_DNS").ok();
+                let configured = BOOTSTRAP_OVERRIDE
+                    .get()
+                    .cloned()
+                    .flatten()
+                    .or_else(|| std::env::var("HZD_BOOTSTRAP_DNS").ok());
                 bootstrap_servers(configured.as_deref(), &system_nameservers())
             }),
             Box::new(|host, port| {
@@ -302,8 +315,8 @@ pub fn parse_scutil_nameservers(text: &str) -> Vec<IpAddr> {
     out
 }
 
-/// 本机经 DHCP 等获得的系统 DNS。
-fn system_nameservers() -> Vec<IpAddr> {
+/// 本机经 DHCP 等获得的系统 DNS（`Platform::system_dns` 的桌面取值）。
+pub fn system_nameservers() -> Vec<IpAddr> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("scutil")
@@ -335,7 +348,7 @@ fn query(server: SocketAddr, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> 
     };
     let socket = UdpSocket::bind(local)?;
     if !server.ip().is_loopback() {
-        crate::netif::bind_to_physical_egress(&socket);
+        crate::netif::protect_outer_socket(&socket);
     }
     socket.set_read_timeout(Some(QUERY_TIMEOUT))?;
     let id = query_id();

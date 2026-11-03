@@ -32,6 +32,43 @@ pub struct TunConfig {
     pub v4_cidr: String,
 }
 
+/// 平台无关的 TUN 读写端（ADR-0013）：`Platform::establish` 的产出。
+/// 桌面实现包 tun crate 的 AsyncDevice；Android 在 hz-android 以 VpnService
+/// 的原始 fd 构造。手动装箱的 async 方法（借 self / 缓冲区）保持 dyn 兼容。
+pub trait TunIo: Send + Sync {
+    /// 明文 IP 包写入 TUN。
+    fn send_packet<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
+    /// 从 TUN 读一个明文 IP 包，返回长度。
+    fn recv_packet<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub type SharedTunDevice = Arc<dyn TunIo>;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl TunIo for Arc<tun::AsyncDevice> {
+    fn send_packet<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.send(packet).await.map(|_| ()) })
+    }
+
+    fn recv_packet<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>
+    {
+        Box::pin(async move { self.recv(buf).await })
+    }
+}
+
 /// 计算配置 hz0 需要的全部 `ip` 命令参数序列。
 /// 点对点 /32 + /128 地址，路由只挂 HzNet v4 段与 ULA /48。
 pub fn route_args(cfg: &TunConfig) -> Vec<Vec<String>> {

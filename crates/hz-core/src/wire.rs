@@ -668,7 +668,8 @@ impl SocketEngine {
             .await
             .with_context(|| format!("bind udp :{port} failed"))?;
         let device = if bind_to_egress {
-            crate::netif::bind_to_physical_egress(&socket)
+            // 经 Platform::protect（引擎注入的钩子）；未注入时维持桌面默认。
+            crate::netif::protect_outer_socket(&socket)
         } else {
             None
         };

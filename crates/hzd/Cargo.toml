@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 hz-core.workspace = true
+hz-engine.workspace = true
 rand_core.workspace = true
 hz-proto.workspace = true
 anyhow.workspace = true
@@ -19,6 +20,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+tun = { version = "0.8", features = ["async"] }
 
 [dev-dependencies]
 hz-coord.workspace = true
