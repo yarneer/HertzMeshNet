@@ -1,0 +1,48 @@
+# XcodeGen 工程描述（规格 §8 / MC-9）：只提交本文件，不提交 .pbxproj。
+# `xcodegen generate` 生成 Xcode 工程；签名与公证在 CI（#93）接入。
+name: HzNetClient
+options:
+  bundleIdPrefix: net.hznet
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+packages:
+  HzNetClient:
+    path: .
+targets:
+  HzNetClientApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/HzNetClientApp
+    dependencies:
+      - package: HzNetClient
+        product: HzNetClientKit
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: HzNet
+        CFBundleShortVersionString: "0.4.0"
+        LSUIElement: true  # 菜单栏 App：不进 Dock
+        LSMinimumSystemVersion: "13.0"
+        # hznet://join 深链（#88）
+        CFBundleURLTypes:
+          - CFBundleURLName: net.hznet.join
+            CFBundleURLSchemes: [hznet]
+        NSUserNotificationsUsageDescription: >-
+          HzNet 在身份即将到期、检测到 VPN 冲突或版本过旧时通知你。
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_BUNDLE_IDENTIFIER: net.hznet.client
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_STYLE: Automatic  # Developer ID 签名由 CI（#93）注入后覆盖
+schemes:
+  HzNetClient:
+    build:
+      targets:
+        HzNetClientApp: all
+    run:
+      config: Debug

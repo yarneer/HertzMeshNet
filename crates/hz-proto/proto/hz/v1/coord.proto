@@ -64,6 +64,10 @@ message HelloResponse {
   bytes challenge_nonce = 1;
   int64 challenge_expires_unix = 2;
   string server_version = 3;
+  // 版本提示（#89，optional：旧 coord 不带）：`behind`（落后于服务端）/
+  // `at_min`（协议版本已到支持下限，再落后将被拒）。与 Admin Console 的
+  // 版本比较同一判定；Node 侧写进 status 快照供 Client App 通知。
+  optional string version_hint = 4;
 }
 
 message RegisterAuthKeyRequest {

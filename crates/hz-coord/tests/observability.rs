@@ -335,3 +335,45 @@ async fn last_seen_flushes_to_db_after_stream_disconnects() {
     }
     panic!("流断开 14 秒后 last_seen 仍未落库");
 }
+
+/// #89：coord 在 Hello 应答里向 Node 下发版本提示——判定与 Admin Console
+/// 的版本比较一致（behind / at_min；同版本与更高版本不带）。
+#[tokio::test]
+async fn hello_carries_version_hint_for_older_nodes() {
+    let server = start_server().await;
+    let keys = node_keys();
+    let mut client = connect(server.handle.local_addr).await;
+
+    let cases: &[(Option<&str>, u32, Option<&str>)] = &[
+        // 落后于 coord：协议仍在用 1（== MIN_SUPPORTED）→ at_min（再落后
+        // 就被拒）。behind 只在协议升代后（min > 旧协议）对旧 Node 出现，
+        // 纯判定分支由 hz-coord health 的表驱动单测覆盖。
+        (Some("0.2.2 (abcdef1)"), 1, Some("at_min")),
+        // 同版本（commit 不同也算同）：不带。
+        (Some("0.3.0 (a1b2c3d)"), 1, None),
+        // 更高版本：不带。
+        (Some("9.9.9"), 1, None),
+        // 旧 Node 不上报版本：无提示（App 显示未知但不通知）。
+        (None, 1, None),
+    ];
+    for (node_version, protocol, expect) in cases {
+        let response = client
+            .hello(HelloRequest {
+                protocol_version: *protocol,
+                machine_key_pub: keys.machine.verifying_key().to_bytes().to_vec(),
+                hostname: "hint-host".to_owned(),
+                node_version: node_version.map(str::to_string),
+                os: Some("macos".to_string()),
+                arch: Some("aarch64".to_string()),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response.version_hint.as_deref(),
+            *expect,
+            "node_version={node_version:?} 的版本提示"
+        );
+    }
+    server.handle.shutdown();
+}

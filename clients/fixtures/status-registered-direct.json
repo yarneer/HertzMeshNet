@@ -1,0 +1,38 @@
+{
+  "coord_addr": "https://coord.example.com",
+  "desired_state": "up",
+  "diagnostics": {
+    "dns_fallback": null,
+    "route_repair": null
+  },
+  "dns_suffix": "hznet.internal",
+  "dns_v4": "100.96.0.53",
+  "expires_at_unix": 1900000000,
+  "ipv4": "100.96.0.1",
+  "ipv6": "fd00:96::1",
+  "name": "mini",
+  "network_cidr": "100.96.0.0/16",
+  "node_id": "n-mini",
+  "owner_user": "alice",
+  "peers": [
+    {
+      "endpoint": "203.0.113.9:41001",
+      "endpoints": [
+        "203.0.113.9:41001"
+      ],
+      "handshake_secs": 4,
+      "ipv4": "100.96.0.2",
+      "ipv6": "fd00:96::2",
+      "name": "beefy-pc",
+      "path": "direct"
+    }
+  ],
+  "policy": {
+    "dropped": 0,
+    "version": 0
+  },
+  "registered": true,
+  "revoked": false,
+  "tags": [],
+  "version_hint": ""
+}

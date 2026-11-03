@@ -1,0 +1,12 @@
+{
+  "node": {
+    "expires_at_unix": 1900000000,
+    "ipv4": "100.96.0.1",
+    "ipv6": "fd00:96::1",
+    "name": "mini",
+    "node_id": "n-mini",
+    "owner_user": "alice",
+    "tags": []
+  },
+  "state": "completed"
+}

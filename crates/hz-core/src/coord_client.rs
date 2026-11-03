@@ -15,9 +15,9 @@ use hz_proto::coord_client::CoordClient;
 use hz_proto::{
     AdminCreateAuthKeyRequest, AdminCreateInviteRequest, AdminListInvitesRequest,
     AdminRevokeAuthKeyRequest, AdminRevokeInviteRequest, BeginLoginRequest, DeleteNodeRequest,
-    HelloRequest, ListNodesRequest, LoginStatusRequest, PROTOCOL_VERSION, PolicyGetRequest,
-    PolicyPushRequest, PolicyRollbackRequest, RegisterAuthKeyRequest, RenameNodeRequest,
-    ReportEndpointsRequest, RevokeNodeRequest, StreamMapRequest,
+    HelloRequest, HelloResponse, ListNodesRequest, LoginStatusRequest, PROTOCOL_VERSION,
+    PolicyGetRequest, PolicyPushRequest, PolicyRollbackRequest, RegisterAuthKeyRequest,
+    RenameNodeRequest, ReportEndpointsRequest, RevokeNodeRequest, StreamMapRequest,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tonic::Streaming;
@@ -44,6 +44,26 @@ fn hello_request(keys: &KeyStore, hostname: &str) -> HelloRequest {
     }
 }
 
+/// coord 最近一次 Hello 应答携带的版本提示（#89）：`behind` / `at_min`。
+/// 进程级缓存——Hello 应答只在 coord_client 内部出现，hzd 的 status 组装
+/// 从这里读；旧 coord 不带该字段时保持 None。
+static SERVER_VERSION_HINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn note_server_version_hint(hint: Option<String>) {
+    *SERVER_VERSION_HINT
+        .lock()
+        .expect("server version hint poisoned") = hint;
+}
+
+/// 当前已知的 coord 版本提示（#89）。None = 旧 coord 或尚未 Hello 过，
+/// hzd 侧以空字符串进 status 快照。
+pub fn server_version_hint() -> Option<String> {
+    SERVER_VERSION_HINT
+        .lock()
+        .expect("server version hint poisoned")
+        .clone()
+}
+
 /// 用 Auth Key 完成 Machine-Key 挑战注册，返回授予的身份。
 pub async fn register_with_auth_key(
     state_dir: &Path,
@@ -56,11 +76,7 @@ pub async fn register_with_auth_key(
     let channel = connect(coord_addr).await?;
     let mut client = CoordClient::new(channel);
 
-    let hello = client
-        .hello(hello_request(&keys, hostname))
-        .await
-        .map_err(|status| anyhow!("注册失败：Coordination Server 拒绝了 Hello（{status}）"))?
-        .into_inner();
+    let hello = say_hello(&mut client, &keys, hostname, "注册失败").await?;
 
     let nonce = hello.challenge_nonce.clone();
     let signature = keys.machine().sign(&nonce).to_bytes();
@@ -104,11 +120,13 @@ pub async fn open_network_map_stream(
     let channel = connect(coord_addr).await?;
     let mut client = CoordClient::new(channel);
 
-    let hello = client
-        .hello(hello_request(&keys, &local_hostname()))
-        .await
-        .map_err(|status| anyhow!("Network Map 订阅失败：Hello 被拒绝（{status}）"))?
-        .into_inner();
+    let hello = say_hello(
+        &mut client,
+        &keys,
+        &local_hostname(),
+        "Network Map 订阅失败",
+    )
+    .await?;
 
     let nonce = hello.challenge_nonce;
     let signature = keys.machine().sign(&nonce).to_bytes();
@@ -149,11 +167,7 @@ pub async fn report_endpoints(
     let channel = connect(coord_addr).await?;
     let mut client = CoordClient::new(channel);
 
-    let hello = client
-        .hello(hello_request(&keys, &local_hostname()))
-        .await
-        .map_err(|status| anyhow!("Endpoint 上报失败：Hello 被拒绝（{status}）"))?
-        .into_inner();
+    let hello = say_hello(&mut client, &keys, &local_hostname(), "Endpoint 上报失败").await?;
     let nonce = hello.challenge_nonce;
     let signature = keys.machine().sign(&nonce).to_bytes();
     client
@@ -200,11 +214,7 @@ pub async fn begin_interactive_login(
     let channel = connect(coord_addr).await?;
     let mut client = CoordClient::new(channel);
 
-    let hello = client
-        .hello(hello_request(&keys, hostname))
-        .await
-        .map_err(|status| anyhow!("登录失败：Coordination Server 拒绝了 Hello（{status}）"))?
-        .into_inner();
+    let hello = say_hello(&mut client, &keys, hostname, "登录失败").await?;
 
     let nonce = hello.challenge_nonce.clone();
     let signature = keys.machine().sign(&nonce).to_bytes();
@@ -258,11 +268,7 @@ pub async fn poll_login_status(
     let channel = connect(coord_addr).await?;
     let mut client = CoordClient::new(channel);
 
-    let hello = client
-        .hello(hello_request(&keys, hostname))
-        .await
-        .map_err(|status| anyhow!("登录状态查询失败：Hello 被拒绝（{status}）"))?
-        .into_inner();
+    let hello = say_hello(&mut client, &keys, hostname, "登录状态查询失败").await?;
     let nonce = hello.challenge_nonce;
     let signature = keys.machine().sign(&nonce).to_bytes();
     let response = client
@@ -303,17 +309,30 @@ async fn connect(coord_addr: &str) -> anyhow::Result<Channel> {
     connect_tls_channel(coord_addr, None).await
 }
 
+/// 发 Hello 并记录版本提示（#89）。所有调用点共用；`context` 进错误文案
+/// （注册失败：/ Endpoint 上报失败：……），保持各方法的既有报错语义。
+pub(crate) async fn say_hello(
+    client: &mut CoordClient<Channel>,
+    keys: &KeyStore,
+    hostname: &str,
+    context: &str,
+) -> anyhow::Result<HelloResponse> {
+    let hello = client
+        .hello(hello_request(keys, hostname))
+        .await
+        .map_err(|status| anyhow!("{context}：Coordination Server 拒绝了 Hello（{status}）"))?
+        .into_inner();
+    note_server_version_hint(hello.version_hint.clone());
+    Ok(hello)
+}
+
 /// Hello → 签挑战的公共两步；返回（nonce, signature）。
 async fn signed_challenge(
     client: &mut CoordClient<Channel>,
     keys: &crate::keys::KeyStore,
     hostname: &str,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let hello = client
-        .hello(hello_request(keys, hostname))
-        .await
-        .map_err(|status| anyhow!("Hello 被拒绝（{status}）"))?
-        .into_inner();
+    let hello = say_hello(client, keys, hostname, "调用被拒绝").await?;
     let nonce = hello.challenge_nonce;
     let signature = keys.machine().sign(&nonce).to_bytes().to_vec();
     Ok((nonce, signature))

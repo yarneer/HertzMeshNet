@@ -44,5 +44,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (macOS)
         run: cargo clippy --all-targets -- -D warnings
-      - name: Test (macOS)
+      - name: Test (macOS，含 fixture 重生成)
         run: cargo test --all
+      - name: 契约 fixture 无漂移（#85/MC-5）
+        run: git diff --exit-code clients/fixtures
+      - name: Swift 测试（Kit，swift run 驱动）
+        run: swift run --package-path clients/macos HzNetClientKitTests
+      - name: XcodeGen 生成并构建 App（验证 SwiftUI 目标可编译）
+        run: |
+          brew install xcodegen
+          cd clients/macos && xcodegen generate \
+            && xcodebuild -project HzNetClient.xcodeproj -scheme HzNetClient -configuration Debug build \
+              CODE_SIGNING_ALLOWED=NO | xcbeautify --quiet || \
+            xcodebuild -project HzNetClient.xcodeproj -scheme HzNetClient -configuration Debug build \
+              CODE_SIGNING_ALLOWED=NO

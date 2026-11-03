@@ -80,7 +80,9 @@ enum LoginProgress {
     Failed { error: String },
 }
 
-/// `hz status` 展示的一个对端；来源于本地 Network Map 缓存 + 数据面现状。
+/// `hz status` / 订阅快照展示的一个对端；来源于本地 Network Map 缓存 +
+/// 数据面现状。relay_reason 让 Client App 的对端列表能直接显示中转原因
+/// （#86），与 netcheck 的判定同一来源（relay_reason_map）。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MapPeer {
     pub name: String,
@@ -92,6 +94,9 @@ pub struct MapPeer {
     pub path: Option<String>,
     /// 直连时在用的 Endpoint（Relayed 时为 null）。
     pub endpoint: Option<String>,
+    /// 走 Relay 时的本地判定原因（规格 §4）；直连为 null。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_reason: Option<String>,
 }
 
 /// 物理出口变化代数（FR-8 网络变化恢复）。恢复序列递增它；到 Coordination
@@ -930,6 +935,19 @@ async fn status_value(daemon: &Daemon) -> Result<Value, String> {
             .as_str()
     );
     value["dns_suffix"] = serde_json::json!(hz_core::dns::dns_suffix());
+    // 注册时连接的 Coordination Server（#88 深链校验"已注册到不同 coord"）。
+    value["coord_addr"] = serde_json::json!(
+        daemon
+            .coord_addr
+            .lock()
+            .expect("coord addr poisoned")
+            .clone()
+            .unwrap_or_default()
+    );
+    // coord 的版本提示（#89）：behind / at_min；旧 coord（或尚未 Hello 过）
+    // 为空字符串，App 侧不触发"版本过旧"通知。
+    value["version_hint"] =
+        serde_json::json!(hz_core::coord_client::server_version_hint().unwrap_or_default());
     value["revoked"] = serde_json::json!(*daemon.revoked.lock().expect("revoked poisoned"));
     // #25：最近一次运行中路由修复与引导 DNS 回退，供 hz status 汇报。
     let route_repair = LAST_ROUTE_REPAIR
@@ -1161,6 +1179,12 @@ fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {
                 .collect()
         })
         .unwrap_or_default();
+    // 中转原因（#86）：与 Health Report 同一判定来源；netcheck 现场探测的
+    // UDP 结论这里拿不到，传 true 让 local_udp_broken 只经周期上报路径报出。
+    let relay_reasons = match daemon.engine.lock().expect("engine poisoned").as_ref() {
+        Some(engine) => relay_reason_map(daemon, engine, true),
+        None => HashMap::new(),
+    };
     daemon
         .map_cache
         .snapshot()
@@ -1168,18 +1192,19 @@ fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {
         .filter(|node| own_node_id.as_deref() != Some(node.node_id.as_str()))
         .map(|node| {
             let report = reports.get(&node.node_id);
+            let path = report.map(|report| if report.use_relay { "relay" } else { "direct" });
             MapPeer {
                 handshake_secs: ages
                     .get(&node.node_id)
                     .and_then(|age| age.map(Duration::from))
                     .map(|age| age.as_secs()),
-                path: report.map(|report| {
-                    if report.use_relay {
-                        "relay".to_string()
-                    } else {
-                        "direct".to_string()
+                relay_reason: match path {
+                    Some("relay") => {
+                        relay_reasons.get(&node.node_id).map(|reason| reason.to_string())
                     }
-                }),
+                    _ => None,
+                },
+                path: path.map(str::to_string),
                 endpoint: report
                     .and_then(|report| report.endpoint)
                     .map(|endpoint| endpoint.to_string()),

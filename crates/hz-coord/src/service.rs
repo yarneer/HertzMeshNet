@@ -605,14 +605,29 @@ impl Coord for CoordServiceImpl {
             os: req.os,
             arch: req.arch,
         };
-        let (nonce, _expires) = self
-            .challenges
-            .issue(machine_key_pub, req.hostname, runtime);
+        let (nonce, _expires) =
+            self.challenges
+                .issue(machine_key_pub, req.hostname, runtime.clone());
+        // 版本提示（#89）：与 Admin Console 的版本比较同一判定，只换成 Node
+        // 可读的单词。协议版本取请求携带值——Hello 时就是 Node 在用的协议。
+        // （node_version 已被上移进 runtime，从 runtime 读。）
+        let node_version_for_hint = runtime.node_version.clone();
+        let version_hint = match crate::health::version_status(
+            node_version_for_hint.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+            Some(req.protocol_version),
+            hz_proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+        ) {
+            crate::health::VersionStatus::Behind => Some("behind".to_string()),
+            crate::health::VersionStatus::AtMin => Some("at_min".to_string()),
+            _ => None,
+        };
         let challenge_expires_unix = system_time_to_unix(SystemTime::now() + CHALLENGE_TTL);
         Ok(Response::new(HelloResponse {
             challenge_nonce: nonce.to_vec(),
             challenge_expires_unix,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            version_hint,
         }))
     }
 

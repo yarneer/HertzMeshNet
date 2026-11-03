@@ -1,0 +1,104 @@
+{
+  "arch": "aarch64",
+  "log_note": "最近 2 行（/Library/Logs/hzd.log，已脱敏）",
+  "log_tail": [
+    "2026-10-29T10:00:00Z INFO hzd starting",
+    "2026-10-29T10:00:01Z INFO path=direct endpoint=203.0.113.9:41001 node_id=n-beefy-pc"
+  ],
+  "netcheck": {
+    "egress": {
+      "default_route": "en0",
+      "physical": "en0",
+      "virtual_holds_default": false
+    },
+    "endpoints": [
+      {
+        "addr": "192.168.31.63:51820",
+        "kind": "lan",
+        "suspicious": []
+      },
+      {
+        "addr": "203.0.113.9:41001",
+        "kind": "stun",
+        "suspicious": []
+      }
+    ],
+    "ipv6_usable": false,
+    "peers": [
+      {
+        "name": "beefy-pc",
+        "node_id": "n-beefy-pc",
+        "path": "direct",
+        "punch": "success",
+        "relay_reason": null
+      }
+    ],
+    "portmap": {
+      "external": null,
+      "multi_nat": false,
+      "protocol": null
+    },
+    "relay_rtt_ms": 12.5,
+    "stun": {
+      "mapped": [
+        "203.0.113.9:41001"
+      ],
+      "nat": "easy",
+      "targets": 2
+    },
+    "udp": {
+      "ipv4": {
+        "error": null,
+        "mapped": "203.0.113.9:41001",
+        "ok": true,
+        "stage": null
+      },
+      "ipv6": {
+        "error": "无该族 STUN 目标",
+        "mapped": null,
+        "ok": false,
+        "stage": "query"
+      }
+    }
+  },
+  "os": "macos",
+  "status": {
+    "coord_addr": "https://coord.example.com",
+    "desired_state": "up",
+    "diagnostics": {
+      "dns_fallback": null,
+      "route_repair": null
+    },
+    "dns_suffix": "hznet.internal",
+    "dns_v4": "100.96.0.53",
+    "expires_at_unix": 1900000000,
+    "ipv4": "100.96.0.1",
+    "ipv6": "fd00:96::1",
+    "name": "mini",
+    "network_cidr": "100.96.0.0/16",
+    "node_id": "n-mini",
+    "owner_user": "alice",
+    "peers": [
+      {
+        "endpoint": "203.0.113.9:41001",
+        "endpoints": [
+          "203.0.113.9:41001"
+        ],
+        "handshake_secs": 4,
+        "ipv4": "100.96.0.2",
+        "ipv6": "fd00:96::2",
+        "name": "beefy-pc",
+        "path": "direct"
+      }
+    ],
+    "policy": {
+      "dropped": 0,
+      "version": 0
+    },
+    "registered": true,
+    "revoked": false,
+    "tags": [],
+    "version_hint": ""
+  },
+  "version": "0.4.0 (a1b2c3d)"
+}

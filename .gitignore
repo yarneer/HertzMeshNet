@@ -2,3 +2,11 @@
 *.sock
 dist/
 scripts/deploy.zip
+
+# macOS Client App（clients/macos）构建产物
+clients/macos/.build/
+clients/macos/Generated/
+clients/macos/*.xcodeproj
+
+# 本机 swift build 误在仓库根产生的产物
+/.build/
