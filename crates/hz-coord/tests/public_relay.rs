@@ -109,7 +109,7 @@ async fn configured_relay_and_stun_ride_registration_and_map() {
             invite_code: None,
             challenge_nonce: nonce,
             challenge_signature: signature,
-            auth_key: auth_key,
+            auth_key,
             node_key_pub: keys.node_public.to_vec(),
         })
         .await
