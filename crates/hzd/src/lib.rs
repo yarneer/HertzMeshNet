@@ -1199,9 +1199,9 @@ fn peers_view(daemon: &Daemon) -> Vec<MapPeer> {
                     .and_then(|age| age.map(Duration::from))
                     .map(|age| age.as_secs()),
                 relay_reason: match path {
-                    Some("relay") => {
-                        relay_reasons.get(&node.node_id).map(|reason| reason.to_string())
-                    }
+                    Some("relay") => relay_reasons
+                        .get(&node.node_id)
+                        .map(|reason| reason.to_string()),
                     _ => None,
                 },
                 path: path.map(str::to_string),
