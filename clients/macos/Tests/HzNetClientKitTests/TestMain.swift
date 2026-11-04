@@ -113,6 +113,7 @@ struct TestMain {
             suite.testDefaultFileName()
             try suite.testArchiveContainsSingleJsonEntry()
             try suite.testUnzipVerifiesArchive()
+            try suite.testWriteArchiveTightensToOwnerOnly()
             suite.testCrc32KnownVector()
             suite.testEmptyArchiveThrows()
         }

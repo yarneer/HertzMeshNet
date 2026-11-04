@@ -1,8 +1,8 @@
 import Foundation
 
-/// 诊断包导出（#90）：文件名生成与 zip 内容是纯函数（可测）；保存面板
-/// 与写盘由 App 层组合。zip 为 store（不压缩）实现——诊断内容是 JSON，
-/// 压缩收益小，换取零第三方依赖的可测实现。
+/// 诊断包导出（#90 / #110）：文件名与 zip 内容是纯函数；写盘后把 mode
+/// 收成 0600。保存面板仍由 App 层组合。zip 为 store（不压缩）——诊断内容
+/// 是 JSON，压缩收益小，换取零第三方依赖的可测实现。
 public enum DiagnosticsExport {
     /// 默认文件名：`hznet-diagnostics-<Node Name>-<yyyyMMdd-HHmmss>.zip`。
     /// Node Name 里的路径不安全字符替换为 `-`。
@@ -32,6 +32,18 @@ public enum DiagnosticsExport {
         writer.add(name: "diagnostics.json", data: json)
         // 归档 mtime 是导出时刻（诊断内容的时点在 JSON 的 status 里）。
         return try writer.finish(date: Date())
+    }
+
+    /// 写出 zip，再把权限收成仅属主可读写（0600）。`Data.write` 沿用
+    /// 已有文件的 mode 或进程 umask（保存面板默认往往是 0644），与 CLI
+    /// `hz diagnostics -o` 的 OpenOptions `.mode(0o600)` 对齐必须在写完后
+    /// 再设一次（#110）。不改 zip 字节。
+    public static func writeArchive(_ data: Data, to url: URL) throws {
+        try data.write(to: url)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
     }
 }
 
