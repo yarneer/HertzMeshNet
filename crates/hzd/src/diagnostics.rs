@@ -28,10 +28,14 @@ const MAX_TAIL_BYTES: usize = 512 * 1024;
 
 /// hzd 日志文件路径：`HZD_LOG_FILE` 显式指定（测试与手工部署），否则按
 /// 平台默认（macOS 是 launchd plist 的 StandardErrorPath）。Linux 的默认
-/// 落在 systemd journal，见 [`journal_tail`]。
+/// 落在 systemd journal，见 [`journal_tail`]。`HZD_JOURNAL_FILE` 注入时返回
+/// None，让 macOS 默认路径也让开，注入才能进 journal 管道。
 fn hzd_log_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("HZD_LOG_FILE") {
         return Some(PathBuf::from(path));
+    }
+    if std::env::var_os("HZD_JOURNAL_FILE").is_some() {
+        return None;
     }
     #[cfg(target_os = "macos")]
     {
@@ -936,9 +940,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.log");
         std::fs::write(&path, raw).unwrap();
+        // 走 daemon 同一入口。macOS 默认有 launchd 路径，必须仍能读到注入。
         let _unset = ClearEnv("HZD_JOURNAL_FILE");
-        unsafe { std::env::set_var("HZD_JOURNAL_FILE", &path) };
-        let (tail, note) = collect_log_tail_from(None);
+        unsafe {
+            std::env::remove_var("HZD_LOG_FILE");
+            std::env::set_var("HZD_JOURNAL_FILE", &path);
+        }
+        let (tail, note) = collect_log_tail();
 
         let joined = tail.join("\n");
         assert!(!joined.contains(pem_body), "{joined}");
