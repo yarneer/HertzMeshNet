@@ -7,7 +7,6 @@
 //! [`collect_tail_from_path`] 复用这里的管线。
 
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -24,12 +23,12 @@ pub fn collected_at_utc() -> String {
 pub const LOG_TAIL_LINES: usize = 2000;
 
 /// 单行截断上限：tracing 正常行远短于此，防个别爆行撑爆 IPC 1 MiB 上限。
-const MAX_LINE_CHARS: usize = 8 * 1024;
+pub const MAX_LINE_CHARS: usize = 8 * 1024;
 
 /// log_tail 总量预算（#84 评审）：2000 行 × 8 KiB 最坏可超 IPC 单行 1 MiB
 /// 上限——超预算时从最老的行开始丢弃，而不是让整份诊断以传输错误失败。
 /// 预算给 status/netcheck 部分留了充足余量。
-const MAX_TAIL_BYTES: usize = 512 * 1024;
+pub const MAX_TAIL_BYTES: usize = 512 * 1024;
 
 /// 反向扫的块大小。每次从当前偏移往前读一块，读够就停。
 const TAIL_CHUNK: u64 = 64 * 1024;
@@ -586,13 +585,6 @@ fn next_word(text: &str, start: usize, word: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
-    struct ClearEnv(&'static str);
-    impl Drop for ClearEnv {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var(self.0) };
-        }
-    }
-
     #[test]
     fn collected_at_is_utc_rfc3339() {
         let stamp = collected_at_utc();
@@ -789,9 +781,8 @@ mod tests {
     #[test]
     fn missing_log_file_yields_empty_tail_with_note() {
         // 文件不存在：空 tail + 说明，不报错（规格 §3.4）。
-        let (tail, note) = collect_tail_from_path(std::path::Path::new(
-            "/nonexistent/hzd-diagnostic-test.log",
-        ));
+        let (tail, note) =
+            collect_tail_from_path(std::path::Path::new("/nonexistent/hzd-diagnostic-test.log"));
         assert!(tail.is_empty());
         let note = note.expect("应附说明");
         assert!(
@@ -849,5 +840,4 @@ mod tests {
         assert!(joined.contains("203.0.113.9:41001"), "{joined}");
         assert!(note.unwrap().contains("已脱敏"));
     }
-
 }

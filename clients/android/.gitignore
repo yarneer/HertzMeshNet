@@ -6,3 +6,4 @@ local.properties
 .idea/
 captures/
 .kotlin/
+.DS_Store

@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 pub use hz_engine::diagnostics::{
-    LOG_TAIL_LINES, SCHEMA_VERSION, collected_at_utc, collect_tail_from_path, redact_line,
+    LOG_TAIL_LINES, SCHEMA_VERSION, collect_tail_from_path, collected_at_utc, redact_line,
     redact_lines,
 };
 
@@ -105,6 +105,7 @@ fn journal_tail() -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hz_engine::diagnostics::{MAX_LINE_CHARS, MAX_TAIL_BYTES};
 
     struct ClearEnv(&'static str);
     impl Drop for ClearEnv {
@@ -170,5 +171,4 @@ mod tests {
         );
         assert!(note.contains(&format!("最近 {} 行", tail.len())), "{note}");
     }
-
 }
