@@ -10,6 +10,7 @@
 //! Name、Node Address 与 Endpoint（排障需要）。`log_tail` 逐行脱敏之后，
 //! 整份诊断 JSON 再跑同一套规则（#108）。
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -42,8 +43,9 @@ fn hzd_log_path() -> Option<PathBuf> {
     }
 }
 
-/// 读取日志尾部并逐行脱敏。返回 (行列表, 说明)；读取失败时行为空、说明
-/// 告知原因（不报错，规格 §3.4）。
+/// 读取日志尾部并逐行脱敏。大文件从尾部反向扫，只读盖住行数上限或
+/// [`MAX_TAIL_BYTES`] 的字节，不把整份日志读进内存。返回 (行列表, 说明)；
+/// 读取失败时行为空、说明告知原因（不报错，规格 §3.4）。
 pub fn collect_log_tail() -> (Vec<String>, Option<String>) {
     collect_log_tail_from(hzd_log_path().as_deref())
 }
@@ -52,7 +54,7 @@ pub fn collect_log_tail() -> (Vec<String>, Option<String>) {
 /// journal 路径（Linux）或「未配置」。
 pub fn collect_log_tail_from(path: Option<&std::path::Path>) -> (Vec<String>, Option<String>) {
     if let Some(path) = path {
-        return match std::fs::read_to_string(path) {
+        return match read_log_file(path) {
             Ok(text) => {
                 let lines = fit_tail_budget(redact_lines(tail_lines(&text, LOG_TAIL_LINES)));
                 let count = lines.len();
@@ -93,6 +95,57 @@ pub fn collect_log_tail_from(path: Option<&std::path::Path>) -> (Vec<String>, Op
             Some("未配置 HZD_LOG_FILE，log_tail 为空".to_string()),
         )
     }
+}
+
+/// 反向扫的块大小。每次从当前偏移往前读一块，读够就停。
+const TAIL_CHUNK: u64 = 64 * 1024;
+
+/// 字节侧最多读到这里（预算再加一块），丢掉窗口起点的半行后仍盖住
+/// [`MAX_TAIL_BYTES`]。行数先凑满时读得更少。
+const TAIL_READ_LIMIT: u64 = MAX_TAIL_BYTES as u64 + TAIL_CHUNK;
+
+#[cfg(test)]
+thread_local! {
+    static LOG_TAIL_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn read_log_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    read_log_tail(&mut file, len)
+}
+
+/// 从文件尾部往前读，直到盖住 [`LOG_TAIL_LINES`] 或 [`TAIL_READ_LIMIT`]。
+/// 没读到文件头时，丢掉起点处的半行。更早的字节不进内存。
+fn read_log_tail(file: &mut (impl Read + Seek), len: u64) -> std::io::Result<String> {
+    if len == 0 {
+        return Ok(String::new());
+    }
+    let mut pos = len;
+    let mut chunks = Vec::new();
+    let mut newlines = 0usize;
+    while pos > 0 {
+        let n = TAIL_CHUNK.min(pos);
+        pos -= n;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut buf = vec![0u8; n as usize];
+        file.read_exact(&mut buf)?;
+        #[cfg(test)]
+        LOG_TAIL_BYTES_READ.with(|cell| cell.set(cell.get() + n));
+        newlines += buf.iter().filter(|b| **b == b'\n').count();
+        chunks.push(buf);
+        // 多计一个换行：中段起读时，最前面的换行只结束半行。
+        if newlines > LOG_TAIL_LINES || len - pos >= TAIL_READ_LIMIT {
+            break;
+        }
+    }
+    let mut bytes: Vec<u8> = chunks.into_iter().rev().flatten().collect();
+    if pos > 0 {
+        if let Some(i) = bytes.iter().position(|b| *b == b'\n') {
+            bytes.drain(..=i);
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// 文本最后 `max` 行，每行截断到 [`MAX_LINE_CHARS`]。
@@ -792,6 +845,48 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let (tail, note) = collect_log_tail_from(Some(&path));
         assert!(tail.is_empty());
+        assert!(note.unwrap().contains("已脱敏"));
+    }
+
+    #[test]
+    fn large_log_is_tail_read_not_loaded_whole() {
+        // 比尾读上限大一截：开头标记不应被读入；靠近预算内沿的行要留下。
+        let secret = "hznet.c3VwZXJzZWNyZXRrZXlkb25vdGNoYXJlMTIz";
+        let mut body = String::from("OLD-MARKER-SHOULD-DROP\n");
+        for i in 0..4000 {
+            body.push_str(&format!("old {i:05} {}\n", "z".repeat(400)));
+        }
+        body.push_str(&format!(
+            "tail secret {secret} endpoint=203.0.113.9:41001\n"
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        std::fs::write(&path, &body).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > TAIL_READ_LIMIT + TAIL_CHUNK);
+
+        LOG_TAIL_BYTES_READ.with(|cell| cell.set(0));
+        let (lines, note) = collect_log_tail_from(Some(&path));
+        let read = LOG_TAIL_BYTES_READ.with(|cell| cell.get());
+        assert!(read > 0, "尾读没有发生");
+        assert!(read < len, "整文件读入了 {read} / {len}");
+        assert!(
+            read <= TAIL_READ_LIMIT + TAIL_CHUNK,
+            "尾读 {read} 超过上限 {}",
+            TAIL_READ_LIMIT + TAIL_CHUNK
+        );
+
+        let joined = lines.join("\n");
+        assert!(!joined.contains("OLD-MARKER-SHOULD-DROP"), "{joined}");
+        assert!(!joined.contains("old 00000"), "{joined}");
+        assert!(!joined.contains("old 02000"), "预算之外的旧行不应留下");
+        assert!(joined.contains("old 02800"), "字节预算内沿附近的行应留下");
+        assert!(
+            !joined.contains("c3VwZXJzZWNyZXRrZXlkb25vdGNoYXJl"),
+            "{joined}"
+        );
+        assert!(joined.contains("hznet.[REDACTED]"), "{joined}");
+        assert!(joined.contains("203.0.113.9:41001"), "{joined}");
         assert!(note.unwrap().contains("已脱敏"));
     }
 }
