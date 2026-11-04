@@ -17,6 +17,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -39,6 +41,33 @@ fun OnboardingScreen(onDone: () -> Unit) {
     var inviteCode by remember { mutableStateOf("") }
     var note by remember { mutableStateOf<String?>(null) }
 
+    // VPN 授权走 ActivityResult：同意后自动继续原操作，不再要求手动重点。
+    var pendingAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val consentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val action = pendingAction
+        pendingAction = null
+        if (VpnService.prepare(context) == null) {
+            action?.invoke()
+        } else {
+            note = if (result.resultCode == android.app.Activity.RESULT_OK) {
+                "VPN 授权未完成，请重试"
+            } else {
+                "已拒绝 VPN 授权：HzNet 需要建立隧道才能加入，请重新点击并在系统对话框选“确定”"
+            }
+        }
+    }
+    fun ensureVpnConsent(action: () -> Unit) {
+        val prepare = VpnService.prepare(context)
+        if (prepare == null) {
+            action()
+        } else {
+            pendingAction = action
+            consentLauncher.launch(prepare)
+        }
+    }
+
     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("加入 HzNet", fontSize = 24.sp, fontWeight = FontWeight.Bold)
 
@@ -57,17 +86,12 @@ fun OnboardingScreen(onDone: () -> Unit) {
 
         Button(
             onClick = {
-                // 首次连接需要 VPN 授权（一次性）。
-                val prepare = VpnService.prepare(context)
-                if (prepare != null) {
-                    context.startActivity(prepare)
-                    note = "授权 VPN 后请重试"
-                    return@Button
+                ensureVpnConsent {
+                    HzNetVpnService.pendingBrowserLogin = coordAddr
+                    HzNetVpnService.start(context, configFor(context, coordAddr, nodeName))
+                    note = "已发起浏览器登录：完成登录后回到本 App"
+                    onDone()
                 }
-                HzNetVpnService.pendingBrowserLogin = coordAddr
-                HzNetVpnService.start(context, configFor(context, coordAddr, nodeName))
-                note = "已发起浏览器登录：完成登录后回到本 App"
-                onDone()
             },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("浏览器登录") }
@@ -80,15 +104,15 @@ fun OnboardingScreen(onDone: () -> Unit) {
         )
         OutlinedButton(
             onClick = {
-                val prepare = VpnService.prepare(context)
-                if (prepare != null) {
-                    context.startActivity(prepare)
-                    note = "授权 VPN 后请重试"
+                if (inviteCode.isBlank()) {
+                    note = "请先输入邀请码"
                     return@OutlinedButton
                 }
-                HzNetVpnService.pendingInvite = inviteCode.trim()
-                HzNetVpnService.start(context, configFor(context, coordAddr, nodeName))
-                onDone()
+                ensureVpnConsent {
+                    HzNetVpnService.pendingInvite = inviteCode.trim()
+                    HzNetVpnService.start(context, configFor(context, coordAddr, nodeName))
+                    onDone()
+                }
             },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("用邀请码加入") }
