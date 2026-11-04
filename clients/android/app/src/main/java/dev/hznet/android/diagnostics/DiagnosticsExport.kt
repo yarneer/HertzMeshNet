@@ -48,10 +48,12 @@ object DiagnosticsExport {
         val batteryWhitelisted: Boolean,
     )
 
-    /** 诊断 zip 的文件名（不含扩展名）：hznet-diagnostics-<node>-<时间>。 */
+    /** 诊断 zip 的文件名（不含扩展名）：hznet-diagnostics-<node>-<毫秒时间戳>。 */
     fun fileName(nodeName: String, epochMillis: Long): String {
-        val safeNode = nodeName.ifBlank { "node" }.replace(Regex("[^A-Za-z0-9-]"), "-")
-        return "hznet-diagnostics-$safeNode-${java.time.Instant.ofEpochMilli(epochMillis)}"
+        val safeNode = nodeName.ifBlank { "node" }
+            .lowercase()
+            .replace(Regex("[^a-z0-9-]"), "-")
+        return "hznet-diagnostics-$safeNode-$epochMillis"
     }
 
     /**
@@ -70,6 +72,8 @@ object DiagnosticsExport {
             put("battery_whitelisted", meta.batteryWhitelisted)
         }
         val diagnosticsJson = JSONObject(engineDiagnostics.toString()).apply {
+            // log_tail 一律是脱敏后的行（diagnostics.log 与 JSON 同源）。
+            put("log_tail", org.json.JSONArray(redacted))
             put("app", manifest)
         }
 

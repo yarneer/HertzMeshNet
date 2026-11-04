@@ -18,7 +18,7 @@ class UpdateCheckTest {
         assertTrue(UpdateCheck.isNewer("0.4.9", "1.0.0"))
         assertFalse(UpdateCheck.isNewer("0.4.0", "0.4.0"))
         assertFalse(UpdateCheck.isNewer("0.4.1", "0.4.0"))
-        assertFalse(UpdateCheck.isNewer("0.4.0", "0.4.0-dev1"), "非数字段按 0 处理，不算更高")
+        assertFalse("非数字段按 0 处理，不算更高", UpdateCheck.isNewer("0.4.0", "0.4.0-dev1"))
     }
 
     @Test

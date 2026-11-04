@@ -12,7 +12,7 @@ import java.util.zip.ZipInputStream
 
 /** #101：到期提醒时点与重排（纯函数，表驱动）。 */
 class ExpiryScheduleTest {
-    private const val DAY = 24 * 60 * 60 * 1000L
+    private val DAY = 24 * 60 * 60 * 1000L
     private val expires = 100 * DAY // 相对锚点
 
     @Test

@@ -29,15 +29,17 @@ class LoginFlow(
 
         companion object {
             fun everyTwoSeconds(): PollScheduler {
-                val executor = Executors.newSingleThreadScheduledExecutor { thread ->
-                    thread.isDaemon = true
-                    thread
-                }
+                val executor = Executors.newSingleThreadScheduledExecutor(
+                    object : java.util.concurrent.ThreadFactory {
+                        override fun newThread(task: Runnable): Thread =
+                            Thread(task, "hznet-login-poll").apply { isDaemon = true }
+                    }
+                )
                 return PollScheduler { task ->
-                    val future = executor.scheduleWithFixedDelay(
-                        task, 2, 2, TimeUnit.SECONDS
-                    )
-                    { future.cancel(false) }
+                    val future: java.util.concurrent.ScheduledFuture<*> =
+                        executor.scheduleWithFixedDelay(task, 2, 2, TimeUnit.SECONDS)
+                    val cancel: () -> Unit = { future.cancel(false) }
+                    cancel
                 }
             }
         }
@@ -61,7 +63,7 @@ class LoginFlow(
             return
         }
         onStarted(loginUrl)
-        cancelPolling = scheduler { pollOnce() }
+        cancelPolling = scheduler.schedule { pollOnce() }
     }
 
     private fun pollOnce() {

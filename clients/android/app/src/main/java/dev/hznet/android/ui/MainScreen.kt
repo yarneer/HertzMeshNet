@@ -208,7 +208,7 @@ private fun exportDiagnostics(context: Context, snapshot: JSONObject?) {
             androidVersion = Build.VERSION.RELEASE ?: "?",
             model = Build.MODEL ?: "?",
             privateDnsMode = runCatching {
-                Settings.Global.getString(context.contentResolver, Settings.Global.PRIVATE_DNS_MODE)
+                Settings.Global.getString(context.contentResolver, "private_dns_mode")
             }.getOrNull() ?: "off",
             batteryWhitelisted = power.isIgnoringBatteryOptimizations(context.packageName),
         ),
@@ -305,7 +305,7 @@ private fun PrivateDnsHint(context: Context) {
     val prefs = context.getSharedPreferences("hznet", Context.MODE_PRIVATE)
     if (prefs.getBoolean("private_dns_hint_done", false)) return
     val strict = runCatching {
-        Settings.Global.getString(context.contentResolver, Settings.Global.PRIVATE_DNS_MODE)
+        Settings.Global.getString(context.contentResolver, "private_dns_mode")
     }.getOrNull() == "strict"
     if (!strict) return
     AlertDialog(

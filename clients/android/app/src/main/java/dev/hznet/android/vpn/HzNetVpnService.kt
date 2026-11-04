@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import dev.hznet.android.engine.EngineBridge
 import dev.hznet.android.engine.HzNetPlatform
 import dev.hznet.android.engine.SnapshotSink
+import dev.hznet.android.ui.AppModel
 import dev.hznet.android.ui.LoginFlow
 import dev.hznet.android.ui.MainActivity
 import org.json.JSONObject
@@ -236,12 +237,8 @@ class HzNetVpnService : VpnService() {
 
     private fun notifyRevoked() {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(
-            2,
-            buildNotification("HzNet 已被其他 VPN 接管").setContentText(
-                "Android 同一时间只允许一个 VPN。需要 HzNet 时请断开另一个 VPN 后重连。"
-            ).build()
-        )
+        manager.notify(2, buildNotification("HzNet 已被其他 VPN 接管",
+            "Android 同一时间只允许一个 VPN。需要 HzNet 时请断开另一个 VPN 后重连。"))
     }
 
     private fun isRegistered(): Boolean =
@@ -260,7 +257,9 @@ class HzNetVpnService : VpnService() {
         )
     }
 
-    private fun buildNotification(text: String): Notification {
+    private fun buildNotification(text: String): Notification = buildNotification("HzNet", text)
+
+    private fun buildNotification(title: String, text: String): Notification {
         val open = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
@@ -268,7 +267,7 @@ class HzNetVpnService : VpnService() {
         )
         return NotificationCompat.Builder(this, CHANNEL_STATUS)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentTitle("HzNet")
+            .setContentTitle(title)
             .setContentText(text)
             .setOngoing(true)
             .setContentIntent(open)

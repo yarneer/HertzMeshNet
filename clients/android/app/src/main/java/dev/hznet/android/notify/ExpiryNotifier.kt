@@ -22,10 +22,10 @@ import java.util.concurrent.TimeUnit
  * 1 天档通知带"重新登录"直达登录流程（打开 App 引导）。
  */
 object ExpiryNotifier {
-    private const val CHANNEL = "hznet-expiry"
-    private const val WORK_NAME = "hznet-expiry-reminders"
-    private const val KEY_TIER = "tier"
-    private const val KEY_EXPIRES_AT = "expires_at"
+    const val CHANNEL = "hznet-expiry"
+    const val WORK_NAME = "hznet-expiry-reminders"
+    const val KEY_TIER = "tier"
+    const val KEY_EXPIRES_AT = "expires_at"
     const val NOTIFICATION_ID_THREE_DAYS = 101
     const val NOTIFICATION_ID_ONE_DAY = 102
 

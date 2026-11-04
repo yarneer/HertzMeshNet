@@ -20,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import android.os.Build
 import dev.hznet.android.engine.EngineBridge
 import dev.hznet.android.vpn.HzNetVpnService

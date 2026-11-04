@@ -62,7 +62,8 @@ class LoginFlowTest {
             }
         }
 
-        fun runOne() = queue.removeFirstOrNull()?.invoke() ?: error("没有排队的轮询任务")
+        /** 触发一拍：周期任务保持登记（真实调度器会重复执行），cancel 才清空。 */
+        fun runOne() = queue.firstOrNull()?.invoke() ?: error("没有排队的轮询任务")
     }
 
     @Test
@@ -85,7 +86,7 @@ class LoginFlowTest {
         manual.runOne() // pending
         manual.runOne() // completed → 终态 + 取消
         assertEquals(listOf(LoginFlow.Outcome.COMPLETED), outcomes)
-        assertTrue(manual.cancelled, "终态后必须取消轮询")
+        assertTrue("终态后必须取消轮询", manual.cancelled)
         assertEquals(3, backend.pollCalls)
     }
 
