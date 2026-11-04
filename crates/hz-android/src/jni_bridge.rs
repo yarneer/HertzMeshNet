@@ -66,12 +66,19 @@ impl AndroidPlatform {
         let mut env = self.vm.attach_current_thread()?;
         let jconfig: JString = env.new_string(&spec_json)?;
         let object: &JObject<'_> = self.platform.as_obj();
-        let value = env.call_method(
+        let value = match env.call_method(
             object,
             "establish",
             "(Ljava/lang/String;)I",
             &[jni::objects::JValue::Object(&jconfig)],
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                // Java 侧抛了异常：必须显式清除，否则返回 JVM 后原样重抛（进程崩）。
+                let _ = env.exception_clear();
+                anyhow::bail!("Kotlin establish 调用失败：{error}");
+            }
+        };
         let fd = value.i()?;
         anyhow::ensure!(fd >= 0, "Kotlin establish 返回了无效 fd：{fd}");
         Ok(fd as RawFd)
@@ -82,14 +89,19 @@ impl AndroidPlatform {
             return false;
         };
         let object: &JObject<'_> = self.platform.as_obj();
-        env.call_method(
+        match env.call_method(
             object,
             "protect",
             "(I)Z",
             &[jni::objects::JValue::Int(fd as i32)],
-        )
-        .and_then(|value| value.z())
-        .unwrap_or(false)
+        ) {
+            Ok(value) => value.z().unwrap_or(false),
+            Err(error) => {
+                let _ = env.exception_clear();
+                tracing::warn!(%error, fd, "Kotlin protect 调用失败");
+                false
+            }
+        }
     }
 }
 
