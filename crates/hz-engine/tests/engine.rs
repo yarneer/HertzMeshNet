@@ -25,6 +25,42 @@ struct FakePlatform {
     protected: StdMutex<Vec<RawFd>>,
     net_tx: tokio::sync::broadcast::Sender<NetEvent>,
     system_dns: Vec<IpAddr>,
+    /// 有值时 `establish` 交出这个内存 TUN（测试经它收发明文 IP 包）。
+    tun: Option<Arc<ChanTun>>,
+}
+
+/// 内存 TUN：测试往 `to_engine` 塞包 = 系统写进 TUN；引擎写回的包进 `from_engine`。
+struct ChanTun {
+    to_engine: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    from_engine: mpsc::Sender<Vec<u8>>,
+}
+
+impl TunIo for ChanTun {
+    fn send_packet<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.from_engine.send(packet.to_vec()).await;
+            Ok(())
+        })
+    }
+
+    fn recv_packet<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self.to_engine.lock().await.recv().await {
+                Some(packet) => {
+                    buf[..packet.len()].copy_from_slice(&packet);
+                    Ok(packet.len())
+                }
+                None => std::future::pending().await,
+            }
+        })
+    }
 }
 
 impl FakePlatform {
@@ -35,7 +71,26 @@ impl FakePlatform {
             protected: StdMutex::new(Vec::new()),
             net_tx,
             system_dns: vec!["192.0.2.53".parse().unwrap()],
+            tun: None,
         })
+    }
+
+    /// 带内存 TUN 的假平台，返回 (平台, 往 TUN 写包的端, 读引擎回包的端)。
+    fn with_tun() -> (Arc<Self>, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (net_tx, _) = tokio::sync::broadcast::channel(64);
+        let (to_engine_tx, to_engine_rx) = mpsc::channel(16);
+        let (from_engine_tx, from_engine_rx) = mpsc::channel(16);
+        let platform = Arc::new(Self {
+            established: StdMutex::new(Vec::new()),
+            protected: StdMutex::new(Vec::new()),
+            net_tx,
+            system_dns: vec![],
+            tun: Some(Arc::new(ChanTun {
+                to_engine: tokio::sync::Mutex::new(to_engine_rx),
+                from_engine: from_engine_tx,
+            })),
+        });
+        (platform, to_engine_tx, from_engine_rx)
     }
 
     async fn push_event(&self, event: NetEvent) {
@@ -60,7 +115,10 @@ impl Platform for FakePlatform {
             .lock()
             .expect("established poisoned")
             .push(spec);
-        anyhow::bail!("fake platform has no tun (drain mode)")
+        match &self.tun {
+            Some(tun) => Ok(tun.clone()),
+            None => anyhow::bail!("fake platform has no tun (drain mode)"),
+        }
     }
 
     fn protect(&self, fd: RawFd) -> bool {
@@ -367,6 +425,95 @@ async fn net_events_drive_rebind_and_endpoint_recollect() {
         "恢复序列应重采 Endpoint 并进入 netcheck 视图"
     );
 
+    coord.shutdown();
+    coord.terminated().await;
+}
+
+/// Android 转发模式下系统发往 dns_v4:53 的查询以 IP 包从 TUN 读出：引擎须
+/// 就地应答并把回包写回 TUN（而不是交给 WireGuard 丢掉——那会让手机上全部
+/// 域名解析失败）。后缀内未知名 NXDOMAIN；后缀外走转发，上游列表为空时
+/// SERVFAIL（证明进了转发分支，而非桌面的 REFUSED）。
+#[tokio::test]
+async fn dns_queries_read_from_tun_are_answered_back_into_tun() {
+    let _serial = SERIALIZE
+        .get_or_init(tokio::sync::Mutex::default)
+        .lock()
+        .await;
+    let (coord, auth_key, coord_addr) = in_process_coord().await;
+    let (platform, to_tun, mut from_tun) = FakePlatform::with_tun();
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        bind_egress: true,
+        dns_forward: true,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::start(
+        config,
+        EngineHooks::default(),
+        platform.clone(),
+        dir.path().to_path_buf(),
+    )
+    .await
+    .unwrap();
+    engine
+        .handle_request(Request::new(
+            1,
+            "up",
+            serde_json::json!({ "auth_key": auth_key, "coord_addr": coord_addr }),
+        ))
+        .await
+        .expect("up 应成功");
+    eventually(10, || !platform.established.lock().unwrap().is_empty()).await;
+    let dns_v4 = platform.established.lock().unwrap()[0].dns_v4;
+
+    let ask = |id: u16, labels: &[&[u8]]| {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&id.to_be_bytes());
+        payload.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        for label in labels {
+            payload.push(label.len() as u8);
+            payload.extend_from_slice(label);
+        }
+        payload.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let mut packet = vec![0x45, 0];
+        packet.extend_from_slice(&((28 + payload.len()) as u16).to_be_bytes());
+        packet.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0, 100, 96, 0, 9]);
+        packet.extend_from_slice(&dns_v4.octets());
+        packet.extend_from_slice(&42000u16.to_be_bytes());
+        packet.extend_from_slice(&53u16.to_be_bytes());
+        packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        packet.extend_from_slice(&[0, 0]);
+        packet.extend_from_slice(&payload);
+        packet
+    };
+    let mut reply_for = async |packet: Vec<u8>| {
+        to_tun.send(packet).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), from_tun.recv())
+            .await
+            .expect("引擎应把 DNS 应答写回 TUN")
+            .unwrap()
+    };
+
+    let reply = reply_for(ask(31, &[b"ghost", b"hznet", b"internal"])).await;
+    assert_eq!(&reply[12..16], &dns_v4.octets(), "回包源 = dns_v4");
+    assert_eq!(&reply[16..20], &[100, 96, 0, 9], "回包目的 = 查询方");
+    assert_eq!(u16::from_be_bytes([reply[22], reply[23]]), 42000);
+    assert_eq!(
+        u16::from_be_bytes([reply[28], reply[29]]),
+        31,
+        "query id 回显"
+    );
+    assert_eq!(reply[31] & 0x0f, 3, "后缀内未知名 NXDOMAIN");
+
+    let reply = reply_for(ask(32, &[b"example", b"com"])).await;
+    assert_eq!(u16::from_be_bytes([reply[28], reply[29]]), 32);
+    assert_eq!(
+        reply[31] & 0x0f,
+        2,
+        "后缀外进转发分支；上游列表为空回 SERVFAIL"
+    );
+
+    drop(engine);
     coord.shutdown();
     coord.terminated().await;
 }

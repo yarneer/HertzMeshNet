@@ -156,6 +156,9 @@ const ENDPOINT_COLLECT_EVERY: Duration = Duration::from_secs(30);
 /// 过期驻留时的轮询间隔：Network Map 订阅暂停，等待重新登录翻转状态。
 const EXPIRED_POLL: Duration = Duration::from_secs(2);
 
+/// TUN 内 DNS 应答的在途上限；超出的查询直接丢弃，由客户端重试。
+const TUN_DNS_INFLIGHT: usize = 64;
+
 /// 守护进程视角的注册会话状态机：Registered 与 Expired 共享同一份身份，
 /// 区别只在能否通信。Expired 不删除任何本地状态（ADR-0005：重新登录保身份）。
 #[derive(Debug, Clone)]
@@ -1517,6 +1520,10 @@ async fn start_dataplane(
         .as_deref()
         .and_then(|text| text.parse().ok())
         .unwrap_or(hz_core::dns::DNS_BIND_V4);
+    let forward = daemon
+        .config
+        .dns_forward
+        .then(|| dns::Forwarding::new(daemon.platform.clone()));
     tasks.extend(spawn_tun_bridge(
         daemon,
         &engine,
@@ -1524,7 +1531,10 @@ async fn start_dataplane(
         &daemon.map_cache,
         &daemon.policy_gate,
         daemon.probes.clone(),
-        dns_v4,
+        TunDns {
+            dns_v4,
+            forward: forward.clone(),
+        },
     ));
     tasks.push(spawn_map_task(
         daemon.clone(),
@@ -1537,13 +1547,12 @@ async fn start_dataplane(
     // 段内 DNS 应答器（平台无关部分）：后缀内本地应答。无 root / 无 TUN 的
     // 测试环境绑定失败只告警，控制面照常。系统 DNS 接入（systemd-resolved
     // 分域、/etc/resolver、resolv.conf 退路）是桌面 Platform.establish 的
-    // 职责（hzd），Android 声明 dns_v4 即可。
-    let forward = daemon
-        .config
-        .dns_forward
-        .then(|| dns::Forwarding::new(daemon.platform.clone()));
-    if let Err(error) = dns::ensure_responder(daemon.map_cache.clone(), dns_v4, forward).await {
-        tracing::warn!(%error, "dns responder unavailable");
+    // 职责（hzd）。转发模式（Android）不起 socket 应答器：dns_v4 不是本机
+    // 地址、53 端口也绑不了，查询由 TUN 读循环就地应答（spawn_tun_bridge）。
+    if forward.is_none() {
+        if let Err(error) = dns::ensure_responder(daemon.map_cache.clone(), dns_v4, None).await {
+            tracing::warn!(%error, "dns responder unavailable");
+        }
     }
     tasks.push(spawn_endpoint_collector(
         daemon.clone(),
@@ -2638,6 +2647,12 @@ async fn handle_punch_frame(
     tracing::debug!("punch frame matched no known peer, dropping");
 }
 
+/// TUN 读循环的段内 DNS 参数：应答地址与转发模式（Android 就地应答用）。
+struct TunDns {
+    dns_v4: std::net::Ipv4Addr,
+    forward: Option<dns::Forwarding>,
+}
+
 /// TUN 读到的包进引擎，引擎解密的包写回 TUN；写入前依次过 ping 探针拦截
 /// （`hz ping` 的应答在这里被消化）与入站 Policy 闸（A1）：源地址 → Map 里
 /// 的对端身份（归属 User + Tag），目标端口取自 TCP/UDP 头，规则之外默认
@@ -2650,8 +2665,9 @@ fn spawn_tun_bridge(
     cache: &Arc<NetworkMapCache>,
     gate: &Arc<InboundGate>,
     probes: Arc<ping::Probes>,
-    dns_v4: std::net::Ipv4Addr,
+    tun_dns: TunDns,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    let TunDns { dns_v4, forward } = tun_dns;
     // down（#81）靠监督任务 abort 这些句柄拆数据面：全部子任务都要收进 Vec。
     let mut tasks = Vec::new();
     let (to_tunnel_tx, to_tunnel_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -2749,6 +2765,9 @@ fn spawn_tun_bridge(
             let engine = engine.clone();
             let cache = cache.clone();
             let gate = gate.clone();
+            let suffix = Arc::new(hz_core::dns::dns_suffix());
+            // 同时在途的 TUN 内 DNS 应答上限（每条最多等上游超时 × 服务器数）。
+            let dns_inflight = Arc::new(tokio::sync::Semaphore::new(TUN_DNS_INFLIGHT));
             tasks.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; 65_535];
                 // 出方向流登记（回包放行依据）与入方向共用对端索引口径。
@@ -2758,6 +2777,29 @@ fn spawn_tun_bridge(
                     match device.recv_packet(&mut buf).await {
                         Ok(len) => {
                             let packet = &buf[..len];
+                            // 发往 dns_v4:53 的查询就地应答，不进 WireGuard（无对端
+                            // 承接，原样送出即被丢弃——Android 上全部域名解析失败）。
+                            if let Some(query) = dns::parse_tun_query(packet, dns_v4) {
+                                let Ok(permit) = dns_inflight.clone().try_acquire_owned() else {
+                                    continue;
+                                };
+                                let device = device.clone();
+                                let cache = cache.clone();
+                                let suffix = suffix.clone();
+                                let forward = forward.clone();
+                                tokio::spawn(async move {
+                                    let reply = dns::answer_tun_query(
+                                        &query,
+                                        &cache.snapshot(),
+                                        &suffix,
+                                        forward.as_ref(),
+                                    )
+                                    .await;
+                                    let _ = device.send_packet(&reply).await;
+                                    drop(permit);
+                                });
+                                continue;
+                            }
                             let class = hz_core::policy::classify_packet(packet);
                             if cache.version() != index_version {
                                 index_version = cache.version();

@@ -315,3 +315,53 @@ async fn empty_upstream_list_is_servfail() {
     let response = ask(responder, &wire_query(17, &[b"example", b"dev"], 1)).await;
     assert_eq!(rcode(&response), 2, "空上游列表视同全部失败");
 }
+
+/// TUN 内应答（Android：查询以 IP 包从 TUN 读出）同样走转发：后缀外查询
+/// 经 protect 的 socket 转给上游，应答封回发往查询方的 IPv4 UDP 包。
+#[tokio::test]
+async fn tun_query_out_of_suffix_forwards_and_wraps_reply() {
+    let upstream = FakeUpstream::start(false).await;
+    let platform = Arc::new(FakePlatform {
+        dns: StdMutex::new(vec![upstream.ip()]),
+        protected: StdMutex::new(vec![]),
+    });
+    let dns_v4 = std::net::Ipv4Addr::new(100, 96, 0, 53);
+    let payload = wire_query(21, &[b"example", b"com"], 1);
+    let mut packet = vec![0x45, 0];
+    packet.extend_from_slice(&((28 + payload.len()) as u16).to_be_bytes());
+    packet.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0, 100, 96, 0, 9]);
+    packet.extend_from_slice(&dns_v4.octets());
+    packet.extend_from_slice(&41000u16.to_be_bytes());
+    packet.extend_from_slice(&53u16.to_be_bytes());
+    packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    packet.extend_from_slice(&[0, 0]);
+    packet.extend_from_slice(&payload);
+
+    let query = hz_engine::dns::parse_tun_query(&packet, dns_v4).expect("应认出 DNS 查询");
+    let forward = Forwarding {
+        platform: platform.clone(),
+        timeout: Duration::from_millis(500),
+        upstream_port: UPSTREAM_PORT.get(),
+    };
+    let reply = hz_engine::dns::answer_tun_query(
+        &query,
+        &cache_with_db1().snapshot(),
+        "hznet.internal",
+        Some(&forward),
+    )
+    .await;
+    assert_eq!(&reply[12..16], &dns_v4.octets(), "回包源 = dns_v4");
+    assert_eq!(&reply[16..20], &[100, 96, 0, 9], "回包目的 = 查询方");
+    assert_eq!(
+        u16::from_be_bytes([reply[22], reply[23]]),
+        41000,
+        "回到查询方端口"
+    );
+    let answer = &reply[28..];
+    assert_eq!(rcode(answer), 0, "上游应答透传");
+    assert_eq!(&answer[answer.len() - 4..], &[b'U', 1, 2, 3]);
+    assert!(
+        !platform.protected.lock().unwrap().is_empty(),
+        "转发 socket 经 protect"
+    );
+}

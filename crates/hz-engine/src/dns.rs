@@ -475,6 +475,119 @@ pub async fn ensure_responder(
     }
 }
 
+/// TUN 内 DNS 应答（Android）：`dns_v4` 不是本机地址、普通 App 也绑不了
+/// 53 端口，`ensure_responder` 在 Android 上必然失败；系统发往 `dns_v4` 的
+/// 查询以 IP 包的形式从 TUN 读出。引擎在读循环里认出这些包，用与 socket
+/// 应答器相同的决策（`respond`）应答，再把回包写回 TUN。桌面上 `dns_v4`
+/// 是 hz0 的本机辅助地址，这类包不会进 TUN。只处理 IPv4 UDP（VpnService
+/// 只声明了 v4 DNS 服务器；系统解析器走 UDP）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunQuery {
+    src: Ipv4Addr,
+    sport: u16,
+    dst: Ipv4Addr,
+    payload: Vec<u8>,
+}
+
+const IPPROTO_UDP: u8 = 17;
+const IPV4_HEADER_LEN: usize = 20;
+const UDP_HEADER_LEN: usize = 8;
+
+/// 认出发往 `dns_v4:53` 的 IPv4 UDP 查询包；其余包（含分片）返回 None。
+pub fn parse_tun_query(packet: &[u8], dns_v4: Ipv4Addr) -> Option<TunQuery> {
+    if packet.len() < IPV4_HEADER_LEN || packet[0] >> 4 != 4 || packet[9] != IPPROTO_UDP {
+        return None;
+    }
+    let ihl = (packet[0] & 0x0f) as usize * 4;
+    let total = (u16::from_be_bytes([packet[2], packet[3]]) as usize).min(packet.len());
+    if ihl < IPV4_HEADER_LEN || total < ihl + UDP_HEADER_LEN {
+        return None;
+    }
+    // MF 位或片偏移非零：分片的 DNS 查询不在 TUN 内重组，交给原路径（丢弃）。
+    if u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff != 0 {
+        return None;
+    }
+    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let udp = &packet[ihl..total];
+    if dst != dns_v4 || u16::from_be_bytes([udp[2], udp[3]]) != DNS_PORT {
+        return None;
+    }
+    let udp_len = (u16::from_be_bytes([udp[4], udp[5]]) as usize).min(udp.len());
+    if udp_len < UDP_HEADER_LEN {
+        return None;
+    }
+    Some(TunQuery {
+        src: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+        sport: u16::from_be_bytes([udp[0], udp[1]]),
+        dst,
+        payload: udp[UDP_HEADER_LEN..udp_len].to_vec(),
+    })
+}
+
+/// RFC 1071 反码和（未取反）。
+fn ones_complement_sum(mut sum: u32, bytes: &[u8]) -> u32 {
+    let mut chunks = bytes.chunks_exact(2);
+    for pair in &mut chunks {
+        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+    }
+    if let [last] = chunks.remainder() {
+        sum += (*last as u32) << 8;
+    }
+    sum
+}
+
+fn fold_checksum(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// 把 DNS 应答封成从 `dns_v4:53` 发回查询方的 IPv4 UDP 包（带 IP 与 UDP 校验和）。
+pub fn build_tun_reply(query: &TunQuery, answer: &[u8]) -> Vec<u8> {
+    let udp_len = UDP_HEADER_LEN + answer.len();
+    let total = IPV4_HEADER_LEN + udp_len;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&[0x45, 0]);
+    out.extend_from_slice(&(total as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0x40, 0, 64, IPPROTO_UDP, 0, 0]);
+    out.extend_from_slice(&query.dst.octets());
+    out.extend_from_slice(&query.src.octets());
+    let ip_checksum = fold_checksum(ones_complement_sum(0, &out[..IPV4_HEADER_LEN]));
+    out[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    out.extend_from_slice(&DNS_PORT.to_be_bytes());
+    out.extend_from_slice(&query.sport.to_be_bytes());
+    out.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(answer);
+    // 伪首部：源、目的、协议、UDP 长度。
+    let mut pseudo = Vec::with_capacity(12);
+    pseudo.extend_from_slice(&query.dst.octets());
+    pseudo.extend_from_slice(&query.src.octets());
+    pseudo.extend_from_slice(&[0, IPPROTO_UDP]);
+    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    let sum = ones_complement_sum(ones_complement_sum(0, &pseudo), &out[IPV4_HEADER_LEN..]);
+    // UDP 校验和算出 0 时按 RFC 768 写全 1（0 表示"未计算"）。
+    let udp_checksum = match fold_checksum(sum) {
+        0 => 0xffff,
+        value => value,
+    };
+    out[IPV4_HEADER_LEN + 6..IPV4_HEADER_LEN + 8].copy_from_slice(&udp_checksum.to_be_bytes());
+    out
+}
+
+/// 应答一条 TUN 内查询，返回要写回 TUN 的完整 IP 包。
+pub async fn answer_tun_query(
+    query: &TunQuery,
+    nodes: &[MapNode],
+    suffix: &str,
+    forward: Option<&Forwarding>,
+) -> Vec<u8> {
+    let answer = respond(&query.payload, nodes, suffix, forward).await;
+    build_tun_reply(query, &answer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +750,98 @@ mod tests {
         let response = build_response(&query, &fixture(), "hznet.internal");
         assert_eq!(rcode(&response), 0, "压缩指针 qname 应被正确展开匹配");
         assert_eq!(ancount(&response), 1);
+    }
+
+    const DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 53);
+    const CLIENT_V4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 9);
+
+    /// 客户端发往 `dst:dport` 的 IPv4 UDP 包（校验和留 0，解析不看它）。
+    fn udp_packet(dst: Ipv4Addr, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let total = IPV4_HEADER_LEN + UDP_HEADER_LEN + payload.len();
+        let mut out = vec![0x45, 0];
+        out.extend_from_slice(&(total as u16).to_be_bytes());
+        out.extend_from_slice(&[0, 1, 0, 0, 64, IPPROTO_UDP, 0, 0]);
+        out.extend_from_slice(&CLIENT_V4.octets());
+        out.extend_from_slice(&dst.octets());
+        out.extend_from_slice(&40000u16.to_be_bytes());
+        out.extend_from_slice(&dport.to_be_bytes());
+        out.extend_from_slice(&((UDP_HEADER_LEN + payload.len()) as u16).to_be_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn tun_query_to_dns_v4_port_53_is_recognized() {
+        let payload = wire_query(1, 0, &db1_labels(), TYPE_A);
+        let query = parse_tun_query(&udp_packet(DNS_V4, 53, &payload), DNS_V4).unwrap();
+        assert_eq!(query.src, CLIENT_V4);
+        assert_eq!(query.sport, 40000);
+        assert_eq!(query.payload, payload);
+    }
+
+    #[test]
+    fn non_dns_tun_packets_are_left_alone() {
+        let payload = wire_query(1, 0, &db1_labels(), TYPE_A);
+        let peer = Ipv4Addr::new(100, 96, 0, 7);
+        assert!(
+            parse_tun_query(&udp_packet(peer, 53, &payload), DNS_V4).is_none(),
+            "对端的 53"
+        );
+        assert!(
+            parse_tun_query(&udp_packet(DNS_V4, 5353, &payload), DNS_V4).is_none(),
+            "非 53"
+        );
+        let mut tcp = udp_packet(DNS_V4, 53, &payload);
+        tcp[9] = 6;
+        assert!(parse_tun_query(&tcp, DNS_V4).is_none(), "TCP");
+        let mut fragment = udp_packet(DNS_V4, 53, &payload);
+        fragment[6] = 0x20; // MF
+        assert!(parse_tun_query(&fragment, DNS_V4).is_none(), "分片");
+        assert!(parse_tun_query(&[0x45, 0, 0], DNS_V4).is_none(), "截断的头");
+    }
+
+    #[test]
+    fn tun_reply_swaps_endpoints_and_has_valid_checksums() {
+        let payload = wire_query(1, 0, &db1_labels(), TYPE_A);
+        let query = parse_tun_query(&udp_packet(DNS_V4, 53, &payload), DNS_V4).unwrap();
+        let answer = build_response(&payload, &fixture(), "hznet.internal");
+        let reply = build_tun_reply(&query, &answer);
+
+        assert_eq!(&reply[12..16], &DNS_V4.octets(), "源 = dns_v4");
+        assert_eq!(&reply[16..20], &CLIENT_V4.octets(), "目的 = 查询方");
+        assert_eq!(
+            u16::from_be_bytes([reply[2], reply[3]]) as usize,
+            reply.len()
+        );
+        assert_eq!(
+            fold_checksum(ones_complement_sum(0, &reply[..20])),
+            0,
+            "IP 校验和"
+        );
+        let udp = &reply[20..];
+        assert_eq!(u16::from_be_bytes([udp[0], udp[1]]), 53);
+        assert_eq!(u16::from_be_bytes([udp[2], udp[3]]), 40000);
+        assert_eq!(&udp[8..], answer.as_slice());
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&DNS_V4.octets());
+        pseudo.extend_from_slice(&CLIENT_V4.octets());
+        pseudo.extend_from_slice(&[0, IPPROTO_UDP]);
+        pseudo.extend_from_slice(&(udp.len() as u16).to_be_bytes());
+        assert_eq!(
+            fold_checksum(ones_complement_sum(ones_complement_sum(0, &pseudo), udp)),
+            0,
+            "UDP 校验和"
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_query_answered_locally_without_forwarding() {
+        let payload = wire_query(5, 0, &db1_labels(), TYPE_A);
+        let query = parse_tun_query(&udp_packet(DNS_V4, 53, &payload), DNS_V4).unwrap();
+        let reply = answer_tun_query(&query, &fixture(), "hznet.internal", None).await;
+        let answer = &reply[IPV4_HEADER_LEN + UDP_HEADER_LEN..];
+        assert_eq!(rcode(answer), 0);
+        assert_eq!(&answer[answer.len() - 4..], &[100, 96, 0, 7]);
     }
 }

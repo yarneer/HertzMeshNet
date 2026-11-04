@@ -1,6 +1,7 @@
 package dev.hznet.android.backend
 
 import dev.hznet.android.engine.EngineBridge
+import dev.hznet.android.engine.PhysicalDns
 import dev.hznet.android.engine.SnapshotSink
 import org.json.JSONObject
 
@@ -51,7 +52,7 @@ class JniBackend : HzBackend {
     override fun ringLogTail(): String = EngineBridge.ringLogTail()
 
     override fun onNetworkChanged(dnsServers: List<String>) =
-        EngineBridge.onNetworkChanged(dnsServers.toString())
+        EngineBridge.onNetworkChanged(PhysicalDns.toJson(dnsServers))
 }
 
 /** 请求结果的解包助手。 */

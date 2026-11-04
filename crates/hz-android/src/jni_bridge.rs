@@ -515,9 +515,14 @@ pub unsafe extern "C" fn Java_dev_hznet_android_engine_EngineBridge_onNetworkCha
     let Ok(text): Result<String, _> = env.get_string(&dns_servers_json).map(Into::into) else {
         return;
     };
-    let servers: Vec<IpAddr> = serde_json::from_str::<Vec<String>>(&text)
-        .map(|list| list.iter().filter_map(|s| s.parse().ok()).collect())
-        .unwrap_or_default();
+    let servers: Vec<IpAddr> = match serde_json::from_str::<Vec<String>>(&text) {
+        Ok(list) => list.iter().filter_map(|s| s.parse().ok()).collect(),
+        Err(error) => {
+            // 静默吞成空列表会让转发模式对全部后缀外查询回 SERVFAIL。
+            tracing::warn!(%error, raw = %text, "onNetworkChanged: DNS 列表不是 JSON 字符串数组，忽略");
+            return;
+        }
+    };
     if let Some(platform) = PLATFORM.get() {
         platform.note_network(servers);
     }

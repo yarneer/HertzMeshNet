@@ -16,6 +16,7 @@ import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.app.NotificationCompat
 import dev.hznet.android.engine.EngineBridge
 import dev.hznet.android.engine.HzNetPlatform
+import dev.hznet.android.engine.PhysicalDns
 import dev.hznet.android.engine.SnapshotSink
 import dev.hznet.android.ui.AppModel
 import dev.hznet.android.ui.LoginFlow
@@ -186,24 +187,49 @@ class HzNetVpnService : VpnService() {
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                pushDnsServers(manager, network)
+                refreshPhysicalNetwork(manager, network)
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                refreshPhysicalNetwork(manager, network)
             }
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                pushDnsServers(manager, network)
+                refreshPhysicalNetwork(manager, network)
+            }
+
+            override fun onLost(network: Network) {
+                physicalNetworks.remove(network)
+                pushDnsServers()
             }
         }
+        // NOT_VPN：本 VPN 网络同样带 INTERNET 能力，不排除就会把它的 DNS
+        // （dns_v4 自己）当成上游推给引擎。
         val request = android.net.NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
         manager.registerNetworkCallback(request, callback)
         networkCallback = callback
     }
 
-    private fun pushDnsServers(manager: ConnectivityManager, network: Network) {
+    /** 当前全部物理网络（回调在 binder 线程上到达）。 */
+    private val physicalNetworks = java.util.concurrent.ConcurrentHashMap<Network, PhysicalDns.Candidate>()
+
+    private fun refreshPhysicalNetwork(manager: ConnectivityManager, network: Network) {
         val link = manager.getLinkProperties(network) ?: return
-        val servers = link.dnsServers.map { it.hostAddress }.filterNotNull()
-        EngineBridge.onNetworkChanged(servers.toString())
+        val caps = manager.getNetworkCapabilities(network) ?: return
+        physicalNetworks[network] = PhysicalDns.Candidate(
+            unmetered = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+            validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+            servers = link.dnsServers.mapNotNull { it.hostAddress },
+        )
+        pushDnsServers()
+    }
+
+    private fun pushDnsServers() {
+        val servers = PhysicalDns.order(physicalNetworks.values)
+        EngineBridge.onNetworkChanged(PhysicalDns.toJson(servers))
     }
 
     /** 订阅引擎快照：更新常驻通知 + AppModel（UI 的唯一数据源）+ 到期重排。 */
@@ -310,6 +336,7 @@ class HzNetVpnService : VpnService() {
             }
         }
         networkCallback = null
+        physicalNetworks.clear()
         super.onDestroy()
     }
 }
