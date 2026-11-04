@@ -1,5 +1,6 @@
 {
   "arch": "aarch64",
+  "collected_at": "2026-10-29T10:00:01Z",
   "log_note": "最近 2 行（/Library/Logs/hzd.log，已脱敏）",
   "log_tail": [
     "2026-10-29T10:00:00Z INFO hzd starting",
@@ -62,6 +63,7 @@
     }
   },
   "os": "macos",
+  "schema_version": 1,
   "status": {
     "coord_addr": "https://coord.example.com",
     "desired_state": "up",

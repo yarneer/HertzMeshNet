@@ -221,10 +221,12 @@ fn fixtures() -> Vec<(&'static str, Value)> {
         json!({"state": "failed", "error": "登录等待超时，请重新执行 hz login"}),
     ));
 
-    // diagnostics 响应：status + netcheck 六项 + 版本 + 日志尾部（已脱敏）。
+    // diagnostics 响应：元数据 + status + netcheck 六项 + 版本 + 日志尾部（已脱敏）。
     fixtures.push((
         "diagnostics.json",
         json!({
+            "schema_version": 1,
+            "collected_at": "2026-10-29T10:00:01Z",
             "status": snapshot(
                 &NodeStatus::Registered(identity.clone()),
                 json!({

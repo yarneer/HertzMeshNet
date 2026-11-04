@@ -128,6 +128,15 @@ async fn diagnostics_returns_fields_and_redacts_secrets() {
     );
     assert_eq!(diagnostics["os"], std::env::consts::OS);
     assert_eq!(diagnostics["arch"], std::env::consts::ARCH);
+    assert_eq!(diagnostics["schema_version"].as_i64(), Some(1));
+    let collected_at = diagnostics["collected_at"].as_str().expect("collected_at");
+    assert!(collected_at.ends_with('Z'), "{collected_at}");
+    let parsed = chrono::DateTime::parse_from_rfc3339(collected_at)
+        .unwrap_or_else(|error| panic!("{collected_at}: {error}"));
+    let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .abs();
+    assert!(skew < 120, "{collected_at}");
 
     // log_tail：恰好最近 2000 行，说明里带路径与「已脱敏」。
     let tail = diagnostics["log_tail"].as_array().unwrap();

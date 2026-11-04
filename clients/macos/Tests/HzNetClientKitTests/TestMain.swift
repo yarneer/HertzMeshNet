@@ -99,6 +99,7 @@ struct TestMain {
             try suite.testExpiredAndDownSnapshots()
             try suite.testLoginProgressWire()
             try suite.testDiagnosticsReport()
+            try suite.testDiagnosticsReportDecodesLegacyPayload()
         }
         runSuite("DeepLinkTests") {
             let suite = DeepLinkTests()

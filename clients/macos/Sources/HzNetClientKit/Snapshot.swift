@@ -222,6 +222,10 @@ public struct DiagnosticsReport: Codable, Equatable, Sendable {
     public var netcheck: JSONValue
     public var logTail: [String]
     public var logNote: String?
+    /// 载荷 schema 版本（#109）。缺省表示旧 hzd，无此字段。
+    public var schemaVersion: Int?
+    /// 采集时刻，UTC RFC3339。缺省表示旧 hzd。
+    public var collectedAt: String?
 
     public enum CodingKeys: String, CodingKey {
         case status
@@ -231,6 +235,8 @@ public struct DiagnosticsReport: Codable, Equatable, Sendable {
         case netcheck
         case logTail = "log_tail"
         case logNote = "log_note"
+        case schemaVersion = "schema_version"
+        case collectedAt = "collected_at"
     }
 }
 
