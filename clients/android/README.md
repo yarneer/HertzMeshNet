@@ -17,15 +17,9 @@ gradle assembleDebug          # 或 CI；wrapper 见下
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-**Gradle wrapper**：仓库未携带 `gradle-wrapper.jar`（二进制）。装了
-gradle 的机器上生成一次即可：
-
-```sh
-cd clients/android && gradle wrapper --gradle-version 8.10.2
-```
-
-CI 不依赖 wrapper（`gradle/actions/setup-gradle` 安装发行版后直接跑
-`gradle`）。
+**Gradle wrapper**：已携带（`gradlew` + 8.11.1 wrapper jar）。CI 用
+`gradle/actions/setup-gradle` 指定发行版直接跑 `gradle`（不依赖 wrapper），
+本机 `./gradlew` 亦可。
 
 ## 测试
 
