@@ -1,7 +1,8 @@
-//! Seam B（#84）：真实 hzd + 进程内 coord + 真实 UDS。diagnostics 返回字段
-//! 齐全；向日志注入私钥 / Auth Key / 邀请码 / 登录 token 后，返回内容中均
-//! 不出现，Node Name 与 Endpoint 仍在。独立测试二进制：HZD_LOG_FILE 只影响
-//! 本进程。
+//! Seam B（#84 / #108）：真实 hzd + 进程内 coord + 真实 UDS。diagnostics
+//! 返回字段齐全；向日志注入私钥 / Auth Key / 邀请码 / 登录 token / Bearer /
+//! Cookie / JWT 后，返回内容中均不出现，Node Name 与 Endpoint 仍在。文件名里
+//! 的密钥只出现在 `log_note`，用来卡住整包二次脱敏。独立测试二进制：
+//! HZD_LOG_FILE 只影响本进程。
 
 use std::path::Path;
 use std::time::Duration;
@@ -26,7 +27,14 @@ async fn wait_for_socket(path: &Path) {
 const AUTH_KEY: &str = "hznet.c3VwZXJzZWNyZXRrZXlkb25vdGNoYXJlMTIz";
 const INVITE: &str = "HZ-ABCD-EFGH";
 const LOGIN_URL: &str = "https://coord.example.com/oidc/start/n-a1b2c3d4e5f6a7b8";
+const LOGIN_URL_2: &str = "https://coord.example.com/oidc/start/n-0011223344556677";
 const PRIVATE_HEX: &str = "6d616368696e655f707269766174655f6b65795f6865785f3030313233343536";
+const BEARER: &str = "sk_live_51Habcdefghijklmnopqrstuv";
+const BEARER_2: &str = "sk_live_51Hzzzzzzzzzzzzzzzzzzzz";
+const COOKIE: &str = "s3cr3tc00k13value";
+const JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+/// 只放进日志文件名（进 `log_note`，不进 log_tail），整包二次 redact 才能剥掉。
+const NOTE_LEAK: &str = "hznet.bm90ZWxla2tleWRvbm90c2hhcmUxMjM0NTY";
 
 #[tokio::test]
 async fn diagnostics_returns_fields_and_redacts_secrets() {
@@ -50,16 +58,24 @@ async fn diagnostics_returns_fields_and_redacts_secrets() {
     let socket = node_dir.path().join("hzd.sock");
 
     // 日志文件：敏感行 + 有用行，外加超过 2000 行验证截尾。
-    let log_path = node_dir.path().join("hzd.log");
+    let log_path = node_dir.path().join(format!("{NOTE_LEAK}.log"));
     let mut log = String::new();
     for i in 0..2100 {
         log.push_str(&format!("noise line {i}\n"));
     }
-    log.push_str(&format!("issued auth key {AUTH_KEY} to admin\n"));
-    log.push_str(&format!("invite {INVITE} redeemed\n"));
+    log.push_str(&format!(
+        "issued auth key {AUTH_KEY} to admin {LOGIN_URL} {LOGIN_URL_2}\n"
+    ));
+    log.push_str(&format!(
+        "invite {INVITE} redeemed Bearer {BEARER} bearer {BEARER_2}\n"
+    ));
     log.push_str(&format!("login_url={LOGIN_URL} expires soon\n"));
-    log.push_str(&format!("machine key priv {PRIVATE_HEX} loaded\n"));
-    log.push_str("node mini path=direct endpoint=203.0.113.9:41001 stun mapped\n");
+    log.push_str(&format!(
+        "machine key priv {PRIVATE_HEX} loaded Authorization: Basic dXNlcjpwYXNzdzByZA==\n"
+    ));
+    log.push_str(&format!(
+        "node mini path=direct endpoint=203.0.113.9:41001 Cookie: hz_admin={COOKIE} id_token={JWT}\n"
+    ));
     std::fs::write(&log_path, log).unwrap();
     // SAFETY: 本二进制只有这一个测试线程，daemon 尚未启动，无并发读写。
     unsafe { std::env::set_var("HZD_LOG_FILE", &log_path) };
@@ -115,9 +131,28 @@ async fn diagnostics_returns_fields_and_redacts_secrets() {
     // 整份诊断（含 status/netcheck）中不得出现任何敏感样本。
     let whole = serde_json::to_string(&diagnostics).unwrap();
     assert!(!whole.contains(AUTH_KEY), "Auth Key 泄漏");
+    assert!(
+        !whole.contains("bm90ZWxla2tleWRvbm90c2hhcmU"),
+        "log_note 路径泄漏"
+    );
     assert!(!whole.contains(INVITE), "邀请码泄漏");
     assert!(!whole.contains("n-a1b2c3d4e5f6a7b8"), "登录 token 泄漏");
+    assert!(
+        !whole.contains("n-0011223344556677"),
+        "第二处登录 token 泄漏"
+    );
     assert!(!whole.contains(PRIVATE_HEX), "私钥 hex 泄漏");
+    assert!(!whole.contains(BEARER), "Bearer 泄漏");
+    assert!(!whole.contains(BEARER_2), "第二处 Bearer 泄漏");
+    assert!(!whole.contains(COOKIE), "cookie 泄漏");
+    assert!(
+        !whole.contains("dXNlcjpwYXNzdzByZA=="),
+        "Authorization 泄漏"
+    );
+    assert!(
+        !whole.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+        "JWT 泄漏"
+    );
 
     // Node Name 与 Endpoint 保留（status 的身份 + 日志里的排障信息）。
     assert!(whole.contains(&info.name), "Node Name 应保留");
