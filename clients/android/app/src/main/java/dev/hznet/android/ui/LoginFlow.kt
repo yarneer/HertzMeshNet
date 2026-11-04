@@ -20,6 +20,8 @@ class LoginFlow(
     private val onStarted: (loginUrl: String) -> Unit,
     private val onFinished: (outcome: Outcome) -> Unit,
     private val scheduler: PollScheduler = PollScheduler.everyTwoSeconds(),
+    /** 发起失败的原因（引擎错误文本或缺 login_url），供调用方记日志 / 提示。 */
+    private val onError: (message: String) -> Unit = {},
 ) {
     enum class Outcome { COMPLETED, FAILED, TIMED_OUT }
 
@@ -52,13 +54,15 @@ class LoginFlow(
     /** 发起登录；结果经构造时的回调透出。 */
     fun begin(coordAddr: String) {
         val up = backend.call("up", JSONObject().put("coord_addr", coordAddr))
-        val result = up.getOrNull() ?: run {
+        val result = up.getOrElse { error ->
+            onError("up 失败：${error.message}")
             finish(Outcome.FAILED)
             return
         }
         val loginUrl = result.optString("login_url")
         if (loginUrl.isBlank()) {
             // 已注册的幂等 up 直接返回身份：视为完成。
+            if (!result.has("node_id")) onError("up 既无 login_url 也无 node_id：$result")
             finish(if (result.has("node_id")) Outcome.COMPLETED else Outcome.FAILED)
             return
         }

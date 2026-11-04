@@ -166,7 +166,11 @@ class HzNetVpnService : VpnService() {
         loginFlow = LoginFlow(
             backend = dev.hznet.android.backend.JniBackend(),
             onStarted = { loginUrl ->
-                CustomTabsIntent.Builder().build().launchUrl(this, android.net.Uri.parse(loginUrl))
+                // 从 Service 上下文启动 Activity 必须带 NEW_TASK，否则抛
+                // AndroidRuntimeException 把整个进程带崩。
+                val tab = CustomTabsIntent.Builder().build()
+                tab.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                tab.launchUrl(this, android.net.Uri.parse(loginUrl))
             },
             onFinished = { outcome ->
                 if (outcome == LoginFlow.Outcome.COMPLETED) {
@@ -177,6 +181,7 @@ class HzNetVpnService : VpnService() {
                     )
                 }
             },
+            onError = { message -> android.util.Log.w("hznet", "浏览器登录未能发起：$message") },
         )
         loginFlow?.begin(coordAddr)
     }
