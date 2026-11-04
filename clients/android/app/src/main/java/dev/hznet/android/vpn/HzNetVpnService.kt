@@ -138,6 +138,17 @@ class HzNetVpnService : VpnService() {
         }
         watchPhysicalNetwork()
         subscribeStatus()
+        // 更新检查（#102）：记录 coord 基地址并排每日 manifest 检查；
+        // 到期提醒的通知渠道（#101）。
+        runCatching {
+            val coord = JSONObject(configJson).optString("coord_addr")
+            if (coord.isNotBlank()) {
+                dev.hznet.android.update.Updater.noteCoordBase(this, coord)
+            }
+        }
+        dev.hznet.android.update.Updater.createChannel(this)
+        dev.hznet.android.update.Updater.schedule(this)
+        dev.hznet.android.notify.ExpiryNotifier.createChannel(this)
     }
 
     private var loginFlow: LoginFlow? = null

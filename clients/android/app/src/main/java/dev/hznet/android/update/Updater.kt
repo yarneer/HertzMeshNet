@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import org.json.JSONObject
 import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
@@ -64,7 +65,17 @@ object Updater {
 
     private fun coordBaseUrl(context: Context): String? {
         val prefs = context.getSharedPreferences("hznet", Context.MODE_PRIVATE)
-        return prefs.getString("coord_base", null)
+        prefs.getString("coord_base", null)?.let { return it }
+        // 兜底：服务尚未启动过时，从最近一次连接配置里取 coord 地址。
+        val config = prefs.getString("last_config_json", null) ?: return null
+        val coord = runCatching {
+            JSONObject(config).optString("coord_addr")
+        }.getOrDefault("")
+        if (coord.isBlank()) return null
+        return runCatching {
+            val uri = java.net.URI(coord)
+            "${uri.scheme}://${uri.host}${if (uri.port != -1) ":${uri.port}" else ""}"
+        }.getOrNull()
     }
 
     /** 设置页连接成功后记录（https://host，拼 /dl/… 用）。 */

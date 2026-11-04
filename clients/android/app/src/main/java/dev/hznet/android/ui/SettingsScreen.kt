@@ -43,7 +43,18 @@ fun SettingsScreen(onBack: () -> Unit) {
             snapshot?.let { "${it.optString("name")} · ${it.optString("ipv4")}" } ?: "—",
         )
         SettingRow("App 版本", appVersion(context))
-        SettingRow("引擎版本", snapshot?.optString("version")?.takeIf { it.isNotBlank() } ?: "—")
+        var engineVersion by remember { mutableStateOf("…") }
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            engineVersion = runCatching {
+                val reply = org.json.JSONObject(
+                    dev.hznet.android.engine.EngineBridge.request(
+                        """{"method":"diagnostics","params":{}}"""
+                    )
+                )
+                reply.optJSONObject("result")?.optString("version")?.takeIf { it.isNotBlank() }
+            }.getOrNull() ?: "—"
+        }
+        SettingRow("引擎版本", engineVersion)
 
         OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("返回") }
 
