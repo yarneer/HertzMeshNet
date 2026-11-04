@@ -102,11 +102,15 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
+      # runner 预装 SDK/NDK；挑最新 NDK 给 cargo-ndk。
+      - name: 选择预装 NDK
+        run: |
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
       - name: 安装 cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Rust 侧 Android 目标检查

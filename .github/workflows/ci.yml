@@ -46,11 +46,17 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-24.04 runner 预装 Android SDK 与 NDK（setup-android@v3 反而在
+      # 装 legacy tools 包时失败）；挑最新 NDK 给 cargo-ndk。
+      - name: 选择预装 NDK
+        run: |
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          ls "$NDK"
       - name: 安装 cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Rust 侧 Android 目标检查（JNI 桥编译）
