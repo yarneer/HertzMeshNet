@@ -1848,7 +1848,7 @@ mod tests {
         store
             .update_node_runtime(
                 &alpha.id,
-                Some("0.3.0 (a1b2c3d)"),
+                Some(concat!(env!("CARGO_PKG_VERSION"), " (a1b2c3d)")),
                 Some("macos"),
                 Some("aarch64"),
             )
@@ -1904,7 +1904,10 @@ mod tests {
         let alpha_row = rows.iter().find(|row| row["node_id"] == alpha.id).unwrap();
         let beta_row = rows.iter().find(|row| row["node_id"] == beta.id).unwrap();
 
-        assert_eq!(alpha_row["version"], "0.3.0 (a1b2c3d)");
+        assert_eq!(
+            alpha_row["version"],
+            format!("{} (a1b2c3d)", env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(alpha_row["os"], "macos");
         assert_eq!(alpha_row["arch"], "aarch64");
         assert_eq!(alpha_row["version_status"], "same");

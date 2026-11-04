@@ -349,8 +349,12 @@ async fn hello_carries_version_hint_for_older_nodes() {
         // 就被拒）。behind 只在协议升代后（min > 旧协议）对旧 Node 出现，
         // 纯判定分支由 hz-coord health 的表驱动单测覆盖。
         (Some("0.2.2 (abcdef1)"), 1, Some("at_min")),
-        // 同版本（commit 不同也算同）：不带。
-        (Some("0.3.0 (a1b2c3d)"), 1, None),
+        // 同版本（commit 不同也算同）：不带。跟随包版本，升版不破测试。
+        (
+            Some(concat!(env!("CARGO_PKG_VERSION"), " (a1b2c3d)")),
+            1,
+            None,
+        ),
         // 更高版本：不带。
         (Some("9.9.9"), 1, None),
         // 旧 Node 不上报版本：无提示（App 显示未知但不通知）。
