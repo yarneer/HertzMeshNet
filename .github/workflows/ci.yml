@@ -60,7 +60,7 @@ jobs:
       - name: 安装 cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Rust 侧 Android 目标检查（JNI 桥编译）
-        run: cargo check -p hz-android --target aarch64-linux-android
+        run: cargo ndk -t arm64-v8a check -p hz-android
       - name: Gradle（setup-gradle 安装发行版，不依赖 wrapper jar）
         uses: gradle/actions/setup-gradle@v4
         with:
