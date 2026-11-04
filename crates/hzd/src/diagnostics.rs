@@ -9,11 +9,21 @@
 //! 中的 token，以及 Bearer / JWT / Cookie / Authorization 凭证；保留 Node
 //! Name、Node Address 与 Endpoint（排障需要）。`log_tail`（文件与 journal）
 //! 走同一套：多行脱敏、行截断、尾部预算；整份诊断 JSON 再跑同一套规则（#108）。
+//! 载荷另带 [`SCHEMA_VERSION`] 与 [`collected_at_utc`]（#109）；旧客户端忽略未知字段。
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use serde_json::Value;
+
+/// 诊断载荷 schema（#109）。当前 `1`。
+/// 只增加字段不升版本；不兼容的形状变化才 +1。
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// 采集时刻，UTC，秒精度 RFC3339（`2026-10-29T10:00:01Z`）。
+pub fn collected_at_utc() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
 
 /// 诊断包里日志的最大行数。
 pub const LOG_TAIL_LINES: usize = 2000;
@@ -671,6 +681,18 @@ mod tests {
         fn drop(&mut self) {
             unsafe { std::env::remove_var(self.0) };
         }
+    }
+
+    #[test]
+    fn collected_at_is_utc_rfc3339() {
+        let stamp = collected_at_utc();
+        assert_eq!(stamp.len(), 20, "{stamp}");
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamp).expect(&stamp);
+        let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .abs();
+        assert!(skew < 5, "{stamp}");
     }
 
     #[test]

@@ -54,7 +54,7 @@ macOS 上的 Node 目前要靠 `sudo hzd install-launchd`、`sudo hz up` 和翻 
 
 ### 3.4 `diagnostics`（MC-4）
 
-返回 `{status, netcheck, version, os, arch, log_tail}`。`log_tail` 为 hzd 日志最近 2000 行，由 hzd 读取（普通用户未必能读 `/Library/Logs/hzd.log`）。脱敏：去掉私钥、Auth Key、邀请码、登录 URL 中的 token；保留 Node Name、Node Address 与 Endpoint（排障需要）。
+返回 `{schema_version, collected_at, status, netcheck, version, os, arch, log_tail, log_note}`。`schema_version` 为整数，当前 `1`：只增加字段不升版本，不兼容的形状变化才 +1；旧客户端忽略未知字段。`collected_at` 为采集时刻，UTC RFC3339（如 `2026-10-29T10:00:01Z`）。`log_tail` 为 hzd 日志最近 2000 行，由 hzd 读取（普通用户未必能读 `/Library/Logs/hzd.log`）。`log_note` 说明这次尾部的行数、来源与脱敏情况；读不到日志时说明原因，字段可缺省。脱敏：去掉私钥、Auth Key、邀请码、登录 URL 中的 token；保留 Node Name、Node Address 与 Endpoint（排障需要）。
 
 ## 4. 契约测试（MC-5）
 

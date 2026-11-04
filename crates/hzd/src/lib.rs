@@ -547,6 +547,8 @@ async fn handle_request(
         "diagnostics" => {
             // #84：普通 User 出问题时导出一份脱敏诊断文件发给 Admin。
             let mut value = serde_json::json!({
+                "schema_version": diagnostics::SCHEMA_VERSION,
+                "collected_at": diagnostics::collected_at_utc(),
                 "status": status_value(&daemon).await?,
                 "version": hz_core::version::node_version(),
                 "os": std::env::consts::OS,

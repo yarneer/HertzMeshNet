@@ -24,7 +24,9 @@ struct DiagnosticsExportTests {
             arch: "aarch64",
             netcheck: .string("opaque"),
             logTail: ["line1", "line2"],
-            logNote: "最近 2 行"
+            logNote: "最近 2 行",
+            schemaVersion: 1,
+            collectedAt: "2026-10-29T10:00:01Z"
         )
     }
 

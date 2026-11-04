@@ -92,6 +92,22 @@ struct SnapshotDecodingTests {
         hzExpect(report.status.name == "mini")
         hzExpect(report.logTail.count == 2)
         hzExpect(report.logNote != nil)
+        hzExpect(report.schemaVersion == 1)
+        hzExpect(report.collectedAt == "2026-10-29T10:00:01Z")
         hzExpect(report.netcheck.prettyText.contains("\"nat\""))
+    }
+
+    /// #109：旧载荷没有 schema_version / collected_at / log_note 时仍可解码。
+    func testDiagnosticsReportDecodesLegacyPayload() throws {
+        let legacy = Data(
+            """
+            {"arch":"x86_64","log_tail":[],"netcheck":null,"os":"linux","status":{"desired_state":"down","registered":false},"version":"0.3.0"}
+            """.utf8)
+        let report = try JSONDecoder().decode(DiagnosticsReport.self, from: legacy)
+        hzExpect(report.schemaVersion == nil)
+        hzExpect(report.collectedAt == nil)
+        hzExpect(report.logNote == nil)
+        hzExpect(report.version == "0.3.0")
+        hzExpect(report.logTail.isEmpty)
     }
 }
