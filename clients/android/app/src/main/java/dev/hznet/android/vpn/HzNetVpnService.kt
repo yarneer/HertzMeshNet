@@ -88,11 +88,14 @@ class HzNetVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                // 关 ≠ 停引擎：Desired State 落 down（引擎拆数据面并持久化），
+                // 撤掉常驻通知（前台通知只覆盖连接期间）；引擎与订阅继续运行，
+                // UI 才能如实显示"已断开"。引擎真正退出随服务销毁（onDestroy）。
                 requestDown()
-                EngineBridge.stop()
                 stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                return START_NOT_STICKY
+                (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                    .cancel(NOTIFICATION_ID)
+                return START_STICKY
             }
             ACTION_START -> startEngine(intent.getStringExtra(EXTRA_CONFIG) ?: lastConfig())
             else -> {
@@ -210,7 +213,9 @@ class HzNetVpnService : VpnService() {
                 val response = JSONObject(snapshotJson)
                 val result = response.optJSONObject("result") ?: return@SnapshotSink
                 AppModel.publish(result)
-                updateNotification(statusLine(result))
+                if (result.optString("desired_state") == "up") {
+                    updateNotification(statusLine(result))
+                }
                 // 到期提醒（#101）：expires_at 变化时 WorkManager REPLACE 重排；
                 // VPN 关闭时也能触发（不依赖引擎运行）。
                 val expiresAt = if (result.has("expires_at_unix")) {
@@ -297,6 +302,7 @@ class HzNetVpnService : VpnService() {
 
     override fun onDestroy() {
         loginFlow?.cancel()
+        runCatching { EngineBridge.stop() }
         networkCallback?.let {
             runCatching {
                 (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
