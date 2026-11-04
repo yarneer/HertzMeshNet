@@ -49,7 +49,17 @@ private enum class Screen { MAIN, ONBOARDING, SETTINGS }
 @Composable
 fun HzNetApp(deepLinkInput: String?) {
     val context = LocalContext.current
-    var screen by remember { mutableStateOf(Screen.MAIN) }
+    // 初始屏：磁盘上没有 registration.json（从未注册）→ 直接进引导。不能等
+    // 引擎快照——引擎要等引导完成后才启动，新装时会死等在主界面。
+    var screen by remember {
+        mutableStateOf(
+            if (java.io.File(context.filesDir, "hznet/registration.json").exists()) {
+                Screen.MAIN
+            } else {
+                Screen.ONBOARDING
+            }
+        )
+    }
     var pendingDeepLink by remember { mutableStateOf(deepLinkInput ?: AppModel.pendingDeepLink) }
     // 运行中到达的深链（onNewIntent）。
     AppModel.pendingDeepLink?.let { link ->
@@ -57,11 +67,7 @@ fun HzNetApp(deepLinkInput: String?) {
         AppModel.consumeDeepLink()
     }
 
-    // 未注册 → 引导（快照未到时按注册文件判断，见 shouldOnboard）。
     val snapshot = AppModel.snapshot
-    if (screen == Screen.MAIN && snapshot?.optBoolean("registered") == false) {
-        screen = Screen.ONBOARDING
-    }
 
     // 深链确认框（一律醒目显示 coord 域名；校验规则见 DeepLink）。
     pendingDeepLink?.let { link ->
