@@ -1,8 +1,9 @@
-//! Seam B（#84 / #108）：真实 hzd + 进程内 coord + 真实 UDS。diagnostics
+//! Seam B（#84 / #108 / #106）：真实 hzd + 进程内 coord + 真实 UDS。diagnostics
 //! 返回字段齐全；向日志注入私钥 / Auth Key / 邀请码 / 登录 token / Bearer /
 //! Cookie / JWT 后，返回内容中均不出现，Node Name 与 Endpoint 仍在。文件名里
-//! 的密钥只出现在 `log_note`，用来卡住整包二次脱敏。独立测试二进制：
-//! HZD_LOG_FILE 只影响本进程。
+//! 的密钥只出现在 `log_note`，用来卡住整包二次脱敏。journal 注入走
+//! `HZD_JOURNAL_FILE`（与文件路径同一套脱敏 / 截断 / 预算）。独立测试二进制：
+//! 这两个环境变量只影响本进程，测试之间用锁串行。
 
 use std::path::Path;
 use std::time::Duration;
@@ -36,8 +37,13 @@ const JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkw
 /// 只放进日志文件名（进 `log_note`，不进 log_tail），整包二次 redact 才能剥掉。
 const NOTE_LEAK: &str = "hznet.bm90ZWxla2tleWRvbm90c2hhcmUxMjM0NTY";
 
+/// 文件路径与 journal 路径都写进程环境变量；cargo 默认并行跑这两个测试。
+static LOG_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn diagnostics_returns_fields_and_redacts_secrets() {
+    let _env = LOG_ENV.lock().await;
+    unsafe { std::env::remove_var("HZD_JOURNAL_FILE") };
     let coord_dir = tempfile::tempdir().unwrap();
     let store = Store::open(&coord_dir.path().join("coord.db"), AddressConfig::default())
         .await
@@ -166,4 +172,75 @@ async fn diagnostics_returns_fields_and_redacts_secrets() {
     daemon.abort();
     let _ = daemon.await;
     coord.shutdown();
+}
+
+#[tokio::test]
+async fn journal_diagnostics_redacts_long_lines_and_stays_under_ipc() {
+    let pem_body = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEA";
+    let mut raw = String::new();
+    for i in 0..80 {
+        raw.push_str(&format!("old-{i:03} {}\n", "o".repeat(7000)));
+    }
+    raw.push_str("-----BEGIN PRIVATE KEY-----\n");
+    raw.push_str(pem_body);
+    raw.push('\n');
+    raw.push_str("morebase64bodyline==\n");
+    raw.push_str("-----END PRIVATE KEY-----\n");
+    raw.push_str(&format!(
+        "journal-long {PRIVATE_HEX} {}\n",
+        "L".repeat(9 * 1024)
+    ));
+    raw.push_str("journal-newest endpoint=203.0.113.9:41001\n");
+
+    let node_dir = tempfile::tempdir().unwrap();
+    let journal = node_dir.path().join("journal.log");
+    std::fs::write(&journal, raw).unwrap();
+    let socket = node_dir.path().join("hzd.sock");
+
+    let _env = LOG_ENV.lock().await;
+    unsafe {
+        std::env::remove_var("HZD_LOG_FILE");
+        std::env::set_var("HZD_JOURNAL_FILE", &journal);
+    }
+
+    let daemon = tokio::spawn(hzd::run(node_dir.path().to_path_buf(), socket.clone()));
+    wait_for_socket(&socket).await;
+    let response = ipc::request(
+        &socket,
+        Request::new(1, "diagnostics", serde_json::json!({})),
+    )
+    .await
+    .unwrap();
+    let diagnostics = match response {
+        Response::Ok { result, .. } => result,
+        Response::Error { error, .. } => panic!("diagnostics 失败：{error}"),
+    };
+
+    let tail = diagnostics["log_tail"].as_array().unwrap();
+    let whole = serde_json::to_string(&diagnostics).unwrap();
+    assert!(!whole.contains(pem_body), "跨行 PEM 泄漏");
+    assert!(!whole.contains("morebase64"), "PEM 体泄漏");
+    assert!(!whole.contains("BEGIN PRIVATE KEY"), "PEM 头泄漏");
+    assert!(!whole.contains(PRIVATE_HEX), "超长行私钥泄漏");
+    assert!(
+        tail.iter()
+            .any(|line| line.as_str().unwrap().ends_with("…(截断)")),
+        "超长行应截断：{tail:?}"
+    );
+    assert!(
+        !whole.contains("old-000"),
+        "预算应丢掉最老行，且 IPC 仍成功"
+    );
+    assert!(whole.contains("journal-newest"), "{whole}");
+    assert!(whole.contains("203.0.113.9:41001"), "{whole}");
+    let note = diagnostics["log_note"].as_str().unwrap();
+    assert!(
+        note.contains("已脱敏") && note.contains("journal"),
+        "{note}"
+    );
+    assert!(note.contains(&format!("最近 {} 行", tail.len())), "{note}");
+
+    unsafe { std::env::remove_var("HZD_JOURNAL_FILE") };
+    daemon.abort();
+    let _ = daemon.await;
 }

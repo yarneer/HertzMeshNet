@@ -7,8 +7,8 @@
 //!
 //! 脱敏（`redact_secrets`，纯函数）：去掉私钥、Auth Key、邀请码、登录 URL
 //! 中的 token，以及 Bearer / JWT / Cookie / Authorization 凭证；保留 Node
-//! Name、Node Address 与 Endpoint（排障需要）。`log_tail` 逐行脱敏之后，
-//! 整份诊断 JSON 再跑同一套规则（#108）。
+//! Name、Node Address 与 Endpoint（排障需要）。`log_tail`（文件与 journal）
+//! 走同一套：多行脱敏、行截断、尾部预算；整份诊断 JSON 再跑同一套规则（#108）。
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -50,13 +50,14 @@ pub fn collect_log_tail() -> (Vec<String>, Option<String>) {
     collect_log_tail_from(hzd_log_path().as_deref())
 }
 
-/// 同 [`collect_log_tail`]，路径可注入（测试用）。None 走平台默认的
-/// journal 路径（Linux）或「未配置」。
+/// 同 [`collect_log_tail`]，路径可注入（测试用）。None 时读
+/// `HZD_JOURNAL_FILE`（测试注入）或 Linux 的 systemd journal，与文件路径
+/// 共用 [`finish_tail`]。
 pub fn collect_log_tail_from(path: Option<&std::path::Path>) -> (Vec<String>, Option<String>) {
     if let Some(path) = path {
         return match read_log_file(path) {
             Ok(text) => {
-                let lines = fit_tail_budget(redact_lines(tail_lines(&text, LOG_TAIL_LINES)));
+                let lines = finish_tail(&text);
                 let count = lines.len();
                 (
                     lines,
@@ -72,17 +73,17 @@ pub fn collect_log_tail_from(path: Option<&std::path::Path>) -> (Vec<String>, Op
             ),
         };
     }
+    if let Some(lines) = journal_tail() {
+        let count = lines.len();
+        return (
+            lines,
+            Some(format!(
+                "最近 {count} 行（systemd journal hzd 服务，已脱敏）"
+            )),
+        );
+    }
     #[cfg(target_os = "linux")]
     {
-        if let Some(lines) = journal_tail() {
-            let count = lines.len();
-            return (
-                lines.into_iter().map(|line| redact_line(&line)).collect(),
-                Some(format!(
-                    "最近 {count} 行（systemd journal hzd 服务，已脱敏）"
-                )),
-            );
-        }
         (
             Vec::new(),
             Some("未配置 HZD_LOG_FILE 且 systemd journal 不可用，log_tail 为空".to_string()),
@@ -148,9 +149,9 @@ fn read_log_tail(file: &mut (impl Read + Seek), len: u64) -> std::io::Result<Str
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// 文本最后 `max` 行，每行截断到 [`MAX_LINE_CHARS`]。
+/// 文本最后 `max` 行。截断在脱敏之后，见 [`finish_tail`]。
 fn tail_lines(text: &str, max: usize) -> Vec<String> {
-    let mut lines: Vec<String> = text.lines().map(truncate_line).collect();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     if lines.len() > max {
         lines.drain(..lines.len() - max);
     }
@@ -166,30 +167,46 @@ fn truncate_line(line: &str) -> String {
     }
 }
 
-/// Linux 默认路径：systemd journal（hzd 通常由 systemd 托管，root 可读）。
-#[cfg(target_os = "linux")]
+/// 文件与 journal 共用（#106）：多行脱敏 → 行截断 → 尾部预算。
+fn finish_tail(text: &str) -> Vec<String> {
+    let lines: Vec<String> = redact_lines(tail_lines(text, LOG_TAIL_LINES))
+        .into_iter()
+        .map(|line| truncate_line(&line))
+        .collect();
+    fit_tail_budget(lines)
+}
+
+/// `HZD_JOURNAL_FILE`（测试注入）或 Linux `journalctl -u hzd` 的原文，再走
+/// [`finish_tail`]。读不到则为 None。
 fn journal_tail() -> Option<Vec<String>> {
-    let output = std::process::Command::new("journalctl")
-        .args([
-            "--unit",
-            "hzd",
-            "--no-pager",
-            "--output",
-            "cat",
-            "--lines",
-            &LOG_TAIL_LINES.to_string(),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    if let Some(path) = std::env::var_os("HZD_JOURNAL_FILE") {
+        let text = std::fs::read_to_string(path).ok()?;
+        return Some(finish_tail(&text));
     }
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect(),
-    )
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("journalctl")
+            .args([
+                "--unit",
+                "hzd",
+                "--no-pager",
+                "--output",
+                "cat",
+                "--lines",
+                &LOG_TAIL_LINES.to_string(),
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Some(finish_tail(&text))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 const REDACTED: &str = "[REDACTED]";
@@ -645,6 +662,13 @@ fn next_word(text: &str, start: usize, word: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
+    struct ClearEnv(&'static str);
+    impl Drop for ClearEnv {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
     #[test]
     fn secrets_are_redacted_but_names_and_endpoints_survive() {
         // Auth Key（hznet.<43 base64url>）与 Relay Token。
@@ -888,5 +912,59 @@ mod tests {
         assert!(joined.contains("hznet.[REDACTED]"), "{joined}");
         assert!(joined.contains("203.0.113.9:41001"), "{joined}");
         assert!(note.unwrap().contains("已脱敏"));
+    }
+
+    #[test]
+    fn journal_path_redacts_truncates_and_fits_budget() {
+        let pem_body = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEA";
+        let hex = "ab".repeat(40);
+        let mut raw = String::new();
+        for i in 0..80 {
+            raw.push_str(&format!("old-{i:03} {}\n", "o".repeat(7000)));
+        }
+        raw.push_str("-----BEGIN PRIVATE KEY-----\n");
+        raw.push_str(pem_body);
+        raw.push('\n');
+        raw.push_str("morebase64bodyline==\n");
+        raw.push_str("-----END PRIVATE KEY-----\n");
+        raw.push_str(&format!(
+            "journal-long {hex} {}\n",
+            "L".repeat(MAX_LINE_CHARS + 100)
+        ));
+        raw.push_str("journal-newest endpoint=203.0.113.9:41001\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        std::fs::write(&path, raw).unwrap();
+        let _unset = ClearEnv("HZD_JOURNAL_FILE");
+        unsafe { std::env::set_var("HZD_JOURNAL_FILE", &path) };
+        let (tail, note) = collect_log_tail_from(None);
+
+        let joined = tail.join("\n");
+        assert!(!joined.contains(pem_body), "{joined}");
+        assert!(!joined.contains("morebase64"), "{joined}");
+        assert!(!joined.contains("BEGIN PRIVATE KEY"), "{joined}");
+        assert!(!joined.contains(&hex), "{joined}");
+        let long = tail
+            .iter()
+            .find(|line| line.contains("journal-long"))
+            .expect("超长行应留下");
+        assert!(long.ends_with("…(截断)"), "{long}");
+        assert!(
+            long.chars().count() <= MAX_LINE_CHARS + 10,
+            "{}",
+            long.chars().count()
+        );
+        assert!(joined.contains("journal-newest"), "{joined}");
+        assert!(joined.contains("203.0.113.9:41001"), "{joined}");
+        assert!(!joined.contains("old-000"), "预算应丢掉最老行：{joined}");
+        let total: usize = tail.iter().map(|line| line.len() + 2).sum();
+        assert!(total <= MAX_TAIL_BYTES, "{total}");
+        let note = note.expect("journal 说明");
+        assert!(
+            note.contains("已脱敏") && note.contains("journal"),
+            "{note}"
+        );
+        assert!(note.contains(&format!("最近 {} 行", tail.len())), "{note}");
     }
 }
