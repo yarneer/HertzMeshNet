@@ -142,7 +142,8 @@ private fun MainScreen(onOpenSettings: () -> Unit, onOpenOnboarding: () -> Unit)
             revokedAtMillis = AppModel.revokedAtMillis,
         )
     )
-    var connected by remember { mutableStateOf(snapshot?.optString("desired_state") == "up") }
+    // 开关状态由快照派生（单一数据源）：上面状态行与开关永不各说各话。
+    val connected = snapshot?.optString("desired_state") == "up"
 
     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
@@ -183,7 +184,6 @@ private fun MainScreen(onOpenSettings: () -> Unit, onOpenOnboarding: () -> Unit)
                     } else {
                         HzNetVpnService.stop(context)
                     }
-                    connected = want
                 },
             )
         }

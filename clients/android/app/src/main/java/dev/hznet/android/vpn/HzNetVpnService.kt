@@ -119,11 +119,8 @@ class HzNetVpnService : VpnService() {
             stopSelf()
             return
         }
-        if (honorSystemIntent && EngineBridge.desiredState() == "down") {
-            // 系统意图优先：写回 up（引擎 up 恢复数据面）。
-            EngineBridge.request("""{"method":"up","params":{}}""")
-        }
         // 引导路径的注册：邀请码 up（Activity 传入）。已注册时引擎幂等恢复。
+        val hadInvite = pendingInvite != null
         pendingInvite?.let { invite ->
             pendingInvite = null
             EngineBridge.request(
@@ -132,9 +129,16 @@ class HzNetVpnService : VpnService() {
         }
         // 浏览器登录：up 拿 login_url → Custom Tabs 打开 → 轮询 login_poll →
         // 完成后把 App 切回前台（规格 §8）。
+        val hadBrowserLogin = pendingBrowserLogin != null
         pendingBrowserLogin?.let { coord ->
             pendingBrowserLogin = null
             startBrowserLogin(coord)
+        }
+        // 普通开关 / 系统"始终开启"拉起：Desired State 为 down 时恢复数据面
+        // （已注册的 up 是幂等恢复：不重新注册、不轮换密钥，只拉数据面并写 up）。
+        // 引导路径（邀请码 / 浏览器登录）自带 up，不在此重复发。
+        if (!hadInvite && !hadBrowserLogin && EngineBridge.desiredState() == "down") {
+            EngineBridge.request("""{"method":"up","params":{}}""")
         }
         watchPhysicalNetwork()
         subscribeStatus()
