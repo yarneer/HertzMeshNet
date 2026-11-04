@@ -73,6 +73,25 @@ struct DiagnosticsExportTests {
         hzExpect(reference == 0xCBF4_3926)
     }
 
+    /// #110：已有 0644（保存面板 / umask）时，写完必须收成 0600。
+    /// `Data.write` 覆盖已有文件会保留原 mode，所以这一例在缺 chmod 时失败。
+    func testWriteArchiveTightensToOwnerOnly() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hznet-mode-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let zip = dir.appendingPathComponent("diag.zip")
+        let data = try DiagnosticsExport.makeArchive(report: makeReport())
+        try data.write(to: zip)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: zip.path)
+
+        try DiagnosticsExport.writeArchive(data, to: zip)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: zip.path)
+        let mode = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? -1
+        hzExpect(mode & 0o777 == 0o600, String(format: "mode %04o", mode))
+    }
+
     func testEmptyArchiveThrows() {
         var writer = ZipWriter()
         do {

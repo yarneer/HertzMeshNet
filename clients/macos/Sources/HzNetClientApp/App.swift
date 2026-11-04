@@ -144,7 +144,7 @@ struct HzNetClientApp: App {
         }
     }
 
-    // MARK: - 导出诊断包（#90）
+    // MARK: - 导出诊断包（#90 / #110）
 
     func exportDiagnostics() {
         Task { @MainActor in
@@ -157,7 +157,7 @@ struct HzNetClientApp: App {
                     now: Date()
                 )
                 guard panel.runModal() == .OK, let url = panel.url else { return }
-                try data.write(to: url)
+                try DiagnosticsExport.writeArchive(data, to: url)
                 exportError = nil
             } catch {
                 exportError = "导出诊断包失败：\(error)"
