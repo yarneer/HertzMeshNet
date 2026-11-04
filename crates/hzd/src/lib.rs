@@ -559,7 +559,8 @@ async fn handle_request(
             if let Some(note) = note {
                 value["log_note"] = serde_json::json!(note);
             }
-            Ok(value)
+            // #108：status / netcheck / log_note 与 log_tail 走同一套脱敏。
+            Ok(diagnostics::redact_package(value))
         }
         "down" => {
             // #81：停数据面（断 Network Map 流、停止上报、尽拆 TUN/DNS 接入），

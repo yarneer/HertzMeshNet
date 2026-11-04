@@ -5,10 +5,14 @@
 //! 可读，由 hzd（通常以 root 运行）代读。读不到（文件不存在 / 不可读 /
 //! 非 systemd 环境）时为空并附说明，不报错。
 //!
-//! 脱敏（`redact_line`，纯函数）：去掉私钥、Auth Key、邀请码与登录 URL 中
-//! 的 token；保留 Node Name、Node Address 与 Endpoint（排障需要）。
+//! 脱敏（`redact_secrets`，纯函数）：去掉私钥、Auth Key、邀请码、登录 URL
+//! 中的 token，以及 Bearer / JWT / Cookie / Authorization 凭证；保留 Node
+//! Name、Node Address 与 Endpoint（排障需要）。`log_tail` 逐行脱敏之后，
+//! 整份诊断 JSON 再跑同一套规则（#108）。
 
 use std::path::PathBuf;
+
+use serde_json::Value;
 
 /// 诊断包里日志的最大行数。
 pub const LOG_TAIL_LINES: usize = 2000;
@@ -137,24 +141,74 @@ fn journal_tail() -> Option<Vec<String>> {
 
 const REDACTED: &str = "[REDACTED]";
 
-/// 一行日志的脱敏（#84 验收：私钥 / Auth Key / 邀请码 / 登录 token 不出现，
-/// Node Name / Node Address / Endpoint 保留）。规则按序应用：
-///
-/// 1. PEM 私钥块（`-----BEGIN … PRIVATE KEY-----`）整段替换；
-/// 2. Auth Key / Relay Token：`hznet.` / `hzrelay.` 后的 base64url 主体；
-/// 3. 邀请码：`HZ-XXXX-XXXX`；
-/// 4. 登录 URL：`/oidc/start/<login_id>` 与 `login_id=<…>` 的 token 部分；
-/// 5. 私钥的 hex 形态：连续 ≥64 个十六进制字符（Machine/Node Key 私钥
-///    序列化后的典型形态；公钥同样命中，多脱不错）。
+/// 一行日志的脱敏（#84 / #108：私钥 / Auth Key / 邀请码 / 登录 token /
+/// Bearer / JWT / Cookie / Authorization 不出现，Node Name / Node Address /
+/// Endpoint 保留）。含 `PRIVATE KEY` 的行整行替换——PEM 块的同行上下文没有
+/// 排障价值。整包 JSON 不能走这条短路，见 [`redact_package`]。
 pub fn redact_line(line: &str) -> String {
     if line.contains("PRIVATE KEY") {
         return format!("…{REDACTED}（PEM 私钥块）");
     }
-    let mut line = redact_prefixed_secret(line, "hznet.");
-    line = redact_prefixed_secret(&line, "hzrelay.");
-    line = redact_invite_codes(&line);
-    line = redact_login_tokens(&line);
-    redact_long_hex(&line)
+    redact_secrets(line)
+}
+
+/// token 级规则，`redact_line` 与整包二次脱敏共用。按序：
+///
+/// 1. Auth Key / Relay Token：`hznet.` / `hzrelay.` 后的 base64url 主体；
+/// 2. 邀请码：`HZ-XXXX-XXXX`；
+/// 3. 登录 URL：`/oidc/start/<login_id>` 与 `login_id=<…>`，同一行全部出现；
+/// 4. `Authorization` 头、独立 `Bearer`、`Cookie` / `Set-Cookie`、裸 JWT；
+/// 5. 私钥的 hex 形态：连续 ≥64 个十六进制字符（公钥同样命中，多脱不错）。
+fn redact_secrets(text: &str) -> String {
+    let mut text = redact_prefixed_secret(text, "hznet.");
+    text = redact_prefixed_secret(&text, "hzrelay.");
+    text = redact_invite_codes(&text);
+    text = redact_login_tokens(&text);
+    text = redact_authorization(&text);
+    text = redact_bearer(&text);
+    text = redact_cookies(&text);
+    text = redact_jwts(&text);
+    redact_long_hex(&text)
+}
+
+/// 整包纵深（#108）。`log_tail` 已经逐行脱敏；这里把 status / netcheck /
+/// log_note 里将来漏进来的密钥再过同一套 token 规则。PEM 在整包里只替换
+/// 块本身——`redact_line` 的整行短路会毁掉 JSON。
+pub(crate) fn redact_package(value: Value) -> Value {
+    let Ok(raw) = serde_json::to_string(&value) else {
+        return value;
+    };
+    let scrubbed = redact_secrets(&redact_pem_inline(&raw));
+    serde_json::from_str(&scrubbed).unwrap_or(value)
+}
+
+/// `-----BEGIN … PRIVATE KEY-----` … `-----END …-----` 整段替换，其余字节不动。
+fn redact_pem_inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(begin) = rest.find("-----BEGIN") {
+        if let Some(end) = pem_block_end(&rest[begin..]) {
+            out.push_str(&rest[..begin]);
+            out.push_str(REDACTED);
+            rest = &rest[begin + end..];
+        } else {
+            out.push_str(&rest[..begin + "-----BEGIN".len()]);
+            rest = &rest[begin + "-----BEGIN".len()..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `after` 以 `-----BEGIN` 开头。返回块的字节长度（含 END 行），不是私钥块则 None。
+fn pem_block_end(after: &str) -> Option<usize> {
+    let end_rel = after.find("-----END")?;
+    if !after[..end_rel].contains("PRIVATE KEY") {
+        return None;
+    }
+    let tail = &after[end_rel + 5..];
+    let close = tail.find("-----")?;
+    Some(end_rel + 5 + close + 5)
 }
 
 /// 多行 PEM 私钥块的状态机脱敏（#84 评审）：BEGIN 行进入块内状态，直到
@@ -252,21 +306,27 @@ fn redact_login_tokens(line: &str) -> String {
     line
 }
 
-/// 把 marker 之后的 token 段（到下一个非 URL/标识符字符）替换为 [REDACTED]。
+/// 把 marker 之后的 token 段（到下一个非 URL/标识符字符）全部替换为 [REDACTED]。
 fn redact_after_marker(line: &str, marker: &str) -> String {
-    let Some(found) = line.find(marker) else {
-        return line.to_string();
-    };
-    let after = found + marker.len();
-    let tail = &line[after..];
-    let token_len = tail
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-        .count();
-    if token_len == 0 {
-        return line.to_string();
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(found) = rest.find(marker) {
+        let after = found + marker.len();
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        let token_len = tail
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b'.'))
+            .count();
+        rest = if token_len == 0 {
+            tail
+        } else {
+            out.push_str(REDACTED);
+            &tail[token_len..]
+        };
     }
-    format!("{}{}{}", &line[..after], REDACTED, &tail[token_len..])
+    out.push_str(rest);
+    out
 }
 
 /// 连续 ≥64 个十六进制字符（私钥 hex 形态）→ [REDACTED]。
@@ -290,6 +350,242 @@ fn redact_long_hex(line: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// 短于这个长度的 Bearer / Authorization 凭证不当密钥（避开普通英文单词）。
+const MIN_SECRET: usize = 8;
+
+/// `Authorization:` / `Authorization=` 后的 `scheme token` 或裸 token。
+fn redact_authorization(text: &str) -> String {
+    redact_word_value(text, "authorization", |bytes, after_word| {
+        let value = header_value_start(bytes, after_word)?;
+        authorization_credential_end(bytes, value).map(|end| (value, end))
+    })
+}
+
+/// 独立的 `Bearer <token>`（`Authorization: Bearer` 已由上面的规则吃掉）。
+fn redact_bearer(text: &str) -> String {
+    redact_word_value(text, "bearer", |bytes, after_word| {
+        let mut k = after_word;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k == after_word {
+            return None;
+        }
+        let end = token_end(bytes, k);
+        if end - k >= MIN_SECRET && !is_ipv4(&bytes[k..end]) {
+            Some((k, end))
+        } else {
+            None
+        }
+    })
+}
+
+/// `Cookie:` / `Set-Cookie:` / `cookie=` 的值（`;` 分隔的多对一起换掉）。
+fn redact_cookies(text: &str) -> String {
+    redact_word_value(text, "cookie", |bytes, after_word| {
+        let value = header_value_start(bytes, after_word)?;
+        let end = cookie_value_end(bytes, value);
+        (end > value).then_some((value, end))
+    })
+}
+
+/// 在 `word`（大小写不敏感、两侧不是字母数字）之后按 `span` 替换凭证。
+/// `span` 返回要替换的 `[start, end)`；None 表示这个出现不是凭证。
+fn redact_word_value(
+    text: &str,
+    word: &str,
+    mut span: impl FnMut(&[u8], usize) -> Option<(usize, usize)>,
+) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some((_, after)) = next_word(text, i, word) {
+        if let Some((start, end)) = span(bytes, after) {
+            out.push_str(&text[i..start]);
+            out.push_str(REDACTED);
+            i = end;
+        } else {
+            out.push_str(&text[i..after]);
+            i = after;
+        }
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+/// 词后有空白，再是 `:` 或 `=`，再是空白，返回值的起点。
+fn header_value_start(bytes: &[u8], after_word: usize) -> Option<usize> {
+    let mut j = after_word;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || (bytes[j] != b':' && bytes[j] != b'=') {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    Some(j)
+}
+
+fn authorization_credential_end(bytes: &[u8], j: usize) -> Option<usize> {
+    if j >= bytes.len() {
+        return None;
+    }
+    let word_end = j + bytes[j..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    if word_end > j {
+        let word = &bytes[j..word_end];
+        const SCHEMES: [&[u8]; 5] = [b"bearer", b"basic", b"digest", b"negotiate", b"token"];
+        if SCHEMES
+            .iter()
+            .any(|scheme| word.eq_ignore_ascii_case(scheme))
+        {
+            let mut k = word_end;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let end = token_end(bytes, k);
+            if end - k >= MIN_SECRET && !is_ipv4(&bytes[k..end]) {
+                return Some(end);
+            }
+            return None;
+        }
+    }
+    let end = token_end(bytes, j);
+    if end - j >= MIN_SECRET && !is_ipv4(&bytes[j..end]) {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+fn cookie_value_end(bytes: &[u8], mut j: usize) -> usize {
+    let start = j;
+    loop {
+        let pair = j;
+        while j < bytes.len() && is_cookie_octet(bytes[j]) {
+            j += 1;
+        }
+        if j == pair {
+            return if pair == start { start } else { j };
+        }
+        if j < bytes.len() && bytes[j] == b';' {
+            let mut k = j + 1;
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            if k < bytes.len() && is_cookie_octet(bytes[k]) {
+                j = k;
+                continue;
+            }
+        }
+        return j;
+    }
+}
+
+/// ponytail: 停在 `"` 与 `\` 前，整包 JSON 才还能解析；带引号的 cookie 值要再加引号状态机。
+fn is_cookie_octet(b: u8) -> bool {
+    !b.is_ascii_whitespace() && b != b';' && b != b'"' && b != b'\\'
+}
+
+fn redact_jwts(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(rel) = text[i..].find("eyJ") {
+        let at = i + rel;
+        // `=` / `.` 是边界：`id_token=eyJ…` 与 URL 里的 JWT 都要脱。字母数字与 `-_` 才算嵌在别的 token 里。
+        let inside_token = at > 0
+            && (bytes[at - 1].is_ascii_alphanumeric()
+                || bytes[at - 1] == b'-'
+                || bytes[at - 1] == b'_');
+        if let Some(len) = (!inside_token).then(|| jwt_len(&text[at..])).flatten() {
+            out.push_str(&text[i..at]);
+            out.push_str(REDACTED);
+            i = at + len;
+        } else {
+            out.push_str(&text[i..at + 3]);
+            i = at + 3;
+        }
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+/// 三段 base64url（每段 ≥10）以 `.` 分隔。返回字节长度。
+fn jwt_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    for segment in 0..3 {
+        let start = pos;
+        while pos < bytes.len() && is_b64url(bytes[pos]) {
+            pos += 1;
+        }
+        if pos - start < 10 {
+            return None;
+        }
+        if segment < 2 {
+            if pos >= bytes.len() || bytes[pos] != b'.' {
+                return None;
+            }
+            pos += 1;
+        }
+    }
+    Some(pos)
+}
+
+fn is_b64url(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'=')
+}
+
+fn token_end(bytes: &[u8], start: usize) -> usize {
+    let mut j = start;
+    while j < bytes.len() && is_secret_char(bytes[j]) {
+        j += 1;
+    }
+    j
+}
+
+fn is_secret_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'/' | b'=')
+}
+
+fn is_ipv4(token: &[u8]) -> bool {
+    std::str::from_utf8(token)
+        .ok()
+        .and_then(|text| text.parse::<std::net::Ipv4Addr>().ok())
+        .is_some()
+}
+
+fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn next_word(text: &str, start: usize, word: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut from = start;
+    while from < bytes.len() {
+        let rel = find_ci(&text[from..], word)?;
+        let at = from + rel;
+        let end = at + word.len();
+        let left_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        let right_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return Some((at, end));
+        }
+        from = end;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -342,6 +638,88 @@ mod tests {
         assert_eq!(
             benign,
             "connecting to hznet.coord.example.com for hznet.example"
+        );
+    }
+
+    #[test]
+    fn repeated_markers_and_generic_secrets_are_redacted() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let line = format!(
+            "node mini 10.44.0.2 endpoint=203.0.113.9:41001 \
+             /oidc/start/n-aaaaaaaaaaaaaaaa /oidc/start/n-bbbbbbbbbbbbbbbb \
+             login_id=n-cccccccccccccccc login_id=n-dddddddddddddddd \
+             Bearer sk_live_51Habcdefghijklmnopqrstuv bEaReR sk_live_51Hzzzzzzzzzzzzzzzzzzzz \
+             AUTHORIZATION: Basic dXNlcjpwYXNzdzByZA== \
+             Set-Cookie: hz_admin=s3cr3tc00k13value; Path=/admin id_token={jwt} \
+             endpoint=198.51.100.8:41001 Bearer 203.0.113.10:41002"
+        );
+        let redacted = redact_line(&line);
+        for secret in [
+            "n-aaaaaaaaaaaaaaaa",
+            "n-bbbbbbbbbbbbbbbb",
+            "n-cccccccccccccccc",
+            "n-dddddddddddddddd",
+            "sk_live_51Habcdefghijklmnopqrstuv",
+            "sk_live_51Hzzzzzzzzzzzzzzzzzzzz",
+            "dXNlcjpwYXNzdzByZA==",
+            "s3cr3tc00k13value",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        ] {
+            assert!(!redacted.contains(secret), "{secret} still in {redacted}");
+        }
+        assert!(redacted.contains("mini"), "{redacted}");
+        assert!(redacted.contains("10.44.0.2"), "{redacted}");
+        assert!(redacted.contains("203.0.113.9:41001"), "{redacted}");
+        assert!(redacted.contains("198.51.100.8:41001"), "{redacted}");
+        assert!(redacted.contains("203.0.113.10:41002"), "{redacted}");
+        assert_eq!(
+            redacted.matches("/oidc/start/[REDACTED]").count(),
+            2,
+            "{redacted}"
+        );
+        assert_eq!(
+            redacted.matches("login_id=[REDACTED]").count(),
+            2,
+            "{redacted}"
+        );
+    }
+
+    #[test]
+    fn package_redacts_secrets_that_missed_the_log_tail() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let value = serde_json::json!({
+            "status": {
+                "name": "mini",
+                "ipv4": "10.44.0.2",
+                "note": format!(
+                    "leaked hznet.c3VwZXJzZWNyZXRrZXlkb25vdGNoYXJlMTIz Authorization: Bearer {jwt} Cookie: hz_admin=s3cr3tc00k13value -----BEGIN PRIVATE KEY----- MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6 -----END PRIVATE KEY-----"
+                ),
+            },
+            "netcheck": {"endpoints": [{"addr": "203.0.113.9:41001"}]},
+            "log_tail": ["node mini endpoint=203.0.113.9:41001"],
+        });
+        let redacted = redact_package(value);
+        let whole = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !whole.contains("c3VwZXJzZWNyZXRrZXlkb25vdGNoYXJl"),
+            "{whole}"
+        );
+        assert!(
+            !whole.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+            "{whole}"
+        );
+        assert!(!whole.contains("s3cr3tc00k13value"), "{whole}");
+        assert!(
+            !whole.contains("MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6"),
+            "{whole}"
+        );
+        assert!(whole.contains("mini"), "{whole}");
+        assert!(whole.contains("10.44.0.2"), "{whole}");
+        assert!(whole.contains("203.0.113.9:41001"), "{whole}");
+        assert_eq!(redacted["status"]["name"], "mini");
+        assert_eq!(
+            redacted["log_tail"][0],
+            "node mini endpoint=203.0.113.9:41001"
         );
     }
 
