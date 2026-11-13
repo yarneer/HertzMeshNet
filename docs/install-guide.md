@@ -157,6 +157,16 @@ hzd 只认环境变量 `HZD_RELAY_ADDR`，没有对应的命令行 flag。Relay 
 
 macOS 上脚本会等旧 `hzd` 完全退出（它退出前要先恢复 DNS 配置，通常几秒）再重新加载服务，并确认新 `hzd` 已在运行才报告「已启动」。等待超时或加载失败时脚本报错退出，按提示的命令查看日志并手动加载，或见第 9 节。
 
+0.4.1 起也可以用 `hz` 自己升级：
+
+```sh
+hz update --check           # 只看有没有新版本
+sudo hz update              # 从注册时的 Coordination Server 的 /dl 下载、校验 sha256、替换 hzd 与 hz、重启 hzd
+sudo hz update --from github   # 服务器分发目录还没更新时，直接取 GitHub 最新正式版
+```
+
+`hz update` 只替换 `/usr/local/bin` 下的两个二进制并重启服务，配置文件一概不动（`HZD_COORD_ADDR` 也不改）。它不会降级：服务器上的版本低于本机、manifest 没有版本号，或版本号相同但文件不同（本机是自己编译的）时都只提示不替换，确认要装加 `--force`。gRPC 与分发面不在同一地址时，用 `--coord https://<分发面地址>` 指定。
+
 ## 8. 卸载
 
 Linux：

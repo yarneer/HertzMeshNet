@@ -7,6 +7,8 @@ use hz_core::status::{NodeStatus, RegisteredInfo};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+mod update;
+
 /// `hz --version` 的版本串（#70）：clap 自动加 `hz ` 前缀，这里只给
 /// `0.3.0 (a1b2c3d)`（与 hzd --version 同一来源，无 commit 时仅 semver）。
 static VERSION: std::sync::LazyLock<String> =
@@ -86,6 +88,21 @@ enum Command {
         /// 输出 JSON（脚本用）
         #[arg(long)]
         json: bool,
+    },
+    /// 升级本机 hzd 与 hz 并重启 hzd（需要 sudo；注册与配置保留）
+    Update {
+        /// 只检查有没有新版本，不下载
+        #[arg(long)]
+        check: bool,
+        /// 下载源：coord（缺省，与 install.sh 同源）或 github（最新正式版）
+        #[arg(long, value_enum, default_value = "coord")]
+        from: update::From,
+        /// Coordination Server 地址（缺省用注册时记下的地址）
+        #[arg(long)]
+        coord: Option<String>,
+        /// 越过降级 / 无版本号 / 本地构建的保护，强制装 manifest 里的版本
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -203,6 +220,12 @@ async fn main() -> std::process::ExitCode {
         Command::Diagnostics { out } => diagnostics(out).await,
         Command::Ping { node } => ping(node).await,
         Command::Netcheck { json } => netcheck(json).await,
+        Command::Update {
+            check,
+            from,
+            coord,
+            force,
+        } => update::run(from, coord, check, force).await,
     }
 }
 
