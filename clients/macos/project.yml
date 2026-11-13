@@ -22,7 +22,7 @@ targets:
       path: Generated/Info.plist
       properties:
         CFBundleDisplayName: HzNet
-        CFBundleShortVersionString: "0.4.0"
+        CFBundleShortVersionString: "0.4.1"
         LSUIElement: true  # 菜单栏 App：不进 Dock
         LSMinimumSystemVersion: "13.0"
         # hznet://join 深链（#88）
