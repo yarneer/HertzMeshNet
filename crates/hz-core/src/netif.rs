@@ -37,17 +37,7 @@ pub fn is_virtual_name(name: &str) -> bool {
 
 /// 虚拟网卡：名称前缀，加上 Linux 上 sysfs `tun_flags`（表外名字的 tun 也算）。
 pub fn is_virtual_iface(name: &str) -> bool {
-    if is_virtual_name(name) {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        is_tun_device(name)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    is_virtual_name(name) || is_tun_device(name)
 }
 
 /// Linux：tun/tap 字符设备创建的接口会在 sysfs 暴露 tun_flags，
@@ -58,6 +48,11 @@ fn is_tun_device(name: &str) -> bool {
         .join(name)
         .join("tun_flags")
         .exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_tun_device(_name: &str) -> bool {
+    false
 }
 
 /// 从路由表条目里选出物理出口网卡：
