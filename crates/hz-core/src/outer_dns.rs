@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -346,10 +346,7 @@ fn query(server: SocketAddr, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> 
     } else {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     };
-    let socket = UdpSocket::bind(local)?;
-    if !server.ip().is_loopback() {
-        crate::netif::protect_outer_socket(&socket);
-    }
+    let socket = crate::netif::bind_outer_udp(local, !server.ip().is_loopback())?;
     socket.set_read_timeout(Some(QUERY_TIMEOUT))?;
     let id = query_id();
     socket.send_to(&build_query(id, host, qtype)?, server)?;

@@ -274,6 +274,25 @@ pub fn protect_outer_socket<S: AsFd>(socket: &S) -> Option<String> {
     }
 }
 
+/// 建一个外层 UDP socket 并 bind 到 `local`。egress 为真时先经
+/// [`protect_outer_socket`] 绑物理出口再 bind(2)：macOS 的 IP_BOUND_IF /
+/// IPV6_BOUND_IF 在 bind 之后设置不生效，包会按默认路由走进第三方 TUN。
+pub fn bind_outer_udp(
+    local: std::net::SocketAddr,
+    egress: bool,
+) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(local),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if egress {
+        protect_outer_socket(&socket);
+    }
+    socket.bind(&local.into())?;
+    Ok(socket.into())
+}
+
 pub fn bind_to_physical_egress<S: AsFd>(socket: &S) -> Option<String> {
     let iface = physical_egress()?;
     #[cfg(target_os = "linux")]

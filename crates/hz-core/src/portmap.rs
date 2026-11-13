@@ -724,16 +724,14 @@ async fn upnp_delete(lease: &PortMapLease) -> anyhow::Result<()> {
 
 /// 绑定（可选出口网卡）的 UDP socket。
 async fn udp_socket(peer: SocketAddr, bind_egress: bool) -> anyhow::Result<tokio::net::UdpSocket> {
-    let sock = tokio::net::UdpSocket::bind(if peer.is_ipv4() {
-        "0.0.0.0:0"
+    let local: SocketAddr = if peer.is_ipv4() {
+        "0.0.0.0:0".parse().expect("valid socket addr")
     } else {
-        "[::]:0"
-    })
-    .await?;
-    if bind_egress {
-        crate::netif::bind_to_physical_egress(&sock);
-    }
-    Ok(sock)
+        "[::]:0".parse().expect("valid socket addr")
+    };
+    let sock = crate::netif::bind_outer_udp(local, bind_egress)?;
+    sock.set_nonblocking(true)?;
+    Ok(tokio::net::UdpSocket::from_std(sock)?)
 }
 
 /// 发一条 UDP 并等一条应答（超时返回 Ok(None)）。

@@ -686,15 +686,9 @@ impl SocketEngine {
         port: u16,
         bind_to_egress: bool,
     ) -> anyhow::Result<Self> {
-        let socket = bind_dual_stack(port)
+        let (socket, device) = bind_dual_stack(port, bind_to_egress)
             .await
             .with_context(|| format!("bind udp :{port} failed"))?;
-        let device = if bind_to_egress {
-            // 经 Platform::protect（引擎注入的钩子）；未注入时维持桌面默认。
-            crate::netif::protect_outer_socket(&socket)
-        } else {
-            None
-        };
         let local_addr = socket
             .local_addr()
             .with_context(|| "query udp local addr failed")?;
@@ -770,9 +764,14 @@ impl SocketEngine {
                     // 先在临时端口的新 socket 上验证 egress 可绑（首次绑设备
                     // 无需特权）。失败说明 egress 本身不可用（如网卡已消失），
                     // 旧 socket 原样在位，显式报错且端口不动。
-                    let fallback = Arc::new(bind_dual_stack(0).await.with_context(|| {
-                        format!("recreate udp socket for egress {egress} failed")
-                    })?);
+                    let fallback = Arc::new(
+                        bind_dual_stack(0, false)
+                            .await
+                            .with_context(|| {
+                                format!("recreate udp socket for egress {egress} failed")
+                            })?
+                            .0,
+                    );
                     socket2::SockRef::from(fallback.as_ref())
                         .bind_device(Some(egress.as_bytes()))
                         .with_context(|| format!("bind recreated socket to {egress} failed"))?;
@@ -784,8 +783,8 @@ impl SocketEngine {
                         tokio::time::sleep(RECREATE_RELEASE_POLL).await;
                     }
                     drop(socket);
-                    let fresh = match bind_dual_stack(port).await {
-                        Ok(fresh) => {
+                    let fresh = match bind_dual_stack(port, false).await {
+                        Ok((fresh, _)) => {
                             // egress 刚在临时 socket 上验证过；同端口新 socket
                             // 仍是首次绑设备，再失败只剩设备在窗口内消失的
                             // 竞态，退回已验证的临时 socket。
@@ -1126,7 +1125,19 @@ pub(crate) async fn send_udp(
 /// 单 socket 双栈绑定：先试 [::] 关闭 v6only（v4-mapped 收 v4），失败再退
 /// 纯 v4。打洞与 WireGuard 共用这一个 socket（ADR-0002），IPv6 直连也必须
 /// 落在它上面。向这个 socket 发 IPv4 必须经 [`send_udp`]（macOS 否则 EINVAL）。
-async fn bind_dual_stack(port: u16) -> anyhow::Result<UdpSocket> {
+///
+/// bind_to_egress 时在 bind(2) 之前绑物理出口并返回网卡名：macOS 的
+/// IP_BOUND_IF / IPV6_BOUND_IF 在 bind 之后才设置不生效，包仍按默认路由
+/// 走进第三方 TUN（发往公网报 EHOSTUNREACH）。
+async fn bind_dual_stack(
+    port: u16,
+    bind_to_egress: bool,
+) -> anyhow::Result<(UdpSocket, Option<String>)> {
+    let protect = |socket: &socket2::Socket| {
+        bind_to_egress
+            .then(|| crate::netif::protect_outer_socket(socket))
+            .flatten()
+    };
     match socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
@@ -1137,10 +1148,11 @@ async fn bind_dual_stack(port: u16) -> anyhow::Result<UdpSocket> {
                 tracing::warn!(%error, "disable IPV6_V6ONLY failed, falling back to v4");
             } else {
                 v6.set_nonblocking(true)?;
+                let device = protect(&v6);
                 let addr: std::net::SocketAddr =
                     format!("[::]:{port}").parse().expect("valid socket addr");
                 if v6.bind(&socket2::SockAddr::from(addr)).is_ok() {
-                    return Ok(UdpSocket::from_std(v6.into())?);
+                    return Ok((UdpSocket::from_std(v6.into())?, device));
                 }
                 tracing::warn!("bind [::]:{port} failed, falling back to v4 only");
             }
@@ -1149,7 +1161,16 @@ async fn bind_dual_stack(port: u16) -> anyhow::Result<UdpSocket> {
             tracing::warn!(%error, "ipv6 socket unavailable, falling back to v4 only");
         }
     }
-    Ok(UdpSocket::bind(("0.0.0.0", port)).await?)
+    let v4 = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    v4.set_nonblocking(true)?;
+    let device = protect(&v4);
+    let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+    v4.bind(&socket2::SockAddr::from(addr))?;
+    Ok((UdpSocket::from_std(v4.into())?, device))
 }
 
 fn forward_to_tunnel(to_tunnel: &mpsc::Sender<Vec<u8>>, packets: Vec<Vec<u8>>) {
@@ -1288,12 +1309,12 @@ mod tests {
 
     #[tokio::test]
     async fn dual_stack_socket_sends_udp_to_ipv4_loopback() {
-        let sender = bind_dual_stack(0).await.unwrap();
+        let (sender, _) = bind_dual_stack(0, false).await.unwrap();
         assert!(
             sender.local_addr().unwrap().is_ipv6(),
             "本测试要求双栈绑定成功；纯 v4 回退测不到 macOS 的 EINVAL"
         );
-        let listener = bind_dual_stack(0).await.unwrap();
+        let (listener, _) = bind_dual_stack(0, false).await.unwrap();
         let dest = SocketAddr::new(
             "127.0.0.1".parse().unwrap(),
             listener.local_addr().unwrap().port(),
